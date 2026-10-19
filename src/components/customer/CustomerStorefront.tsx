@@ -88,8 +88,9 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
   const isAreaCovered = useMemo(() => {
     if (deliveryType === 'retirada') return true;
+    if (activeAreas.length === 0) return true;
     return !!matchedArea;
-  }, [deliveryType, matchedArea]);
+  }, [deliveryType, activeAreas.length, matchedArea]);
 
   // Filter products
   const filteredProducts = useMemo(() => {
@@ -602,7 +603,17 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       </div>
 
       {/* Products Grid */}
-      {filteredProducts.length === 0 ? (
+      {products.length === 0 ? (
+        <div className="text-center py-20 px-4 bg-white rounded-3xl border border-dashed border-neutral-300">
+          <div className="w-16 h-16 bg-amber-100 text-amber-600 rounded-2xl flex items-center justify-center mx-auto mb-3">
+            <Beer className="w-8 h-8" />
+          </div>
+          <h3 className="text-lg font-black text-neutral-900">Catálogo em Atualização</h3>
+          <p className="text-xs text-neutral-500 mt-1 max-w-sm mx-auto">
+            O depósito está atualizando o estoque e os produtos disponíveis. Em breve novas bebidas geladas estarão cadastradas para entrega!
+          </p>
+        </div>
+      ) : filteredProducts.length === 0 ? (
         <div className="text-center py-16 bg-white rounded-3xl border border-dashed border-neutral-300">
           <Beer className="w-12 h-12 text-neutral-300 mx-auto mb-3" />
           <h3 className="text-base font-bold text-neutral-800">Nenhum produto encontrado</h3>
@@ -876,30 +887,49 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       <label className="text-[11px] font-semibold text-neutral-700 block mb-1">
                         Selecione seu Bairro * (Áreas Atendidas pelo Depósito)
                       </label>
-                      <select
-                        value={neighborhood}
-                        onChange={(e) => setNeighborhood(e.target.value)}
-                        className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs font-bold text-neutral-900"
-                        required
-                      >
-                        {activeAreas.map(area => (
-                          <option key={area.id} value={area.name}>
-                            {area.name} — Taxa: {formatCurrency(area.fee)} ({area.estimatedTime})
-                          </option>
-                        ))}
-                      </select>
-
-                      {!isAreaCovered && (
-                        <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs flex items-start gap-2">
-                          <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
-                          <div>
-                            <strong>Bairro fora da área de entrega!</strong>
-                            <p className="mt-0.5 text-[11px]">
-                              Nosso depósito entrega nos seguintes bairros: {activeAreas.map(a => a.name).join(', ')}.
-                              Você também pode escolher <strong>Retirar no Depósito</strong>.
-                            </p>
-                          </div>
+                      {activeAreas.length === 0 ? (
+                        <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-xs">
+                          <p className="font-bold">Nenhum bairro de entrega fixo cadastrado</p>
+                          <p className="mt-0.5 text-[11px] text-amber-700">
+                            Informe seu bairro no campo abaixo ou selecione a opção Retirada no Depósito.
+                          </p>
+                          <input
+                            type="text"
+                            required
+                            placeholder="Digite seu bairro..."
+                            value={neighborhood}
+                            onChange={(e) => setNeighborhood(e.target.value)}
+                            className="mt-2 w-full px-3 py-2 bg-white border border-amber-300 rounded-xl text-xs font-bold text-neutral-900"
+                          />
                         </div>
+                      ) : (
+                        <>
+                          <select
+                            value={neighborhood}
+                            onChange={(e) => setNeighborhood(e.target.value)}
+                            className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs font-bold text-neutral-900"
+                            required
+                          >
+                            {activeAreas.map(area => (
+                              <option key={area.id} value={area.name}>
+                                {area.name} — Taxa: {formatCurrency(area.fee)} ({area.estimatedTime})
+                              </option>
+                            ))}
+                          </select>
+
+                          {!isAreaCovered && (
+                            <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs flex items-start gap-2">
+                              <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+                              <div>
+                                <strong>Bairro fora da área de entrega!</strong>
+                                <p className="mt-0.5 text-[11px]">
+                                  Nosso depósito entrega nos seguintes bairros: {activeAreas.map(a => a.name).join(', ')}.
+                                  Você também pode escolher <strong>Retirar no Depósito</strong>.
+                                </p>
+                              </div>
+                            </div>
+                          )}
+                        </>
                       )}
                     </div>
 

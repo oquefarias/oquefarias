@@ -2,13 +2,13 @@ import { Product, Order, StoreSettings, OrderStatus, AppState, DeliveryArea, Cus
 import { initialProducts, initialOrders, initialSettings, initialDeliveryAreas, initialCustomers } from '../data/initialData';
 import { soundService } from '../utils/sound';
 
-const STORAGE_KEY_PRODUCTS = 'deposito_products_v2';
-const STORAGE_KEY_ORDERS = 'deposito_orders_v2';
-const STORAGE_KEY_SETTINGS = 'deposito_settings_v2';
-const STORAGE_KEY_AREAS = 'deposito_areas_v2';
-const STORAGE_KEY_CUSTOMERS = 'deposito_customers_v2';
-const STORAGE_KEY_CURRENT_CUSTOMER = 'deposito_current_customer_v2';
-const STORAGE_KEY_ADMIN_AUTH = 'deposito_admin_auth_v2';
+const STORAGE_KEY_PRODUCTS = 'deposito_products_v4';
+const STORAGE_KEY_ORDERS = 'deposito_orders_v4';
+const STORAGE_KEY_SETTINGS = 'deposito_settings_v4';
+const STORAGE_KEY_AREAS = 'deposito_areas_v4';
+const STORAGE_KEY_CUSTOMERS = 'deposito_customers_v4';
+const STORAGE_KEY_CURRENT_CUSTOMER = 'deposito_current_customer_v4';
+const STORAGE_KEY_ADMIN_AUTH = 'deposito_admin_auth_v4';
 
 let broadcastChannel: BroadcastChannel | null = null;
 if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
@@ -32,20 +32,28 @@ class ApiService {
 
   private initLocalStorageIfEmpty() {
     if (typeof window === 'undefined') return;
+    // Wipe any legacy simulation data from previous turns
+    [
+      'deposito_products_v2', 'deposito_orders_v2', 'deposito_areas_v2', 'deposito_customers_v2',
+      'deposito_products_v3', 'deposito_orders_v3', 'deposito_areas_v3', 'deposito_customers_v3'
+    ].forEach(k => {
+      try { localStorage.removeItem(k); } catch { /* ignore */ }
+    });
+
     if (!localStorage.getItem(STORAGE_KEY_PRODUCTS)) {
-      localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(initialProducts));
+      localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify([]));
     }
     if (!localStorage.getItem(STORAGE_KEY_ORDERS)) {
-      localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify(initialOrders));
+      localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify([]));
     }
     if (!localStorage.getItem(STORAGE_KEY_SETTINGS)) {
       localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(initialSettings));
     }
     if (!localStorage.getItem(STORAGE_KEY_AREAS)) {
-      localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(initialDeliveryAreas));
+      localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify([]));
     }
     if (!localStorage.getItem(STORAGE_KEY_CUSTOMERS)) {
-      localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(initialCustomers));
+      localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify([]));
     }
   }
 
@@ -462,12 +470,27 @@ class ApiService {
     }
   }
 
+  public async clearAllSimulationData(): Promise<void> {
+    localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify([]));
+    localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify([]));
+    localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify([]));
+    localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify([]));
+    localStorage.removeItem(STORAGE_KEY_CURRENT_CUSTOMER);
+    this.notifyListeners();
+
+    try {
+      await fetch('/api/clear-all', { method: 'POST' });
+    } catch {
+      // Ignored
+    }
+  }
+
   public resetToDefaults() {
-    localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(initialProducts));
-    localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify(initialOrders));
+    localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify([]));
+    localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify([]));
     localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(initialSettings));
-    localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(initialDeliveryAreas));
-    localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(initialCustomers));
+    localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify([]));
+    localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify([]));
     this.notifyListeners();
   }
 }

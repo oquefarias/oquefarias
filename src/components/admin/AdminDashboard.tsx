@@ -868,58 +868,75 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </button>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {deliveryAreas.map(area => (
-              <div
-                key={area.id}
-                className={`bg-white rounded-3xl border p-5 transition-all shadow-xs flex flex-col justify-between ${
-                  area.active ? 'border-neutral-200' : 'border-neutral-200 bg-neutral-50 opacity-60'
-                }`}
+          {deliveryAreas.length === 0 ? (
+            <div className="bg-white rounded-3xl p-12 text-center border border-dashed border-neutral-300">
+              <MapPin className="w-12 h-12 text-neutral-300 mx-auto mb-3" />
+              <h4 className="font-bold text-base text-neutral-800">Nenhum bairro cadastrado ainda</h4>
+              <p className="text-xs text-neutral-500 mt-1 max-w-sm mx-auto">
+                Cadastre os bairros onde seu depósito realiza entregas com o tempo estimado e a taxa de frete correspondente.
+              </p>
+              <button
+                onClick={handleOpenNewArea}
+                className="mt-4 inline-flex items-center gap-1.5 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs transition-colors shadow-xs"
               >
-                <div>
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Bairro / Região</span>
-                      <h4 className="text-base font-black text-neutral-900">{area.name}</h4>
+                <Plus className="w-4 h-4" />
+                <span>Cadastrar Primeiro Bairro</span>
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {deliveryAreas.map(area => (
+                <div
+                  key={area.id}
+                  className={`bg-white rounded-3xl border p-5 transition-all shadow-xs flex flex-col justify-between ${
+                    area.active ? 'border-neutral-200' : 'border-neutral-200 bg-neutral-50 opacity-60'
+                  }`}
+                >
+                  <div>
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Bairro / Região</span>
+                        <h4 className="text-base font-black text-neutral-900">{area.name}</h4>
+                      </div>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                        area.active ? 'bg-emerald-100 text-emerald-800' : 'bg-neutral-200 text-neutral-600'
+                      }`}>
+                        {area.active ? 'Ativo' : 'Pausado'}
+                      </span>
                     </div>
-                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-                      area.active ? 'bg-emerald-100 text-emerald-800' : 'bg-neutral-200 text-neutral-600'
-                    }`}>
-                      {area.active ? 'Ativo' : 'Pausado'}
-                    </span>
+
+                    <div className="mt-4 pt-3 border-t border-neutral-100 space-y-2 text-xs">
+                      <div className="flex justify-between items-center">
+                        <span className="text-neutral-500">Taxa de Entrega:</span>
+                        <span className="font-black text-sm text-neutral-900">{formatCurrency(area.fee)}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-neutral-500">Tempo Estimado:</span>
+                        <span className="font-semibold text-neutral-700">{area.estimatedTime}</span>
+                      </div>
+                    </div>
                   </div>
 
-                  <div className="mt-4 pt-3 border-t border-neutral-100 space-y-2 text-xs">
-                    <div className="flex justify-between items-center">
-                      <span className="text-neutral-500">Taxa de Entrega:</span>
-                      <span className="font-black text-sm text-neutral-900">{formatCurrency(area.fee)}</span>
-                    </div>
-                    <div className="flex justify-between items-center">
-                      <span className="text-neutral-500">Tempo Estimado:</span>
-                      <span className="font-semibold text-neutral-700">{area.estimatedTime}</span>
-                    </div>
+                  <div className="mt-4 pt-3 border-t border-neutral-100 flex items-center justify-end gap-1">
+                    <button
+                      onClick={() => handleOpenEditArea(area)}
+                      className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg text-xs font-semibold flex items-center gap-1"
+                    >
+                      <Edit2 className="w-3.5 h-3.5" />
+                      <span>Editar</span>
+                    </button>
+                    <button
+                      onClick={() => handleDeleteArea(area.id)}
+                      className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg text-xs"
+                      title="Excluir bairro"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 </div>
-
-                <div className="mt-4 pt-3 border-t border-neutral-100 flex items-center justify-end gap-1">
-                  <button
-                    onClick={() => handleOpenEditArea(area)}
-                    className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg text-xs font-semibold flex items-center gap-1"
-                  >
-                    <Edit2 className="w-3.5 h-3.5" />
-                    <span>Editar</span>
-                  </button>
-                  <button
-                    onClick={() => handleDeleteArea(area.id)}
-                    className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg text-xs"
-                    title="Excluir bairro"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -959,42 +976,52 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-neutral-100">
-                  {customers.map(c => (
-                    <tr key={c.id} className="hover:bg-neutral-50 transition-colors">
-                      <td className="py-3 px-4 font-bold text-neutral-900 text-sm">
-                        {c.name}
-                      </td>
-                      <td className="py-3 px-4 font-mono font-medium text-neutral-600">
-                        {c.phone}
-                      </td>
-                      <td className="py-3 px-4">
-                        <span>{c.address}, {c.number}</span>
-                        {c.reference && <span className="block text-[11px] text-neutral-400 italic">Ref: {c.reference}</span>}
-                      </td>
-                      <td className="py-3 px-4 font-semibold text-neutral-800">
-                        {c.neighborhood}
-                      </td>
-                      <td className="py-3 px-4 text-center font-black">
-                        {c.totalOrdersCount || 1}
-                      </td>
-                      <td className="py-3 px-4 text-right font-mono font-bold text-emerald-700">
-                        {formatCurrency(c.totalSpent || 0)}
-                      </td>
-                      <td className="py-3 px-4 text-right">
-                        <a
-                          href={`https://wa.me/${c.phone.replace(/\D/g, '')}?text=${encodeURIComponent(
-                            `Olá ${c.name}! Tudo bem? Falamos do ${settings.storeName}.`
-                          )}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center gap-1 px-3 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-lg text-xs font-bold"
-                        >
-                          <MessageCircle className="w-3.5 h-3.5" />
-                          <span>WhatsApp</span>
-                        </a>
+                  {customers.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-12 text-center text-neutral-400">
+                        <Users className="w-10 h-10 mx-auto mb-2 text-neutral-300" />
+                        <p className="font-bold text-neutral-700 text-sm">Nenhum cliente cadastrado ainda</p>
+                        <p className="text-xs text-neutral-400 mt-1">Conforme os clientes fizerem pedidos ou se cadastrarem na loja, os dados aparecerão aqui automaticamente.</p>
                       </td>
                     </tr>
-                  ))}
+                  ) : (
+                    customers.map(c => (
+                      <tr key={c.id} className="hover:bg-neutral-50 transition-colors">
+                        <td className="py-3 px-4 font-bold text-neutral-900 text-sm">
+                          {c.name}
+                        </td>
+                        <td className="py-3 px-4 font-mono font-medium text-neutral-600">
+                          {c.phone}
+                        </td>
+                        <td className="py-3 px-4">
+                          <span>{c.address}, {c.number}</span>
+                          {c.reference && <span className="block text-[11px] text-neutral-400 italic">Ref: {c.reference}</span>}
+                        </td>
+                        <td className="py-3 px-4 font-semibold text-neutral-800">
+                          {c.neighborhood}
+                        </td>
+                        <td className="py-3 px-4 text-center font-black">
+                          {c.totalOrdersCount || 1}
+                        </td>
+                        <td className="py-3 px-4 text-right font-mono font-bold text-emerald-700">
+                          {formatCurrency(c.totalSpent || 0)}
+                        </td>
+                        <td className="py-3 px-4 text-right">
+                          <a
+                            href={`https://wa.me/${c.phone.replace(/\D/g, '')}?text=${encodeURIComponent(
+                              `Olá ${c.name}! Tudo bem? Falamos do ${settings.storeName}.`
+                            )}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1 px-3 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-lg text-xs font-bold"
+                          >
+                            <MessageCircle className="w-3.5 h-3.5" />
+                            <span>WhatsApp</span>
+                          </a>
+                        </td>
+                      </tr>
+                    ))
+                  )}
                 </tbody>
               </table>
             </div>
@@ -1104,7 +1131,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-neutral-100">
-                  {filteredProducts.map(p => {
+                  {filteredProducts.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="py-12 text-center text-neutral-400">
+                        <Package className="w-10 h-10 mx-auto mb-2 text-neutral-300" />
+                        <p className="font-bold text-neutral-700 text-sm">Nenhum produto cadastrado no estoque</p>
+                        <p className="text-xs text-neutral-400 mt-1">Clique no botão "+ Novo Produto" acima para cadastrar suas bebidas e definir estoque.</p>
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredProducts.map(p => {
                     const isLow = p.stock <= p.minStock;
                     const margin = p.price > 0 ? ((p.price - p.costPrice) / p.price) * 100 : 0;
 
@@ -1196,8 +1232,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         </td>
                       </tr>
                     );
-                  })}
-                </tbody>
+                  })
+                )}
+              </tbody>
               </table>
             </div>
           </div>
@@ -1238,53 +1275,61 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 max-h-[600px] overflow-y-auto pr-1">
-              {products
-                .filter(p => {
-                  if (posCategory !== 'todas' && p.category !== posCategory) return false;
-                  if (posSearch.trim()) {
-                    const q = posSearch.toLowerCase();
-                    return p.name.toLowerCase().includes(q) || p.volume.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q);
-                  }
-                  return true;
-                })
-                .map(product => {
-                  const inCart = posCart.find(i => i.product.id === product.id);
-                  const isOutOfStock = product.stock <= 0;
+              {products.length === 0 ? (
+                <div className="col-span-2 sm:col-span-3 p-10 text-center bg-white rounded-2xl border border-dashed border-neutral-300">
+                  <Package className="w-10 h-10 text-neutral-300 mx-auto mb-2" />
+                  <p className="text-sm font-bold text-neutral-700">Nenhum produto cadastrado no estoque</p>
+                  <p className="text-xs text-neutral-400 mt-1">Cadastre seus produtos na aba "Estoque" para realizar vendas no balcão.</p>
+                </div>
+              ) : (
+                products
+                  .filter(p => {
+                    if (posCategory !== 'todas' && p.category !== posCategory) return false;
+                    if (posSearch.trim()) {
+                      const q = posSearch.toLowerCase();
+                      return p.name.toLowerCase().includes(q) || p.volume.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q);
+                    }
+                    return true;
+                  })
+                  .map(product => {
+                    const inCart = posCart.find(i => i.product.id === product.id);
+                    const isOutOfStock = product.stock <= 0;
 
-                  return (
-                    <button
-                      key={product.id}
-                      onClick={() => !isOutOfStock && addToPosCart(product)}
-                      disabled={isOutOfStock}
-                      className={`text-left p-3 rounded-2xl border transition-all flex flex-col justify-between ${
-                        isOutOfStock
-                          ? 'opacity-40 bg-neutral-100 border-neutral-200 cursor-not-allowed'
-                          : inCart
-                          ? 'border-amber-500 bg-amber-50/40 shadow-xs'
-                          : 'bg-white border-neutral-200 hover:border-amber-400 hover:shadow-xs'
-                      }`}
-                    >
-                      <div>
-                        <div className="flex justify-between items-start gap-1">
-                          <span className="text-[10px] font-bold text-neutral-400 uppercase">{product.volume}</span>
-                          <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-neutral-100 text-neutral-600">
-                            Est: {product.stock}
-                          </span>
+                    return (
+                      <button
+                        key={product.id}
+                        onClick={() => !isOutOfStock && addToPosCart(product)}
+                        disabled={isOutOfStock}
+                        className={`text-left p-3 rounded-2xl border transition-all flex flex-col justify-between ${
+                          isOutOfStock
+                            ? 'opacity-40 bg-neutral-100 border-neutral-200 cursor-not-allowed'
+                            : inCart
+                            ? 'border-amber-500 bg-amber-50/40 shadow-xs'
+                            : 'bg-white border-neutral-200 hover:border-amber-400 hover:shadow-xs'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex justify-between items-start gap-1">
+                            <span className="text-[10px] font-bold text-neutral-400 uppercase">{product.volume}</span>
+                            <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-neutral-100 text-neutral-600">
+                              Est: {product.stock}
+                            </span>
+                          </div>
+                          <h4 className="font-bold text-xs text-neutral-900 mt-1 line-clamp-2">{product.name}</h4>
                         </div>
-                        <h4 className="font-bold text-xs text-neutral-900 mt-1 line-clamp-2">{product.name}</h4>
-                      </div>
 
-                      <div className="mt-3 pt-2 border-t border-neutral-100 flex items-center justify-between">
-                        <span className="font-black text-sm text-neutral-900">{formatCurrency(product.price)}</span>
-                        {inCart && (
-                          <span className="w-5 h-5 rounded-full bg-amber-500 text-white font-black text-xs flex items-center justify-center">
-                            {inCart.quantity}
-                          </span>
-                        )}
-                      </div>
-                    </button>
-                  );
-                })}
+                        <div className="mt-3 pt-2 border-t border-neutral-100 flex items-center justify-between">
+                          <span className="font-black text-sm text-neutral-900">{formatCurrency(product.price)}</span>
+                          {inCart && (
+                            <span className="w-5 h-5 rounded-full bg-amber-500 text-white font-black text-xs flex items-center justify-center">
+                              {inCart.quantity}
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })
+              )}
             </div>
           </div>
 
@@ -1906,16 +1951,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="pt-4 border-t border-neutral-100 flex items-center justify-between">
               <button
                 type="button"
-                onClick={() => {
-                  if (confirm('Restaurar dados de exemplo?')) {
-                    api.resetToDefaults();
-                    alert('Dados restaurados com sucesso!');
+                onClick={async () => {
+                  if (confirm('Deseja realmente apagar todos os produtos, pedidos, clientes e bairros de simulação?')) {
+                    await api.clearAllSimulationData();
+                    alert('Todos os dados de simulação foram apagados com sucesso!');
                   }
                 }}
-                className="flex items-center gap-1.5 px-3 py-2 text-xs font-bold text-neutral-500 hover:text-red-600 rounded-xl hover:bg-red-50 transition-colors"
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-red-600 hover:text-red-700 bg-red-50 hover:bg-red-100 rounded-xl transition-colors"
               >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Restaurar Dados</span>
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Zerar Dados de Simulação</span>
               </button>
 
               <button

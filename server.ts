@@ -32,9 +32,12 @@ function loadDatabase(): DatabaseSchema {
     if (fs.existsSync(DATA_FILE)) {
       const raw = fs.readFileSync(DATA_FILE, 'utf-8');
       const parsed = JSON.parse(raw);
-      // Migration helpers
-      if (!parsed.deliveryAreas) parsed.deliveryAreas = initialDeliveryAreas;
-      if (!parsed.customers) parsed.customers = initialCustomers;
+      // Ensure arrays are initialized
+      if (!Array.isArray(parsed.products)) parsed.products = [];
+      if (!Array.isArray(parsed.orders)) parsed.orders = [];
+      if (!Array.isArray(parsed.deliveryAreas)) parsed.deliveryAreas = [];
+      if (!Array.isArray(parsed.customers)) parsed.customers = [];
+      if (!parsed.settings) parsed.settings = initialSettings;
       if (!parsed.settings.adminPin) parsed.settings.adminPin = '1234';
       return parsed;
     }
@@ -316,14 +319,25 @@ async function startServer() {
     res.json(db.settings);
   });
 
+  // Clear all data (products, orders, customers, delivery areas)
+  app.post('/api/clear-all', (_req, res) => {
+    db.products = [];
+    db.orders = [];
+    db.customers = [];
+    db.deliveryAreas = [];
+    saveDatabase(db);
+    broadcastSSE('STATE_UPDATED', db);
+    res.json({ success: true, db });
+  });
+
   // Reset Demo Data
   app.post('/api/reset-demo', (_req, res) => {
     db = {
-      products: initialProducts,
-      orders: initialOrders,
-      settings: initialSettings,
-      deliveryAreas: initialDeliveryAreas,
-      customers: initialCustomers,
+      products: [],
+      orders: [],
+      settings: db.settings || initialSettings,
+      deliveryAreas: [],
+      customers: [],
     };
     saveDatabase(db);
     broadcastSSE('STATE_UPDATED', db);
