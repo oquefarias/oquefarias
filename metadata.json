@@ -1,0 +1,6 @@
+{
+  "name": "Depósito Express - Gestão & Loja de Bebidas",
+  "description": "Sistema completo para depósito de bebidas: gestão de estoque e pedidos no computador da loja sincronizado em tempo real com loja online para os clientes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

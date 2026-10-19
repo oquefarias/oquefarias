@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+body {
+  font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+}
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #receipt-to-print, #receipt-to-print *,
+  #flyer-to-print, #flyer-to-print * {
+    visibility: visible;
+  }
+  #receipt-to-print, #flyer-to-print {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 10px;
+  }
+}
