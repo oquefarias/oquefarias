@@ -140,7 +140,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const [settingsForm, setSettingsForm] = useState<StoreSettings>({ ...settings });
   const [settingsSavedMessage, setSettingsSavedMessage] = useState<boolean>(false);
-  const [showPin, setShowPin] = useState<boolean>(false);
   const [isUploadingLogo, setIsUploadingLogo] = useState<boolean>(false);
   const [isUploadingProductPhoto, setIsUploadingProductPhoto] = useState<boolean>(false);
 
@@ -266,7 +265,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     // 1. Instant local update
     setLocalOrders(prev => prev.map(o => o.id === orderId ? { ...o, status: newStatus, updatedAt: new Date().toISOString() } : o));
     soundService.playSuccessSound();
-    // 2. Persist to API and Supabase
+    // 2. Persist to API
     await api.updateOrderStatus(orderId, newStatus);
   };
 
@@ -466,9 +465,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    await api.updateSettings(settingsForm);
-    setSettingsSavedMessage(true);
-    setTimeout(() => setSettingsSavedMessage(false), 3000);
+    try {
+      await api.updateSettings(settingsForm);
+      setSettingsSavedMessage(true);
+      setTimeout(() => setSettingsSavedMessage(false), 3000);
+    } catch (err) {
+      console.error('Falha ao salvar configurações:', err);
+    }
   };
 
   return (
@@ -1851,30 +1854,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           )}
 
           <form onSubmit={handleSaveSettings} className="bg-white rounded-3xl border border-neutral-200 p-6 sm:p-8 shadow-xs space-y-6">
-
-
-            {/* PIN / SENHA DE ACESSO AO PAINEL */}
-            <div className="bg-neutral-50 p-5 rounded-2xl border border-neutral-200 space-y-2">
-              <label className="font-bold text-xs text-neutral-800 block">
-                PIN / Senha de Acesso ao Painel
-              </label>
-              <div className="max-w-xs relative">
-                <input
-                  type={showPin ? 'text' : 'password'}
-                  value={settingsForm.adminPin}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, adminPin: e.target.value })}
-                  className="w-full px-3 py-2 bg-white border border-neutral-300 rounded-xl text-sm font-mono font-bold pr-10 focus:border-amber-400 outline-none"
-                  required
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPin(!showPin)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-600"
-                >
-                  {showPin ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
-            </div>
 
             {/* ONLINE / OFFLINE STATUS SECTION */}
             <div className="bg-neutral-900 text-white p-6 rounded-3xl space-y-4">

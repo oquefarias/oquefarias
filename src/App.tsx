@@ -180,7 +180,7 @@ export default function App() {
                       className="w-full px-4 py-3 bg-neutral-50 border border-neutral-300 rounded-2xl text-center text-xl tracking-widest font-mono font-bold focus:ring-2 focus:ring-amber-500 focus:outline-none"
                     />
                     <p className="text-[11px] text-neutral-400 mt-1 text-center">
-                      Senha padrão inicial: <strong className="font-mono text-neutral-700">1234</strong> (alterável nas configurações)
+                      Digite o PIN configurado em <code className="text-neutral-700 font-mono">ADMIN_PIN</code> no servidor.
                     </p>
                   </div>
 

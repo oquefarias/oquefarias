@@ -43,6 +43,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   // Login by phone
   const [phoneSearch, setPhoneSearch] = useState<string>('');
   const [loginError, setLoginError] = useState<string>('');
+  const [isLoading, setIsLoading] = useState<boolean>(false);
 
   // Register form
   const [name, setName] = useState<string>('');
@@ -103,18 +104,26 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
   if (!isOpen) return null;
 
-  const handlePhoneLogin = (e: React.FormEvent) => {
+  const handlePhoneLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!phoneSearch.trim()) return;
 
-    const found = api.findCustomerByPhone(phoneSearch);
-    if (found) {
-      api.setCurrentCustomer(found);
-      onSuccess(found);
-    } else {
-      setLoginError('Telefone não encontrado. Cadastre-se abaixo rapidamente em 1 minuto!');
-      setPhone(phoneSearch);
-      setTab('cadastro');
+    setIsLoading(true);
+    setLoginError('');
+    try {
+      const found = await api.findCustomerByPhone(phoneSearch);
+      if (found) {
+        api.setCurrentCustomer(found);
+        onSuccess(found);
+      } else {
+        setLoginError('Telefone não encontrado. Cadastre-se abaixo rapidamente em 1 minuto!');
+        setPhone(phoneSearch);
+        setTab('cadastro');
+      }
+    } catch {
+      setLoginError('Erro ao consultar telefone. Tente novamente.');
+    } finally {
+      setIsLoading(false);
     }
   };
 

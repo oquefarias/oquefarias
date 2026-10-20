@@ -76,7 +76,7 @@ export const AdminLoginModal: React.FC<AdminLoginModalProps> = ({ isOpen, onSucc
               className="w-full px-4 py-3 bg-neutral-50 border border-neutral-300 rounded-xl text-center text-lg tracking-widest font-mono font-bold focus:ring-2 focus:ring-amber-500 focus:outline-none"
             />
             <p className="text-[11px] text-neutral-400 mt-1 text-center">
-              Senha padrão inicial: <strong className="font-mono text-neutral-600">1234</strong> (alterável nas configurações)
+              Digite o PIN configurado em <code className="text-neutral-600 font-mono">ADMIN_PIN</code> no servidor.
             </p>
           </div>
 

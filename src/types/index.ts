@@ -114,9 +114,6 @@ export interface StoreSettings {
   estimatedDeliveryTime: string;
   openingHours: string; // Horário de expediente configurável
   soundEnabled: boolean;
-  adminPin: string; // Senha / PIN de segurança para o painel de administração
-  supabaseUrl?: string; // URL do Projeto Supabase (ex: https://xyz.supabase.co)
-  supabaseAnonKey?: string; // Chave anônima / pública do Supabase
   deliveryRadiusKm?: number; // Raio máximo de entrega em quilômetros (ex: 5)
   storeLatitude?: number; // Coordenada Latitude da loja
   storeLongitude?: number; // Coordenada Longitude da loja

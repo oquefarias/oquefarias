@@ -361,9 +361,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setPlacedOrder(order);
       setCart([]);
       setIsCartOpen(false);
-    } catch (err) {
-      console.error(err);
-      alert('Erro ao enviar pedido. Tente novamente.');
+    } catch (err: any) {
+      console.error('Falha ao processar pedido:', err);
     } finally {
       setIsSubmitting(false);
     }

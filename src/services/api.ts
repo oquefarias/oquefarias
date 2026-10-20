@@ -1,357 +1,428 @@
-import { Product, Order, StoreSettings, OrderStatus, AppState, DeliveryArea, CustomerProfile } from '../types';
+import { Product, Order, StoreSettings, OrderStatus, DeliveryArea, CustomerProfile } from '../types';
 import { initialProducts, initialOrders, initialSettings, initialDeliveryAreas, initialCustomers } from '../data/initialData';
 import { soundService } from '../utils/sound';
-import { supabaseService } from './supabase';
 
-const STORAGE_KEY_PRODUCTS = 'deposito_products_v4';
-const STORAGE_KEY_ORDERS = 'deposito_orders_v4';
-const STORAGE_KEY_SETTINGS = 'deposito_settings_v4';
-const STORAGE_KEY_AREAS = 'deposito_areas_v4';
-const STORAGE_KEY_CUSTOMERS = 'deposito_customers_v4';
+const STORAGE_KEY_ADMIN_TOKEN = 'deposito_admin_token_v5';
 const STORAGE_KEY_CURRENT_CUSTOMER = 'deposito_current_customer_v4';
-const STORAGE_KEY_ADMIN_AUTH = 'deposito_admin_auth_v4';
-
-let broadcastChannel: BroadcastChannel | null = null;
-if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-  try {
-    broadcastChannel = new BroadcastChannel('deposito_sync_channel');
-  } catch (e) {
-    console.warn('BroadcastChannel not supported', e);
-  }
-}
 
 class ApiService {
   private listeners: Array<() => void> = [];
   private eventSource: EventSource | null = null;
-  private hasInitializedBackend: boolean = false;
   private version: number = 0;
 
+  // In-memory state synchronized strictly with the server API
+  private state: {
+    products: Product[];
+    orders: Order[];
+    settings: StoreSettings;
+    deliveryAreas: DeliveryArea[];
+    customers: CustomerProfile[];
+  } = {
+    products: initialProducts,
+    orders: initialOrders,
+    settings: initialSettings,
+    deliveryAreas: initialDeliveryAreas,
+    customers: initialCustomers,
+  };
+
   constructor() {
-    this.initLocalStorageIfEmpty();
-    this.setupBroadcastChannel();
+    this.cleanLegacyLocalStorage();
     this.setupServerEvents();
-    // Initialize Supabase if credentials are present in settings or env
-    const settings = this.getSettings();
-    if (settings.supabaseUrl && settings.supabaseAnonKey) {
-      supabaseService.initFromEnvOrStorage(settings.supabaseUrl, settings.supabaseAnonKey);
-    }
   }
 
-  private initLocalStorageIfEmpty() {
+  /**
+   * Purge any legacy localStorage data so it is never used as a source of truth.
+   * Only admin token and cart are kept in localStorage.
+   */
+  private cleanLegacyLocalStorage() {
     if (typeof window === 'undefined') return;
-    // Wipe any legacy simulation data from previous turns
-    [
-      'deposito_products_v2', 'deposito_orders_v2', 'deposito_areas_v2', 'deposito_customers_v2',
-      'deposito_products_v3', 'deposito_orders_v3', 'deposito_areas_v3', 'deposito_customers_v3'
-    ].forEach(k => {
-      try { localStorage.removeItem(k); } catch { /* ignore */ }
-    });
-
-    if (!localStorage.getItem(STORAGE_KEY_PRODUCTS)) {
-      localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify([]));
-    }
-    if (!localStorage.getItem(STORAGE_KEY_ORDERS)) {
-      localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify([]));
-    }
-    const existingSettingsRaw = localStorage.getItem(STORAGE_KEY_SETTINGS);
-    if (!existingSettingsRaw) {
-      localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(initialSettings));
-    } else {
+    const legacyKeys = [
+      'deposito_products_v4',
+      'deposito_orders_v4',
+      'deposito_settings_v4',
+      'deposito_areas_v4',
+      'deposito_customers_v4',
+      'deposito_products_v3',
+      'deposito_orders_v3',
+      'deposito_areas_v3',
+      'deposito_customers_v3',
+      'deposito_products_v2',
+      'deposito_orders_v2',
+      'deposito_areas_v2',
+      'deposito_customers_v2',
+    ];
+    for (const key of legacyKeys) {
       try {
-        const parsed = JSON.parse(existingSettingsRaw);
-        let updated = false;
-        if (!parsed.supabaseUrl && initialSettings.supabaseUrl) {
-          parsed.supabaseUrl = initialSettings.supabaseUrl;
-          updated = true;
-        }
-        if (!parsed.supabaseAnonKey && initialSettings.supabaseAnonKey) {
-          parsed.supabaseAnonKey = initialSettings.supabaseAnonKey;
-          updated = true;
-        }
-        if (updated) {
-          localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(parsed));
-        }
+        localStorage.removeItem(key);
       } catch {
-        localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(initialSettings));
+        // ignore
       }
-    }
-    if (!localStorage.getItem(STORAGE_KEY_AREAS)) {
-      localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify([]));
-    }
-    if (!localStorage.getItem(STORAGE_KEY_CUSTOMERS)) {
-      localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify([]));
     }
   }
 
-  private setupBroadcastChannel() {
-    if (!broadcastChannel) return;
-    broadcastChannel.onmessage = (event) => {
-      if (event.data?.type === 'ORDER_CREATED') {
-        soundService.playNewOrderSound();
-      }
-      this.notifyListeners();
+  // ================= ADMIN AUTH & HEADERS =================
+  public getAdminToken(): string | null {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem(STORAGE_KEY_ADMIN_TOKEN);
+  }
+
+  public isAdminAuthenticated(): boolean {
+    return Boolean(this.getAdminToken());
+  }
+
+  private getAdminHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
     };
+    const token = this.getAdminToken();
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    return headers;
   }
 
-  private setupServerEvents() {
-    if (typeof window === 'undefined') return;
-    try {
-      this.eventSource = new EventSource('/api/events');
-      this.eventSource.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'NEW_ORDER') {
-            soundService.playNewOrderSound();
-          }
-          if (data.type === 'STATE_UPDATED' && data.payload) {
-            localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(data.payload.products));
-            localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify(data.payload.orders));
-            localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(data.payload.settings));
-            if (data.payload.deliveryAreas) {
-              localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(data.payload.deliveryAreas));
-            }
-            if (data.payload.customers) {
-              localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(data.payload.customers));
-            }
-          }
-          this.notifyListeners();
-        } catch (err) {
-          console.warn('SSE message parse error', err);
-        }
-      };
-    } catch {
-      // Ignored
+  /**
+   * Displays an unmistakable user-facing alert when database operations fail.
+   */
+  private notifyError(message: string) {
+    console.error(`[Depósito API Error] ${message}`);
+    if (typeof window !== 'undefined') {
+      try {
+        window.dispatchEvent(new CustomEvent('deposito_db_error', { detail: { message } }));
+      } catch {
+        // ignore
+      }
+      setTimeout(() => {
+        alert(message);
+      }, 50);
     }
   }
 
+  // ================= REACTIVITY & SSE =================
   public subscribe(listener: () => void): () => void {
     this.listeners.push(listener);
     return () => {
-      this.listeners = this.listeners.filter(l => l !== listener);
+      this.listeners = this.listeners.filter((l) => l !== listener);
     };
   }
 
   private notifyListeners() {
     this.version++;
-    this.listeners.forEach(fn => fn());
+    for (const fn of this.listeners) {
+      try {
+        fn();
+      } catch (err) {
+        console.error('Error notifying listener:', err);
+      }
+    }
   }
 
   public getVersion(): number {
     return this.version;
   }
 
-  public async syncWithBackend(): Promise<void> {
-    if (this.hasInitializedBackend) return;
+  private setupServerEvents() {
+    if (typeof window === 'undefined') return;
+
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
+    }
+
+    const token = this.getAdminToken();
+    if (!token) return; // SSE is restricted to authenticated admin
+
     try {
-      // 1. First attempt to load state from Supabase if configured
-      if (supabaseService.isConfigured()) {
-        const supaData = await supabaseService.loadAllFromSupabase();
-        if (supaData && (supaData.products || supaData.orders || supaData.settings || supaData.deliveryAreas || supaData.customers)) {
-          if (supaData.products) localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(supaData.products));
-          if (supaData.orders) localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify(supaData.orders));
-          if (supaData.settings) localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(supaData.settings));
-          if (supaData.deliveryAreas) localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(supaData.deliveryAreas));
-          if (supaData.customers) localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(supaData.customers));
-          this.hasInitializedBackend = true;
+      this.eventSource = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
+
+      this.eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'NEW_ORDER') {
+            soundService.playNewOrderSound();
+            if (data.payload) {
+              const existingIdx = this.state.orders.findIndex((o) => o.id === data.payload.id);
+              if (existingIdx === -1) {
+                this.state.orders.unshift(data.payload);
+              }
+            }
+          }
+
+          if (data.type === 'ORDER_STATUS_CHANGED' && data.payload) {
+            const idx = this.state.orders.findIndex((o) => o.id === data.payload.id);
+            if (idx >= 0) {
+              this.state.orders[idx] = data.payload;
+            }
+          }
+
+          if (data.type === 'STATE_UPDATED') {
+            this.syncWithBackend();
+          }
+
+          this.notifyListeners();
+        } catch (err) {
+          console.warn('Erro ao processar evento SSE:', err);
+        }
+      };
+
+      this.eventSource.onerror = () => {
+        // EventSource will auto-reconnect or close if unauthenticated
+      };
+    } catch {
+      // Ignored
+    }
+  }
+
+  // ================= DATA SYNCHRONIZATION =================
+  public async syncWithBackend(): Promise<void> {
+    const token = this.getAdminToken();
+
+    if (token) {
+      try {
+        const res = await fetch('/api/admin/state', {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          this.state = {
+            products: Array.isArray(data.products) ? data.products : [],
+            orders: Array.isArray(data.orders) ? data.orders : [],
+            settings: data.settings || initialSettings,
+            deliveryAreas: Array.isArray(data.deliveryAreas) ? data.deliveryAreas : [],
+            customers: Array.isArray(data.customers) ? data.customers : [],
+          };
+          this.setupServerEvents();
           this.notifyListeners();
           return;
         }
-      }
 
-      // 2. Fallback to Express backend state
+        if (res.status === 401) {
+          // Token expired or invalid
+          console.warn('[Admin] Sessão expirada ou inválida. Retornando ao estado público.');
+          this.logoutAdmin();
+          return;
+        }
+      } catch (err) {
+        console.warn('Erro ao buscar estado administrativo:', err);
+      }
+    }
+
+    // Public state for store customer
+    try {
       const res = await fetch('/api/state');
       if (res.ok) {
-        const data: AppState = await res.json();
-        if (data.products && data.orders && data.settings) {
-          localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(data.products));
-          localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify(data.orders));
-          localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(data.settings));
-          if (data.deliveryAreas) {
-            localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(data.deliveryAreas));
-          }
-          if (data.customers) {
-            localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(data.customers));
-          }
-          this.hasInitializedBackend = true;
-          this.notifyListeners();
-        }
+        const data = await res.json();
+        this.state = {
+          products: Array.isArray(data.products) ? data.products : [],
+          orders: [],
+          settings: data.settings || initialSettings,
+          deliveryAreas: Array.isArray(data.deliveryAreas) ? data.deliveryAreas : [],
+          customers: [],
+        };
+        this.notifyListeners();
       }
-    } catch {
-      // Offline fallback
+    } catch (err) {
+      console.warn('Erro ao buscar estado público da loja:', err);
     }
   }
 
   // ================= ADMIN SECURITY / PIN =================
-  public isAdminAuthenticated(): boolean {
-    if (typeof window === 'undefined') return false;
-    return sessionStorage.getItem(STORAGE_KEY_ADMIN_AUTH) === 'true';
-  }
-
   public async verifyAdminPin(pin: string): Promise<boolean> {
-    const settings = this.getSettings();
-    const correctPin = settings.adminPin || '1234';
-    const isOk = String(pin).trim() === String(correctPin).trim();
+    try {
+      const res = await fetch('/api/admin/verify-pin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin }),
+      });
 
-    if (isOk) {
-      sessionStorage.setItem(STORAGE_KEY_ADMIN_AUTH, 'true');
-      this.notifyListeners();
-      return true;
+      if (!res.ok) {
+        return false;
+      }
+
+      const data = await res.json();
+      if (data && data.token) {
+        localStorage.setItem(STORAGE_KEY_ADMIN_TOKEN, data.token);
+        await this.syncWithBackend();
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.error('Erro ao verificar PIN do admin:', err);
+      return false;
     }
-    return false;
   }
 
   public logoutAdmin(): void {
     if (typeof window !== 'undefined') {
-      sessionStorage.removeItem(STORAGE_KEY_ADMIN_AUTH);
-      this.notifyListeners();
+      localStorage.removeItem(STORAGE_KEY_ADMIN_TOKEN);
     }
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
+    }
+    this.state.orders = [];
+    this.state.customers = [];
+    this.syncWithBackend();
+    this.notifyListeners();
   }
 
   // ================= PRODUCTS =================
   public getProducts(): Product[] {
-    try {
-      const data = localStorage.getItem(STORAGE_KEY_PRODUCTS);
-      return data ? JSON.parse(data) : initialProducts;
-    } catch {
-      return initialProducts;
-    }
+    return this.state.products;
   }
 
   public async saveProduct(product: Product): Promise<void> {
-    const products = this.getProducts();
-    const existingIndex = products.findIndex(p => p.id === product.id);
+    const isEdit = this.state.products.some((p) => p.id === product.id);
+    const url = isEdit ? `/api/products/${product.id}` : '/api/products';
+    const method = isEdit ? 'PUT' : 'POST';
 
-    let updated: Product[];
-    if (existingIndex >= 0) {
-      updated = [...products];
-      updated[existingIndex] = product;
+    const res = await fetch(url, {
+      method,
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(product),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível salvar o produto no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const saved: Product = await res.json();
+    const idx = this.state.products.findIndex((p) => p.id === saved.id);
+    if (idx >= 0) {
+      this.state.products[idx] = saved;
     } else {
-      updated = [product, ...products];
+      this.state.products.unshift(saved);
     }
-
-    localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(updated));
     this.notifyListeners();
-    if (broadcastChannel) {
-      broadcastChannel.postMessage({ type: 'PRODUCTS_UPDATED' });
-    }
-
-    // Persist to Supabase
-    supabaseService.saveProduct(product).catch(err => console.warn('Supabase saveProduct error', err));
-
-    try {
-      await fetch(existingIndex >= 0 ? `/api/products/${product.id}` : '/api/products', {
-        method: existingIndex >= 0 ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(product),
-      });
-    } catch {
-      // Ignored
-    }
   }
 
   public async adjustStock(productId: string, delta: number): Promise<void> {
-    const products = this.getProducts();
-    const prod = products.find(p => p.id === productId);
-    if (!prod) return;
+    const res = await fetch(`/api/products/${productId}/stock`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ delta }),
+    });
 
-    prod.stock = Math.max(0, prod.stock + delta);
-    localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(products));
-    this.notifyListeners();
-
-    // Persist to Supabase
-    supabaseService.saveProduct(prod).catch(err => console.warn('Supabase adjustStock error', err));
-
-    try {
-      await fetch(`/api/products/${productId}/stock`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ delta }),
-      });
-    } catch {
-      // Ignored
+    if (!res.ok) {
+      let message = 'Não foi possível alterar o estoque no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
     }
+
+    const updated: Product = await res.json();
+    const idx = this.state.products.findIndex((p) => p.id === productId);
+    if (idx >= 0) {
+      this.state.products[idx] = updated;
+    }
+    this.notifyListeners();
   }
 
   public async deleteProduct(productId: string): Promise<void> {
-    const products = this.getProducts().filter(p => p.id !== productId);
-    localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(products));
-    this.notifyListeners();
+    const res = await fetch(`/api/products/${productId}`, {
+      method: 'DELETE',
+      headers: this.getAdminHeaders(),
+    });
 
-    // Persist to Supabase
-    supabaseService.deleteProduct(productId).catch(err => console.warn('Supabase deleteProduct error', err));
-
-    try {
-      await fetch(`/api/products/${productId}`, { method: 'DELETE' });
-    } catch {
-      // Ignored
+    if (!res.ok) {
+      let message = 'Não foi possível excluir o produto no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
     }
+
+    this.state.products = this.state.products.filter((p) => p.id !== productId);
+    this.notifyListeners();
   }
 
   // ================= DELIVERY AREAS =================
   public getDeliveryAreas(): DeliveryArea[] {
-    try {
-      const data = localStorage.getItem(STORAGE_KEY_AREAS);
-      return data ? JSON.parse(data) : initialDeliveryAreas;
-    } catch {
-      return initialDeliveryAreas;
-    }
+    return this.state.deliveryAreas;
   }
 
   public async saveDeliveryArea(area: DeliveryArea): Promise<void> {
-    const areas = this.getDeliveryAreas();
-    const existingIndex = areas.findIndex(a => a.id === area.id);
+    const isEdit = this.state.deliveryAreas.some((a) => a.id === area.id);
+    const url = isEdit ? `/api/delivery-areas/${area.id}` : '/api/delivery-areas';
+    const method = isEdit ? 'PUT' : 'POST';
 
-    let updated: DeliveryArea[];
-    if (existingIndex >= 0) {
-      updated = [...areas];
-      updated[existingIndex] = area;
+    const res = await fetch(url, {
+      method,
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(area),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível salvar o bairro de entrega no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const saved: DeliveryArea = await res.json();
+    const idx = this.state.deliveryAreas.findIndex((a) => a.id === saved.id);
+    if (idx >= 0) {
+      this.state.deliveryAreas[idx] = saved;
     } else {
-      updated = [...areas, area];
+      this.state.deliveryAreas.push(saved);
     }
-
-    localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(updated));
     this.notifyListeners();
-
-    // Persist to Supabase
-    supabaseService.saveDeliveryArea(area).catch(err => console.warn('Supabase saveDeliveryArea error', err));
-
-    try {
-      await fetch(existingIndex >= 0 ? `/api/delivery-areas/${area.id}` : '/api/delivery-areas', {
-        method: existingIndex >= 0 ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(area),
-      });
-    } catch {
-      // Ignored
-    }
   }
 
   public async deleteDeliveryArea(id: string): Promise<void> {
-    const areas = this.getDeliveryAreas().filter(a => a.id !== id);
-    localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(areas));
-    this.notifyListeners();
+    const res = await fetch(`/api/delivery-areas/${id}`, {
+      method: 'DELETE',
+      headers: this.getAdminHeaders(),
+    });
 
-    // Persist to Supabase
-    supabaseService.deleteDeliveryArea(id).catch(err => console.warn('Supabase deleteDeliveryArea error', err));
-
-    try {
-      await fetch(`/api/delivery-areas/${id}`, { method: 'DELETE' });
-    } catch {
-      // Ignored
+    if (!res.ok) {
+      let message = 'Não foi possível excluir o bairro de entrega no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
     }
+
+    this.state.deliveryAreas = this.state.deliveryAreas.filter((a) => a.id !== id);
+    this.notifyListeners();
   }
 
   // ================= CUSTOMERS & AUTH =================
   public getCustomers(): CustomerProfile[] {
-    try {
-      const data = localStorage.getItem(STORAGE_KEY_CUSTOMERS);
-      return data ? JSON.parse(data) : initialCustomers;
-    } catch {
-      return initialCustomers;
-    }
+    return this.state.customers;
   }
 
   public getCurrentCustomer(): CustomerProfile | null {
+    if (typeof window === 'undefined') return null;
     try {
       const data = localStorage.getItem(STORAGE_KEY_CURRENT_CUSTOMER);
       return data ? JSON.parse(data) : null;
@@ -361,6 +432,7 @@ class ApiService {
   }
 
   public setCurrentCustomer(cust: CustomerProfile | null): void {
+    if (typeof window === 'undefined') return;
     if (cust) {
       localStorage.setItem(STORAGE_KEY_CURRENT_CUSTOMER, JSON.stringify(cust));
     } else {
@@ -369,239 +441,220 @@ class ApiService {
     this.notifyListeners();
   }
 
-  public async saveCustomerProfile(custData: Omit<CustomerProfile, 'id' | 'createdAt'> & { id?: string }): Promise<CustomerProfile> {
-    const customers = this.getCustomers();
-    const cleanPhone = custData.phone.replace(/\D/g, '');
-    const existingIndex = customers.findIndex(c => c.phone.replace(/\D/g, '') === cleanPhone);
-
-    let savedCust: CustomerProfile;
-    if (existingIndex >= 0) {
-      savedCust = { ...customers[existingIndex], ...custData };
-      customers[existingIndex] = savedCust;
-    } else {
-      savedCust = {
-        ...custData,
-        id: custData.id || `cust-${Date.now()}`,
-        createdAt: new Date().toISOString(),
-        totalOrdersCount: 0,
-        totalSpent: 0,
-      };
-      customers.unshift(savedCust);
-    }
-
-    localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(customers));
-    this.setCurrentCustomer(savedCust);
-
-    // Persist to Supabase
-    supabaseService.saveCustomer(savedCust).catch(err => console.warn('Supabase saveCustomer error', err));
-
-    try {
-      await fetch('/api/customers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(savedCust),
-      });
-    } catch {
-      // Ignored
-    }
-
-    return savedCust;
-  }
-
-  public findCustomerByPhone(phone: string): CustomerProfile | null {
+  public async findCustomerByPhone(phone: string): Promise<CustomerProfile | null> {
     const clean = phone.replace(/\D/g, '');
     if (!clean) return null;
-    const customers = this.getCustomers();
-    return customers.find(c => c.phone.replace(/\D/g, '') === clean) || null;
+
+    try {
+      const res = await fetch(`/api/customers/by-phone/${clean}`);
+      if (res.ok) {
+        return await res.json();
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  public async saveCustomerProfile(
+    custData: Omit<CustomerProfile, 'id' | 'createdAt'> & { id?: string }
+  ): Promise<CustomerProfile> {
+    const res = await fetch('/api/customers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(custData),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível salvar o cadastro do cliente no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const saved: CustomerProfile = await res.json();
+    this.setCurrentCustomer(saved);
+
+    if (this.isAdminAuthenticated()) {
+      const cleanPhone = saved.phone.replace(/\D/g, '');
+      const idx = this.state.customers.findIndex(
+        (c) => c.id === saved.id || c.phone.replace(/\D/g, '') === cleanPhone
+      );
+      if (idx >= 0) {
+        this.state.customers[idx] = saved;
+      } else {
+        this.state.customers.unshift(saved);
+      }
+    }
+
+    this.notifyListeners();
+    return saved;
   }
 
   public async deleteCustomer(id: string): Promise<void> {
-    let customers = this.getCustomers();
-    customers = customers.filter(c => c.id !== id);
-    localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(customers));
-    this.notifyListeners();
+    const res = await fetch(`/api/customers/${id}`, {
+      method: 'DELETE',
+      headers: this.getAdminHeaders(),
+    });
 
-    try {
-      await fetch(`/api/customers/${id}`, { method: 'DELETE' });
-    } catch {
-      // Ignored
+    if (!res.ok) {
+      let message = 'Não foi possível excluir o cliente no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
     }
+
+    this.state.customers = this.state.customers.filter((c) => c.id !== id);
+    this.notifyListeners();
   }
 
   // ================= ORDERS =================
   public getOrders(): Order[] {
-    try {
-      const data = localStorage.getItem(STORAGE_KEY_ORDERS);
-      const orders: Order[] = data ? JSON.parse(data) : initialOrders;
-      return orders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    } catch {
-      return initialOrders;
-    }
+    return this.state.orders.sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
   }
 
-  public async createOrder(newOrder: Omit<Order, 'id' | 'createdAt' | 'updatedAt' | 'status'> & { id?: string }): Promise<Order> {
-    const orders = this.getOrders();
-    const randomNum = Math.floor(1000 + Math.random() * 9000);
-    const orderId = newOrder.id || `PED-${randomNum}`;
+  public async createOrder(
+    newOrder: Omit<Order, 'id' | 'createdAt' | 'updatedAt' | 'status'> & { id?: string }
+  ): Promise<Order> {
+    const res = await fetch('/api/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newOrder),
+    });
 
-    const order: Order = {
-      ...newOrder,
-      id: orderId,
-      status: 'pendente',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-
-    // Decrement stock
-    const products = this.getProducts();
-    for (const item of order.items) {
-      const prod = products.find(p => p.id === item.productId);
-      if (prod) {
-        prod.stock = Math.max(0, prod.stock - item.quantity);
+    if (!res.ok) {
+      let message = 'Não foi possível realizar o pedido.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {
+        // ignore
       }
-    }
-    localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(products));
-
-    // Update customer history if customer
-    if (order.customer && order.customer.phone) {
-      await this.saveCustomerProfile({
-        name: order.customer.name,
-        phone: order.customer.phone,
-        address: order.customer.address,
-        number: order.customer.number,
-        neighborhood: order.customer.neighborhood,
-        complement: order.customer.complement,
-        reference: order.customer.reference,
-      });
+      this.notifyError(message);
+      throw new Error(message);
     }
 
-    const updatedOrders = [order, ...orders];
-    localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify(updatedOrders));
+    const createdOrder: Order = await res.json();
+
+    if (this.isAdminAuthenticated()) {
+      this.state.orders.unshift(createdOrder);
+    }
 
     soundService.playNewOrderSound();
-    if (broadcastChannel) {
-      broadcastChannel.postMessage({ type: 'ORDER_CREATED', orderId: order.id });
-    }
-
     this.notifyListeners();
-
-    // Persist to Supabase
-    supabaseService.saveOrder(order).catch(err => console.warn('Supabase saveOrder error', err));
-
-    try {
-      await fetch('/api/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(order),
-      });
-    } catch {
-      // Ignored
-    }
-
-    return order;
+    return createdOrder;
   }
 
   public async updateOrderStatus(orderId: string, status: OrderStatus): Promise<void> {
-    const orders = this.getOrders();
-    const order = orders.find(o => o.id === orderId);
-    if (!order) return;
+    const res = await fetch(`/api/orders/${orderId}/status`, {
+      method: 'PATCH',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ status }),
+    });
 
-    order.status = status;
-    order.updatedAt = new Date().toISOString();
-
-    localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify(orders));
-    this.notifyListeners();
-
-    // Persist to Supabase
-    supabaseService.updateOrderStatus(orderId, status).catch(err => console.warn('Supabase updateOrderStatus error', err));
-
-    try {
-      await fetch(`/api/orders/${orderId}/status`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
-      });
-    } catch {
-      // Ignored
+    if (!res.ok) {
+      let message = 'Não foi possível atualizar o status do pedido no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
     }
+
+    const updated: Order = await res.json();
+    const idx = this.state.orders.findIndex((o) => o.id === orderId);
+    if (idx >= 0) {
+      this.state.orders[idx] = updated;
+    }
+    this.notifyListeners();
+  }
+
+  public async deleteOrder(orderId: string): Promise<void> {
+    const res = await fetch(`/api/orders/${orderId}`, {
+      method: 'DELETE',
+      headers: this.getAdminHeaders(),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível excluir o pedido no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    this.state.orders = this.state.orders.filter((o) => o.id !== orderId);
+    this.notifyListeners();
   }
 
   // ================= SETTINGS =================
   public getSettings(): StoreSettings {
-    try {
-      const data = localStorage.getItem(STORAGE_KEY_SETTINGS);
-      return data ? JSON.parse(data) : initialSettings;
-    } catch {
-      return initialSettings;
-    }
+    return this.state.settings;
   }
 
   public async updateSettings(settings: Partial<StoreSettings>): Promise<void> {
-    const current = this.getSettings();
-    const updated = { ...current, ...settings };
-    localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(updated));
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(settings),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível salvar as configurações no banco de dados.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const updated: StoreSettings = await res.json();
+    this.state.settings = updated;
     soundService.setSoundEnabled(updated.soundEnabled);
     this.notifyListeners();
-
-    // Re-initialize Supabase client if credentials changed
-    if (updated.supabaseUrl && updated.supabaseAnonKey) {
-      supabaseService.initFromEnvOrStorage(updated.supabaseUrl, updated.supabaseAnonKey);
-    }
-    // Persist to Supabase
-    supabaseService.saveSettings(updated).catch(err => console.warn('Supabase saveSettings error', err));
-
-    try {
-      await fetch('/api/settings', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updated),
-      });
-    } catch {
-      // Ignored
-    }
-  }
-
-  // ================= SUPABASE HELPERS =================
-  public async testSupabase(): Promise<{ success: boolean; message: string }> {
-    return supabaseService.testConnection();
-  }
-
-  public async syncAllToSupabase(): Promise<{ success: boolean; message: string }> {
-    return supabaseService.syncAllToSupabase({
-      products: this.getProducts(),
-      orders: this.getOrders(),
-      settings: this.getSettings(),
-      deliveryAreas: this.getDeliveryAreas(),
-      customers: this.getCustomers(),
-    });
-  }
-
-  public isSupabaseConnected(): boolean {
-    return supabaseService.isConfigured();
   }
 
   public async clearAllSimulationData(): Promise<void> {
-    localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify([]));
-    localStorage.removeItem(STORAGE_KEY_CURRENT_CUSTOMER);
-    this.notifyListeners();
+    const res = await fetch('/api/clear-all', {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+    });
 
-    try {
-      await fetch('/api/clear-all', { method: 'POST' });
-    } catch {
-      // Ignored
+    if (!res.ok) {
+      let message = 'Não foi possível zerar os dados de simulação.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+      } catch {
+        // ignore
+      }
+      this.notifyError(message);
+      throw new Error(message);
     }
-  }
 
-  public resetToDefaults() {
-    localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(initialSettings));
-    localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify([]));
-    this.notifyListeners();
+    await this.syncWithBackend();
   }
 }
 
