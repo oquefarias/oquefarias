@@ -4,6 +4,8 @@ import { api } from '../../services/api';
 import {
   User,
   Phone,
+  Mail,
+  Lock,
   MapPin,
   X,
   ArrowRight,
@@ -12,6 +14,7 @@ import {
   Search,
   Loader2,
   Compass,
+  LogOut,
   AlertTriangle,
 } from 'lucide-react';
 import {
@@ -28,6 +31,7 @@ interface CustomerAuthModalProps {
   settings?: StoreSettings;
   onSuccess: (cust: CustomerProfile) => void;
   onClose: () => void;
+  onLogout?: () => void;
 }
 
 export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
@@ -37,17 +41,22 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   settings,
   onSuccess,
   onClose,
+  onLogout,
 }) => {
-  const [tab, setTab] = useState<'login' | 'cadastro'>(currentCustomer ? 'cadastro' : 'login');
+  const [tab, setTab] = useState<'login' | 'cadastro' | 'perfil'>('login');
 
-  // Login by phone
-  const [phoneSearch, setPhoneSearch] = useState<string>('');
+  // Login form
+  const [loginEmail, setLoginEmail] = useState<string>('');
+  const [loginPassword, setLoginPassword] = useState<string>('');
   const [loginError, setLoginError] = useState<string>('');
-  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isLoadingLogin, setIsLoadingLogin] = useState<boolean>(false);
 
-  // Register form
+  // Register / Edit form
   const [name, setName] = useState<string>('');
+  const [email, setEmail] = useState<string>('');
   const [phone, setPhone] = useState<string>('');
+  const [password, setPassword] = useState<string>('');
+  const [confirmPassword, setConfirmPassword] = useState<string>('');
   const [cep, setCep] = useState<string>('');
   const [address, setAddress] = useState<string>('');
   const [number, setNumber] = useState<string>('');
@@ -67,10 +76,14 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     type: 'success' | 'warn' | 'error';
     text: string;
   } | null>(null);
+  const [registerError, setRegisterError] = useState<string>('');
+  const [isSubmittingRegister, setIsSubmittingRegister] = useState<boolean>(false);
 
   useEffect(() => {
     if (currentCustomer) {
+      setTab('perfil');
       setName(currentCustomer.name || '');
+      setEmail(currentCustomer.email || '');
       setPhone(currentCustomer.phone || '');
       setCep(currentCustomer.cep || '');
       setAddress(currentCustomer.address || '');
@@ -85,8 +98,12 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setDistanceKm(currentCustomer.distanceKm ?? null);
       setIsWithinRadius(currentCustomer.isWithinDeliveryRadius ?? null);
     } else {
+      setTab('login');
       setName('');
+      setEmail('');
       setPhone('');
+      setPassword('');
+      setConfirmPassword('');
       setCep('');
       setAddress('');
       setNumber('');
@@ -99,31 +116,33 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setLng(undefined);
       setDistanceKm(null);
       setIsWithinRadius(null);
+      setLoginError('');
+      setRegisterError('');
     }
   }, [currentCustomer, isOpen, deliveryAreas]);
 
   if (!isOpen) return null;
 
-  const handlePhoneLogin = async (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!phoneSearch.trim()) return;
+    if (!loginEmail.trim() || !loginPassword.trim()) {
+      setLoginError('Preencha seu e-mail e senha.');
+      return;
+    }
 
-    setIsLoading(true);
+    setIsLoadingLogin(true);
     setLoginError('');
     try {
-      const found = await api.findCustomerByPhone(phoneSearch);
-      if (found) {
-        api.setCurrentCustomer(found);
-        onSuccess(found);
+      const res = await api.loginCustomer(loginEmail, loginPassword);
+      if (res.success && res.customer) {
+        onSuccess(res.customer);
       } else {
-        setLoginError('Telefone não encontrado. Cadastre-se abaixo rapidamente em 1 minuto!');
-        setPhone(phoneSearch);
-        setTab('cadastro');
+        setLoginError(res.error || 'E-mail ou senha incorretos.');
       }
     } catch {
-      setLoginError('Erro ao consultar telefone. Tente novamente.');
+      setLoginError('Servidor indisponível. Tente novamente em instantes.');
     } finally {
-      setIsLoading(false);
+      setIsLoadingLogin(false);
     }
   };
 
@@ -235,30 +254,103 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || !phone.trim() || !address.trim() || !number.trim() || !neighborhood.trim()) {
-      alert('Por favor, preencha todos os campos obrigatórios.');
+    setRegisterError('');
+
+    if (!name.trim() || !email.trim() || !phone.trim() || !address.trim() || !number.trim() || !neighborhood.trim()) {
+      setRegisterError('Por favor, preencha todos os campos obrigatórios (*).');
       return;
     }
 
-    const saved = await api.saveCustomerProfile({
-      id: currentCustomer?.id,
-      name: name.trim(),
-      phone: phone.trim(),
-      cep: cep.trim(),
-      address: address.trim(),
-      number: number.trim(),
-      neighborhood: neighborhood.trim(),
-      city: city.trim(),
-      state: state.trim(),
-      complement: complement.trim(),
-      reference: reference.trim(),
-      latitude: lat,
-      longitude: lng,
-      distanceKm: distanceKm ?? undefined,
-      isWithinDeliveryRadius: isWithinRadius ?? undefined,
-    });
+    if (!email.includes('@')) {
+      setRegisterError('Digite um e-mail válido.');
+      return;
+    }
 
-    onSuccess(saved);
+    if (password.length < 8) {
+      setRegisterError('A senha deve conter no mínimo 8 caracteres.');
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      setRegisterError('As senhas não coincidem. Digite novamente.');
+      return;
+    }
+
+    setIsSubmittingRegister(true);
+    try {
+      const saved = await api.registerCustomer({
+        name: name.trim(),
+        email: email.trim().toLowerCase(),
+        phone: phone.trim(),
+        password,
+        cep: cep.trim(),
+        address: address.trim(),
+        number: number.trim(),
+        neighborhood: neighborhood.trim(),
+        city: city.trim(),
+        state: state.trim(),
+        complement: complement.trim(),
+        reference: reference.trim(),
+        latitude: lat,
+        longitude: lng,
+        distanceKm: distanceKm ?? undefined,
+        isWithinDeliveryRadius: isWithinRadius ?? undefined,
+      });
+
+      onSuccess(saved);
+    } catch (err: any) {
+      setRegisterError(err.message || 'Erro ao realizar cadastro.');
+    } finally {
+      setIsSubmittingRegister(false);
+    }
+  };
+
+  const handleUpdateProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setRegisterError('');
+
+    if (!name.trim() || !phone.trim() || !address.trim() || !number.trim() || !neighborhood.trim()) {
+      setRegisterError('Preencha os campos obrigatórios (*).');
+      return;
+    }
+
+    if (password && password.length < 8) {
+      setRegisterError('A nova senha deve ter no mínimo 8 caracteres.');
+      return;
+    }
+
+    setIsSubmittingRegister(true);
+    try {
+      const updated = await api.updateCustomerMe({
+        name: name.trim(),
+        phone: phone.trim(),
+        password: password ? password : undefined,
+        cep: cep.trim(),
+        address: address.trim(),
+        number: number.trim(),
+        neighborhood: neighborhood.trim(),
+        city: city.trim(),
+        state: state.trim(),
+        complement: complement.trim(),
+        reference: reference.trim(),
+        latitude: lat,
+        longitude: lng,
+        distanceKm: distanceKm ?? undefined,
+        isWithinDeliveryRadius: isWithinRadius ?? undefined,
+      });
+
+      onSuccess(updated);
+    } catch (err: any) {
+      setRegisterError(err.message || 'Erro ao atualizar dados.');
+    } finally {
+      setIsSubmittingRegister(false);
+    }
+  };
+
+  const handleLogoutClick = () => {
+    api.logoutCustomer();
+    if (onLogout) onLogout();
+    onClose();
   };
 
   const maxRadiusKm = settings?.deliveryRadiusKm || 5;
@@ -280,83 +372,151 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
           </div>
 
           <h3 className="font-black text-xl">
-            {currentCustomer ? 'Meu Cadastro de Entrega' : 'Acesse ou Cadastre-se'}
+            {currentCustomer ? 'Minha Conta de Entrega' : 'Identifique-se para Comprar'}
           </h3>
           <p className="text-xs text-amber-100 mt-1">
-            Cadastre seu endereço pelo CEP para entrega rápida e segura no seu endereço.
+            {currentCustomer
+              ? 'Visualize ou atualize seus dados de entrega.'
+              : 'Faça login ou crie sua conta para finalizar seus pedidos com segurança.'}
           </p>
 
           {/* Tab selector */}
-          {!currentCustomer && (
+          {!currentCustomer ? (
             <div className="flex bg-black/20 p-1 rounded-xl mt-4 text-xs font-bold">
               <button
                 type="button"
-                onClick={() => setTab('login')}
+                onClick={() => {
+                  setTab('login');
+                  setLoginError('');
+                }}
                 className={`flex-1 py-1.5 rounded-lg transition-all cursor-pointer ${
                   tab === 'login' ? 'bg-white text-amber-950 shadow-xs' : 'text-amber-100 hover:text-white'
                 }`}
               >
-                Já sou Cliente
+                Já tenho Conta (Entrar)
               </button>
               <button
                 type="button"
-                onClick={() => setTab('cadastro')}
+                onClick={() => {
+                  setTab('cadastro');
+                  setRegisterError('');
+                }}
                 className={`flex-1 py-1.5 rounded-lg transition-all cursor-pointer ${
                   tab === 'cadastro' ? 'bg-white text-amber-950 shadow-xs' : 'text-amber-100 hover:text-white'
                 }`}
               >
-                Primeiro Pedido (Cadastrar)
+                Criar Nova Conta
+              </button>
+            </div>
+          ) : (
+            <div className="mt-3 flex items-center justify-between text-xs bg-black/15 px-3 py-1.5 rounded-xl">
+              <span className="font-medium text-amber-100">Logado como: <strong className="text-white">{currentCustomer.name}</strong></span>
+              <button
+                type="button"
+                onClick={handleLogoutClick}
+                className="text-white font-bold flex items-center gap-1 hover:underline cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Sair</span>
               </button>
             </div>
           )}
         </div>
 
-        {/* Tab 1: Phone Login */}
-        {tab === 'login' && !currentCustomer ? (
-          <form onSubmit={handlePhoneLogin} className="p-6 space-y-4">
+        {/* Tab 1: Email + Password Login */}
+        {tab === 'login' && !currentCustomer && (
+          <form onSubmit={handleLogin} className="p-6 space-y-4">
             <div>
               <label className="text-xs font-bold text-neutral-700 block mb-1">
-                Digite seu número de WhatsApp / Celular
+                E-mail
               </label>
               <div className="relative">
-                <Phone className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
+                <Mail className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
                 <input
-                  type="tel"
+                  type="email"
                   required
-                  placeholder="(11) 99999-8888"
-                  value={phoneSearch}
+                  placeholder="seu@email.com"
+                  value={loginEmail}
                   onChange={(e) => {
-                    setPhoneSearch(e.target.value);
+                    setLoginEmail(e.target.value);
                     if (loginError) setLoginError('');
                   }}
-                  className="w-full pl-9 pr-3 py-2.5 bg-neutral-50 border border-neutral-300 rounded-xl text-sm font-semibold"
+                  className="w-full pl-9 pr-3 py-2.5 bg-neutral-50 border border-neutral-300 rounded-xl text-sm font-semibold outline-amber-500"
                 />
               </div>
-              <p className="text-[11px] text-neutral-400 mt-1">
-                Localizaremos seu endereço salvo automaticamente.
-              </p>
+            </div>
+
+            <div>
+              <label className="text-xs font-bold text-neutral-700 block mb-1">
+                Senha
+              </label>
+              <div className="relative">
+                <Lock className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
+                <input
+                  type="password"
+                  required
+                  placeholder="••••••••"
+                  value={loginPassword}
+                  onChange={(e) => {
+                    setLoginPassword(e.target.value);
+                    if (loginError) setLoginError('');
+                  }}
+                  className="w-full pl-9 pr-3 py-2.5 bg-neutral-50 border border-neutral-300 rounded-xl text-sm font-semibold outline-amber-500"
+                />
+              </div>
             </div>
 
             {loginError && (
-              <p className="text-xs text-amber-800 bg-amber-50 p-2.5 rounded-xl border border-amber-200">
+              <p className="text-xs text-red-800 bg-red-50 p-2.5 rounded-xl border border-red-200 font-medium">
                 {loginError}
               </p>
             )}
 
             <button
               type="submit"
-              className="w-full py-3 bg-amber-500 hover:bg-amber-600 text-white font-black text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
+              disabled={isLoadingLogin}
+              className="w-full py-3 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white font-black text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
             >
-              <span>Continuar</span>
-              <ArrowRight className="w-4 h-4" />
+              {isLoadingLogin ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Entrando...</span>
+                </>
+              ) : (
+                <>
+                  <span>Entrar na Minha Conta</span>
+                  <ArrowRight className="w-4 h-4" />
+                </>
+              )}
             </button>
+
+            <div className="pt-2 text-center">
+              <button
+                type="button"
+                onClick={() => setTab('cadastro')}
+                className="text-xs text-amber-700 hover:text-amber-800 font-bold hover:underline cursor-pointer"
+              >
+                Primeira vez aqui? Crie sua conta em 1 minuto →
+              </button>
+            </div>
           </form>
-        ) : (
-          /* Tab 2: Register / Edit Profile */
-          <form onSubmit={handleRegister} className="p-6 space-y-3.5 text-xs">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        )}
+
+        {/* Tab 2: Register (New Customer) OR Tab 3: Edit Profile */}
+        {(tab === 'cadastro' || tab === 'perfil') && (
+          <form
+            onSubmit={tab === 'perfil' ? handleUpdateProfile : handleRegister}
+            className="p-6 space-y-3 text-xs max-h-[75vh] overflow-y-auto"
+          >
+            {registerError && (
+              <p className="text-xs text-red-800 bg-red-50 p-2.5 rounded-xl border border-red-200 font-bold">
+                {registerError}
+              </p>
+            )}
+
+            <div className="space-y-3">
               <div>
-                <label className="font-bold text-neutral-700 block mb-1">Seu Nome *</label>
+                <label className="font-bold text-neutral-700 block mb-1">Nome Completo *</label>
                 <input
                   type="text"
                   required
@@ -366,21 +526,66 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                   className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
                 />
               </div>
-              <div>
-                <label className="font-bold text-neutral-700 block mb-1">WhatsApp / Celular *</label>
-                <input
-                  type="tel"
-                  required
-                  placeholder="(11) 98888-7777"
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
-                  className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
-                />
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">E-mail *</label>
+                  <input
+                    type="email"
+                    required
+                    disabled={tab === 'perfil'}
+                    placeholder="seu@email.com"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    className="w-full px-3 py-2 bg-neutral-50 disabled:bg-neutral-100 border border-neutral-300 rounded-xl"
+                  />
+                </div>
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">WhatsApp / Celular *</label>
+                  <input
+                    type="tel"
+                    required
+                    placeholder="(11) 98888-7777"
+                    value={phone}
+                    onChange={(e) => setPhone(e.target.value)}
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                  />
+                </div>
+              </div>
+
+              {/* Password inputs */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">
+                    {tab === 'perfil' ? 'Nova Senha (opcional)' : 'Senha (mínimo 8 dígitos) *'}
+                  </label>
+                  <input
+                    type="password"
+                    required={tab === 'cadastro'}
+                    placeholder="Mínimo 8 caracteres"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                  />
+                </div>
+                {tab === 'cadastro' && (
+                  <div>
+                    <label className="font-bold text-neutral-700 block mb-1">Confirmar Senha *</label>
+                    <input
+                      type="password"
+                      required
+                      placeholder="Repita a senha"
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                    />
+                  </div>
+                )}
               </div>
             </div>
 
             {/* CEP SEARCH SECTION */}
-            <div className="p-3.5 bg-amber-50/70 border-2 border-amber-300/80 rounded-2xl space-y-2">
+            <div className="p-3 bg-amber-50/80 border-2 border-amber-300/80 rounded-2xl space-y-2 mt-2">
               <label className="font-black text-amber-950 flex items-center justify-between text-xs">
                 <span className="flex items-center gap-1">
                   <Building2 className="w-3.5 h-3.5 text-amber-600" />
@@ -436,7 +641,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
             <div className="space-y-2.5">
               <div className="grid grid-cols-3 gap-2">
                 <div className="col-span-2">
-                  <label className="font-bold text-neutral-700 block mb-1">Rua / Avenida *</label>
+                  <label className="font-bold text-neutral-700 block mb-1">Rua / Logradouro *</label>
                   <input
                     type="text"
                     required
@@ -471,7 +676,6 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                     required
                   />
                 </div>
-
                 <div>
                   <label className="font-bold text-neutral-700 block mb-1">Complemento</label>
                   <input
@@ -484,11 +688,35 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                 </div>
               </div>
 
+              <div className="grid grid-cols-3 gap-2">
+                <div className="col-span-2">
+                  <label className="font-bold text-neutral-700 block mb-1">Cidade</label>
+                  <input
+                    type="text"
+                    placeholder="São Paulo"
+                    value={city}
+                    onChange={(e) => setCity(e.target.value)}
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                  />
+                </div>
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">UF</label>
+                  <input
+                    type="text"
+                    maxLength={2}
+                    placeholder="SP"
+                    value={state}
+                    onChange={(e) => setState(e.target.value.toUpperCase())}
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl uppercase font-bold"
+                  />
+                </div>
+              </div>
+
               <div>
                 <label className="font-bold text-neutral-700 block mb-1">Ponto de Referência</label>
                 <input
                   type="text"
-                  placeholder="Ex: Em frente à padaria, portão branco"
+                  placeholder="Ex: Em frente à padaria, portão preto"
                   value={reference}
                   onChange={(e) => setReference(e.target.value)}
                   className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
@@ -499,12 +727,34 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
             <div className="pt-2">
               <button
                 type="submit"
-                className="w-full py-3 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
+                disabled={isSubmittingRegister}
+                className="w-full py-3 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
-                <CheckCircle2 className="w-4 h-4" />
-                <span>Salvar Cadastro e Continuar</span>
+                {isSubmittingRegister ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Salvando...</span>
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>{tab === 'perfil' ? 'Atualizar Dados' : 'Criar Minha Conta e Continuar'}</span>
+                  </>
+                )}
               </button>
             </div>
+
+            {tab === 'cadastro' && (
+              <div className="text-center pt-1">
+                <button
+                  type="button"
+                  onClick={() => setTab('login')}
+                  className="text-xs text-neutral-500 hover:text-neutral-800 font-bold hover:underline cursor-pointer"
+                >
+                  Já possui uma conta? Faça login aqui
+                </button>
+              </div>
+            )}
           </form>
         )}
       </div>

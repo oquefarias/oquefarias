@@ -1,14 +1,32 @@
-import { Product, Order, StoreSettings, OrderStatus, DeliveryArea, CustomerProfile } from '../types';
+import { Product, Order, StoreSettings, OrderStatus, DeliveryArea, CustomerProfile, Coupon } from '../types';
 import { initialProducts, initialOrders, initialSettings, initialDeliveryAreas, initialCustomers } from '../data/initialData';
 import { soundService } from '../utils/sound';
 
 const STORAGE_KEY_ADMIN_TOKEN = 'deposito_admin_token_v5';
-const STORAGE_KEY_CURRENT_CUSTOMER = 'deposito_current_customer_v4';
+const STORAGE_KEY_CUSTOMER_TOKEN = 'deposito_customer_token_v5';
+const STORAGE_KEY_CURRENT_CUSTOMER = 'deposito_current_customer_v5';
 
 export interface VerifyPinResult {
   success: boolean;
   status: number;
   error?: string;
+}
+
+export interface CustomerAuthResult {
+  success: boolean;
+  status: number;
+  error?: string;
+  customer?: CustomerProfile;
+}
+
+export interface CouponValidationResult {
+  valid: boolean;
+  code: string;
+  type: 'percent' | 'fixed';
+  value: number;
+  discount: number;
+  minOrder?: number;
+  maxDiscount?: number;
 }
 
 class ApiService {
@@ -23,12 +41,14 @@ class ApiService {
     settings: StoreSettings;
     deliveryAreas: DeliveryArea[];
     customers: CustomerProfile[];
+    coupons: Coupon[];
   } = {
     products: initialProducts,
     orders: initialOrders,
     settings: initialSettings,
     deliveryAreas: initialDeliveryAreas,
     customers: initialCustomers,
+    coupons: [],
   };
 
   constructor() {
@@ -37,7 +57,7 @@ class ApiService {
 
   /**
    * Purge legacy localStorage data so it is never used as source of truth.
-   * Only admin token and cart are kept in localStorage.
+   * Only admin token, customer token and cart are kept in localStorage.
    */
   private cleanLegacyLocalStorage() {
     if (typeof window === 'undefined') return;
@@ -55,6 +75,7 @@ class ApiService {
       'deposito_orders_v2',
       'deposito_areas_v2',
       'deposito_customers_v2',
+      'deposito_current_customer_v4',
     ];
     for (const key of legacyKeys) {
       try {
@@ -75,7 +96,7 @@ class ApiService {
     return Boolean(this.getAdminToken());
   }
 
-  private getAdminHeaders(): Record<string, string> {
+  public getAdminHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
@@ -86,14 +107,214 @@ class ApiService {
     return headers;
   }
 
+  // ================= CUSTOMER AUTH & HEADERS =================
+  public getCustomerToken(): string | null {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem(STORAGE_KEY_CUSTOMER_TOKEN);
+  }
+
+  public isCustomerAuthenticated(): boolean {
+    return Boolean(this.getCustomerToken());
+  }
+
+  public getCustomerHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    const token = this.getCustomerToken();
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    return headers;
+  }
+
+  public getCurrentCustomer(): CustomerProfile | null {
+    if (typeof window === 'undefined') return null;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_CURRENT_CUSTOMER);
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  public setCurrentCustomer(customer: CustomerProfile | null) {
+    if (typeof window === 'undefined') return;
+    if (customer) {
+      localStorage.setItem(STORAGE_KEY_CURRENT_CUSTOMER, JSON.stringify(customer));
+    } else {
+      localStorage.removeItem(STORAGE_KEY_CURRENT_CUSTOMER);
+    }
+    this.notifyListeners();
+  }
+
+  public async registerCustomer(data: any): Promise<CustomerProfile> {
+    const res = await fetch('/api/customer/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível realizar o cadastro.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const json = await res.json();
+    if (json.token) {
+      localStorage.setItem(STORAGE_KEY_CUSTOMER_TOKEN, json.token);
+    }
+    if (json.customer) {
+      this.setCurrentCustomer(json.customer);
+    }
+
+    this.notifyListeners();
+    return json.customer;
+  }
+
+  public async loginCustomer(email: string, password: string): Promise<CustomerAuthResult> {
+    try {
+      const res = await fetch('/api/customer/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+
+      if (res.status === 429) {
+        let msg = 'Muitas tentativas, aguarde 15 minutos.';
+        try {
+          const json = await res.json();
+          if (json?.error) msg = json.error;
+        } catch {}
+        return { success: false, status: 429, error: msg };
+      }
+
+      if (res.status >= 500) {
+        return { success: false, status: res.status, error: 'Servidor indisponível' };
+      }
+
+      if (!res.ok) {
+        let msg = 'E-mail ou senha incorretos.';
+        try {
+          const json = await res.json();
+          if (json?.error) msg = json.error;
+        } catch {}
+        return { success: false, status: res.status, error: msg };
+      }
+
+      const data = await res.json();
+      if (data && data.token && data.customer) {
+        localStorage.setItem(STORAGE_KEY_CUSTOMER_TOKEN, data.token);
+        this.setCurrentCustomer(data.customer);
+        return { success: true, status: 200, customer: data.customer };
+      }
+
+      return { success: false, status: 500, error: 'Servidor indisponível' };
+    } catch (err) {
+      console.error('Erro de conexão no login do cliente:', err);
+      return { success: false, status: 0, error: 'Servidor indisponível' };
+    }
+  }
+
+  public logoutCustomer(): void {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem(STORAGE_KEY_CUSTOMER_TOKEN);
+      localStorage.removeItem(STORAGE_KEY_CURRENT_CUSTOMER);
+    }
+    this.notifyListeners();
+  }
+
+  public async getCustomerMe(): Promise<CustomerProfile | null> {
+    const token = this.getCustomerToken();
+    if (!token) return null;
+
+    try {
+      const res = await fetch('/api/customer/me', {
+        headers: this.getCustomerHeaders(),
+      });
+      if (res.ok) {
+        const cust: CustomerProfile = await res.json();
+        this.setCurrentCustomer(cust);
+        return cust;
+      }
+      if (res.status === 401) {
+        this.logoutCustomer();
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  public async updateCustomerMe(data: Partial<CustomerProfile> & { password?: string }): Promise<CustomerProfile> {
+    const res = await fetch('/api/customer/me', {
+      method: 'PUT',
+      headers: this.getCustomerHeaders(),
+      body: JSON.stringify(data),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível atualizar o cadastro.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const updated: CustomerProfile = await res.json();
+    this.setCurrentCustomer(updated);
+    return updated;
+  }
+
+  public async getCustomerOrders(): Promise<Order[]> {
+    const res = await fetch('/api/customer/orders', {
+      headers: this.getCustomerHeaders(),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível carregar seus pedidos.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+
+    const list: Order[] = await res.json();
+    return Array.isArray(list) ? list : [];
+  }
+
+  public async getCustomerOrder(orderId: string): Promise<Order> {
+    const res = await fetch(`/api/customer/orders/${encodeURIComponent(orderId)}`, {
+      headers: this.getCustomerHeaders(),
+    });
+
+    if (!res.ok) {
+      let message = 'Pedido não encontrado.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+
+    return await res.json();
+  }
+
+  // ================= NOTIFICATIONS & ERRORS =================
   private notifyError(message: string) {
     console.error(`[Depósito API Error] ${message}`);
     if (typeof window !== 'undefined') {
       try {
         window.dispatchEvent(new CustomEvent('deposito_db_error', { detail: { message } }));
-      } catch {
-        // ignore
-      }
+      } catch {}
       setTimeout(() => {
         alert(message);
       }, 50);
@@ -123,12 +344,11 @@ class ApiService {
     return this.version;
   }
 
-  // ================= ORDER POLLING (EVERY 10 SECONDS - REPLACES SSE) =================
+  // ================= ORDER & STOCK POLLING (EVERY 10 SECONDS) =================
   private startOrderPolling() {
     this.stopOrderPolling();
     if (!this.isAdminAuthenticated()) return;
 
-    // Poll immediately, then every 10 seconds
     this.pollOrders();
     this.pollingInterval = setInterval(() => {
       this.pollOrders();
@@ -150,21 +370,21 @@ class ApiService {
     }
 
     try {
-      const res = await fetch('/api/admin/orders', {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
+      const [ordersRes, prodRes] = await Promise.all([
+        fetch('/api/admin/orders', {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        fetch('/api/products'),
+      ]);
 
-      if (res.status === 401) {
+      if (ordersRes.status === 401) {
         this.logoutAdmin();
         return;
       }
 
-      if (res.ok) {
-        const fetchedOrders: Order[] = await res.json();
+      if (ordersRes.ok) {
+        const fetchedOrders: Order[] = await ordersRes.json();
         if (Array.isArray(fetchedOrders)) {
-          // Detect any new incoming pending order
           const existingIds = new Set(this.state.orders.map((o) => o.id));
           const hasNewPendingOrder = fetchedOrders.some(
             (fo) => !existingIds.has(fo.id) && fo.status === 'pendente'
@@ -175,9 +395,17 @@ class ApiService {
           }
 
           this.state.orders = fetchedOrders;
-          this.notifyListeners();
         }
       }
+
+      if (prodRes.ok) {
+        const fetchedProducts: Product[] = await prodRes.json();
+        if (Array.isArray(fetchedProducts)) {
+          this.state.products = fetchedProducts;
+        }
+      }
+
+      this.notifyListeners();
     } catch {
       // Background poll silently continues
     }
@@ -203,6 +431,7 @@ class ApiService {
             settings: data.settings || initialSettings,
             deliveryAreas: Array.isArray(data.deliveryAreas) ? data.deliveryAreas : [],
             customers: Array.isArray(data.customers) ? data.customers : [],
+            coupons: Array.isArray(data.coupons) ? data.coupons : [],
           };
           this.startOrderPolling();
           this.notifyListeners();
@@ -231,6 +460,7 @@ class ApiService {
           settings: data.settings || initialSettings,
           deliveryAreas: Array.isArray(data.deliveryAreas) ? data.deliveryAreas : [],
           customers: [],
+          coupons: [],
         };
         this.notifyListeners();
       }
@@ -286,13 +516,29 @@ class ApiService {
     this.stopOrderPolling();
     this.state.orders = [];
     this.state.customers = [];
+    this.state.coupons = [];
     this.syncWithBackend();
     this.notifyListeners();
   }
 
-  // ================= PRODUCTS =================
+  // ================= PRODUCTS & STOCK =================
   public getProducts(): Product[] {
     return this.state.products;
+  }
+
+  public async reloadProducts(): Promise<void> {
+    try {
+      const res = await fetch('/api/products');
+      if (res.ok) {
+        const prods = await res.json();
+        if (Array.isArray(prods)) {
+          this.state.products = prods;
+          this.notifyListeners();
+        }
+      }
+    } catch (err) {
+      console.warn('Erro ao recarregar produtos:', err);
+    }
   }
 
   public async saveProduct(product: Product): Promise<void> {
@@ -311,21 +557,12 @@ class ApiService {
       try {
         const json = await res.json();
         if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
 
-    const saved: Product = await res.json();
-    const idx = this.state.products.findIndex((p) => p.id === saved.id);
-    if (idx >= 0) {
-      this.state.products[idx] = saved;
-    } else {
-      this.state.products.unshift(saved);
-    }
-    this.notifyListeners();
+    await this.reloadProducts();
   }
 
   public async adjustStock(productId: string, delta: number): Promise<void> {
@@ -339,20 +576,13 @@ class ApiService {
       let message = 'Não foi possível alterar o estoque no banco de dados.';
       try {
         const json = await res.json();
-        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+        if (json?.error) message = `Não foi possível alterar o estoque: ${json.error}`;
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
 
-    const updated: Product = await res.json();
-    const idx = this.state.products.findIndex((p) => p.id === productId);
-    if (idx >= 0) {
-      this.state.products[idx] = updated;
-    }
-    this.notifyListeners();
+    await this.reloadProducts();
   }
 
   public async deleteProduct(productId: string): Promise<void> {
@@ -366,9 +596,7 @@ class ApiService {
       try {
         const json = await res.json();
         if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
@@ -394,13 +622,11 @@ class ApiService {
     });
 
     if (!res.ok) {
-      let message = 'Não foi possível salvar o bairro de entrega no banco de dados.';
+      let message = 'Não foi possível salvar a taxa de entrega no banco de dados.';
       try {
         const json = await res.json();
         if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
@@ -422,13 +648,11 @@ class ApiService {
     });
 
     if (!res.ok) {
-      let message = 'Não foi possível excluir o bairro de entrega no banco de dados.';
+      let message = 'Não foi possível excluir a área de entrega no banco de dados.';
       try {
         const json = await res.json();
         if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
@@ -437,82 +661,41 @@ class ApiService {
     this.notifyListeners();
   }
 
-  // ================= CUSTOMERS & AUTH =================
+  // ================= CUSTOMERS (ADMIN) =================
   public getCustomers(): CustomerProfile[] {
     return this.state.customers;
   }
 
-  public getCurrentCustomer(): CustomerProfile | null {
-    if (typeof window === 'undefined') return null;
-    try {
-      const data = localStorage.getItem(STORAGE_KEY_CURRENT_CUSTOMER);
-      return data ? JSON.parse(data) : null;
-    } catch {
-      return null;
-    }
-  }
-
-  public setCurrentCustomer(cust: CustomerProfile | null): void {
-    if (typeof window === 'undefined') return;
-    if (cust) {
-      localStorage.setItem(STORAGE_KEY_CURRENT_CUSTOMER, JSON.stringify(cust));
-    } else {
-      localStorage.removeItem(STORAGE_KEY_CURRENT_CUSTOMER);
-    }
-    this.notifyListeners();
-  }
-
-  public async findCustomerByPhone(phone: string): Promise<CustomerProfile | null> {
-    const clean = phone.replace(/\D/g, '');
-    if (!clean) return null;
-
-    try {
-      const res = await fetch(`/api/customers/by-phone/${clean}`);
-      if (res.ok) {
-        return await res.json();
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  }
-
   public async saveCustomerProfile(
-    custData: Omit<CustomerProfile, 'id' | 'createdAt'> & { id?: string }
+    customer: Omit<CustomerProfile, 'id' | 'createdAt'> & { id?: string; createdAt?: string }
   ): Promise<CustomerProfile> {
-    const res = await fetch('/api/customers', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(custData),
+    const isEdit = Boolean(customer.id && this.state.customers.some((c) => c.id === customer.id));
+    const url = isEdit ? `/api/customers/${customer.id}` : '/api/customers';
+    const method = isEdit ? 'PUT' : 'POST';
+
+    const res = await fetch(url, {
+      method,
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(customer),
     });
 
     if (!res.ok) {
-      let message = 'Não foi possível salvar o cadastro do cliente no banco de dados.';
+      let message = 'Não foi possível salvar o cliente no banco de dados.';
       try {
         const json = await res.json();
         if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
 
     const saved: CustomerProfile = await res.json();
-    this.setCurrentCustomer(saved);
-
-    if (this.isAdminAuthenticated()) {
-      const cleanPhone = saved.phone.replace(/\D/g, '');
-      const idx = this.state.customers.findIndex(
-        (c) => c.id === saved.id || c.phone.replace(/\D/g, '') === cleanPhone
-      );
-      if (idx >= 0) {
-        this.state.customers[idx] = saved;
-      } else {
-        this.state.customers.unshift(saved);
-      }
+    const idx = this.state.customers.findIndex((c) => c.id === saved.id);
+    if (idx >= 0) {
+      this.state.customers[idx] = saved;
+    } else {
+      this.state.customers.unshift(saved);
     }
-
     this.notifyListeners();
     return saved;
   }
@@ -528,9 +711,7 @@ class ApiService {
       try {
         const json = await res.json();
         if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
@@ -549,9 +730,21 @@ class ApiService {
   public async createOrder(
     newOrder: Omit<Order, 'id' | 'createdAt' | 'updatedAt' | 'status'> & { id?: string }
   ): Promise<Order> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const adminToken = this.getAdminToken();
+    const customerToken = this.getCustomerToken();
+
+    if (newOrder.source === 'balcao' && adminToken) {
+      headers['Authorization'] = `Bearer ${adminToken}`;
+    } else if (customerToken) {
+      headers['Authorization'] = `Bearer ${customerToken}`;
+    } else if (adminToken) {
+      headers['Authorization'] = `Bearer ${adminToken}`;
+    }
+
     const res = await fetch('/api/orders', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(newOrder),
     });
 
@@ -560,9 +753,7 @@ class ApiService {
       try {
         const json = await res.json();
         if (json?.error) message = json.error;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
@@ -572,6 +763,9 @@ class ApiService {
     if (this.isAdminAuthenticated()) {
       this.state.orders.unshift(createdOrder);
     }
+
+    // Refresh products on server to sync atomic real-time stock
+    await this.reloadProducts();
 
     soundService.playNewOrderSound();
     this.notifyListeners();
@@ -589,10 +783,8 @@ class ApiService {
       let message = 'Não foi possível atualizar o status do pedido no banco de dados.';
       try {
         const json = await res.json();
-        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+        if (json?.error) message = json.error;
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
@@ -602,6 +794,9 @@ class ApiService {
     if (idx >= 0) {
       this.state.orders[idx] = updated;
     }
+
+    // Refresh products because stock might be restored/decremented on cancel/uncancel
+    await this.reloadProducts();
     this.notifyListeners();
   }
 
@@ -616,14 +811,126 @@ class ApiService {
       try {
         const json = await res.json();
         if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
 
     this.state.orders = this.state.orders.filter((o) => o.id !== orderId);
+    this.notifyListeners();
+  }
+
+  // ================= COUPONS =================
+  public getCoupons(): Coupon[] {
+    return this.state.coupons;
+  }
+
+  public async validateCoupon(code: string, subtotal: number): Promise<CouponValidationResult> {
+    const res = await fetch('/api/coupons/validate', {
+      method: 'POST',
+      headers: this.getCustomerHeaders(),
+      body: JSON.stringify({ code, subtotal }),
+    });
+
+    if (!res.ok) {
+      let message = 'Cupom inválido.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+
+    return await res.json();
+  }
+
+  public async getAdminCoupons(): Promise<Coupon[]> {
+    const res = await fetch('/api/admin/coupons', {
+      headers: this.getAdminHeaders(),
+    });
+
+    if (!res.ok) {
+      let message = 'Erro ao listar cupons.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const list: Coupon[] = await res.json();
+    this.state.coupons = Array.isArray(list) ? list : [];
+    this.notifyListeners();
+    return this.state.coupons;
+  }
+
+  public async createAdminCoupon(data: Partial<Coupon>): Promise<Coupon> {
+    const res = await fetch('/api/admin/coupons', {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(data),
+    });
+
+    if (!res.ok) {
+      let message = 'Erro ao criar cupom.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const created: Coupon = await res.json();
+    this.state.coupons.unshift(created);
+    this.notifyListeners();
+    return created;
+  }
+
+  public async updateAdminCoupon(code: string, data: Partial<Coupon>): Promise<Coupon> {
+    const res = await fetch(`/api/admin/coupons/${code}`, {
+      method: 'PUT',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(data),
+    });
+
+    if (!res.ok) {
+      let message = 'Erro ao atualizar cupom.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const updated: Coupon = await res.json();
+    const idx = this.state.coupons.findIndex((c) => c.code === code);
+    if (idx >= 0) {
+      this.state.coupons[idx] = updated;
+    }
+    this.notifyListeners();
+    return updated;
+  }
+
+  public async deleteAdminCoupon(code: string): Promise<void> {
+    const res = await fetch(`/api/admin/coupons/${code}`, {
+      method: 'DELETE',
+      headers: this.getAdminHeaders(),
+    });
+
+    if (!res.ok) {
+      let message = 'Erro ao excluir cupom.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    this.state.coupons = this.state.coupons.filter((c) => c.code !== code);
     this.notifyListeners();
   }
 
@@ -644,9 +951,7 @@ class ApiService {
       try {
         const json = await res.json();
         if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }
@@ -668,9 +973,7 @@ class ApiService {
       try {
         const json = await res.json();
         if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
-      } catch {
-        // ignore
-      }
+      } catch {}
       this.notifyError(message);
       throw new Error(message);
     }

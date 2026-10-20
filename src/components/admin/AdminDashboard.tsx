@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { Product, Order, StoreSettings, OrderStatus, ProductCategory, PaymentMethod, DeliveryArea, CustomerProfile } from '../../types';
+import { Product, Order, StoreSettings, OrderStatus, ProductCategory, PaymentMethod, DeliveryArea, CustomerProfile, Coupon } from '../../types';
 import { api } from '../../services/api';
 import { soundService } from '../../utils/sound';
 import { PrintReceiptModal } from '../PrintReceiptModal';
@@ -37,6 +37,7 @@ import {
   Copy,
   Compass,
   AlertTriangle,
+  Ticket,
 } from 'lucide-react';
 
 // Compress image uploaded from computer so it stays lightweight and fast
@@ -100,7 +101,40 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onLockDashboard,
   onPreviewCustomerView,
 }) => {
-  const [activeTab, setActiveTab] = useState<'pedidos' | 'estoque' | 'pdv' | 'areas' | 'clientes' | 'financeiro' | 'configuracoes'>('pedidos');
+  const [activeTab, setActiveTab] = useState<'pedidos' | 'estoque' | 'pdv' | 'areas' | 'clientes' | 'cupons' | 'financeiro' | 'configuracoes'>('pedidos');
+  
+  // Coupons state
+  const [coupons, setCoupons] = useState<Coupon[]>(() => api.getCoupons());
+  const [isCouponModalOpen, setIsCouponModalOpen] = useState<boolean>(false);
+  const [couponForm, setCouponForm] = useState<{
+    code: string;
+    type: 'percent' | 'fixed';
+    value: number;
+    minOrder?: number;
+    maxDiscount?: number;
+    active: boolean;
+    expiresAt?: string;
+    maxUses?: number;
+  }>({
+    code: '',
+    type: 'percent',
+    value: 10,
+    minOrder: undefined,
+    maxDiscount: undefined,
+    active: true,
+    expiresAt: '',
+    maxUses: undefined,
+  });
+  const [isSavingCoupon, setIsSavingCoupon] = useState<boolean>(false);
+  const [couponModalError, setCouponModalError] = useState<string>('');
+
+  useEffect(() => {
+    setCoupons(api.getCoupons());
+  }, [api.getVersion()]);
+
+  useEffect(() => {
+    api.getAdminCoupons().then(setCoupons).catch(() => {});
+  }, []);
   
   // Orders filter
   const [orderStatusFilter, setOrderStatusFilter] = useState<OrderStatus | 'todos'>('todos');
@@ -262,16 +296,88 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   // Order status actions - Instant optimistic update without requiring page reload
   const handleUpdateStatus = async (orderId: string, newStatus: OrderStatus) => {
-    // 1. Instant local update
+    const prevOrder = localOrders.find(o => o.id === orderId);
     setLocalOrders(prev => prev.map(o => o.id === orderId ? { ...o, status: newStatus, updatedAt: new Date().toISOString() } : o));
-    soundService.playSuccessSound();
-    // 2. Persist to API
-    await api.updateOrderStatus(orderId, newStatus);
+    try {
+      await api.updateOrderStatus(orderId, newStatus);
+      soundService.playSuccessSound();
+    } catch (err: any) {
+      if (prevOrder) {
+        setLocalOrders(prev => prev.map(o => o.id === orderId ? prevOrder : o));
+      }
+    }
   };
 
   // Stock quick adjust
   const handleAdjustStock = async (productId: string, delta: number) => {
     await api.adjustStock(productId, delta);
+  };
+
+  // Coupon handlers
+  const handleToggleCouponActive = async (coupon: Coupon) => {
+    try {
+      const updated = await api.updateAdminCoupon(coupon.code, { active: !coupon.active });
+      setCoupons(prev => prev.map(c => c.code === coupon.code ? updated : c));
+    } catch (err: any) {
+      console.error('Falha ao atualizar status do cupom:', err);
+    }
+  };
+
+  const handleDeleteCoupon = async (code: string) => {
+    if (!window.confirm(`Deseja realmente excluir o cupom ${code}?`)) return;
+    try {
+      await api.deleteAdminCoupon(code);
+      setCoupons(prev => prev.filter(c => c.code !== code));
+    } catch (err: any) {
+      console.error('Falha ao excluir cupom:', err);
+    }
+  };
+
+  const handleSaveCoupon = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!couponForm.code.trim()) {
+      setCouponModalError('O código do cupom é obrigatório.');
+      return;
+    }
+    if (couponForm.value <= 0) {
+      setCouponModalError('O valor do desconto deve ser maior que zero.');
+      return;
+    }
+
+    setIsSavingCoupon(true);
+    setCouponModalError('');
+    try {
+      const created = await api.createAdminCoupon({
+        code: couponForm.code.toUpperCase().trim(),
+        type: couponForm.type,
+        value: couponForm.value,
+        minOrder: couponForm.minOrder ? Number(couponForm.minOrder) : undefined,
+        maxDiscount:
+          couponForm.type === 'percent' && couponForm.maxDiscount
+            ? Number(couponForm.maxDiscount)
+            : undefined,
+        maxUses: couponForm.maxUses ? Number(couponForm.maxUses) : undefined,
+        expiresAt: couponForm.expiresAt ? new Date(couponForm.expiresAt).toISOString() : null,
+        active: couponForm.active,
+      });
+
+      setCoupons(prev => [created, ...prev.filter(c => c.code !== created.code)]);
+      setIsCouponModalOpen(false);
+      setCouponForm({
+        code: '',
+        type: 'percent',
+        value: 10,
+        minOrder: undefined,
+        maxDiscount: undefined,
+        active: true,
+        expiresAt: '',
+        maxUses: undefined,
+      });
+    } catch (err: any) {
+      setCouponModalError(err.message || 'Erro ao criar cupom.');
+    } finally {
+      setIsSavingCoupon(false);
+    }
   };
 
   // Delivery Area handlers
@@ -389,38 +495,42 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleFinishPosSale = async () => {
     if (posCart.length === 0) return;
     const cashNum = parseFloat(posCashGiven);
-    const order = await api.createOrder({
-      source: 'balcao',
-      customer: {
-        name: posCustomerName.trim() || 'Cliente Balcão',
-        phone: '(Balcão)',
-        address: 'Venda Presencial no Depósito',
-        number: 'Balcão',
-        neighborhood: 'Loja Física',
-      },
-      deliveryType: 'retirada',
-      items: posCart.map(i => ({
-        productId: i.product.id,
-        name: i.product.name,
-        volume: i.product.volume,
-        price: i.product.price,
-        costPrice: i.product.costPrice,
-        quantity: i.quantity,
-        isCold: i.product.isCold,
-      })),
-      subtotal: posSubtotal,
-      deliveryFee: 0,
-      total: posSubtotal,
-      paymentMethod: posPaymentMethod,
-      cashChangeFor: posPaymentMethod === 'dinheiro' && cashNum ? cashNum : undefined,
-    });
+    try {
+      const order = await api.createOrder({
+        source: 'balcao',
+        customer: {
+          name: posCustomerName.trim() || 'Cliente Balcão',
+          phone: '(Balcão)',
+          address: 'Venda Presencial no Depósito',
+          number: 'Balcão',
+          neighborhood: 'Loja Física',
+        },
+        deliveryType: 'retirada',
+        items: posCart.map(i => ({
+          productId: i.product.id,
+          name: i.product.name,
+          volume: i.product.volume,
+          price: i.product.price,
+          costPrice: i.product.costPrice,
+          quantity: i.quantity,
+          isCold: i.product.isCold,
+        })),
+        subtotal: posSubtotal,
+        deliveryFee: 0,
+        total: posSubtotal,
+        paymentMethod: posPaymentMethod,
+        cashChangeFor: posPaymentMethod === 'dinheiro' && cashNum ? cashNum : undefined,
+      });
 
-    await api.updateOrderStatus(order.id, 'concluido');
-    setSelectedReceiptOrder(order);
+      await api.updateOrderStatus(order.id, 'concluido');
+      setSelectedReceiptOrder(order);
 
-    setPosCart([]);
-    setPosCashGiven('');
-    setPosCustomerName('Cliente Balcão');
+      setPosCart([]);
+      setPosCashGiven('');
+      setPosCustomerName('Cliente Balcão');
+    } catch (err: any) {
+      console.error('Falha ao processar venda balcão:', err);
+    }
   };
 
   // Financial Stats Calculation
@@ -580,6 +690,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           >
             <Users className="w-4 h-4" />
             <span>Clientes ({customers.length})</span>
+          </button>
+
+          {/* Cupons de Desconto Tab */}
+          <button
+            onClick={() => setActiveTab('cupons')}
+            className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs sm:text-sm font-bold transition-all ${
+              activeTab === 'cupons' ? 'bg-amber-500 text-white shadow-sm' : 'text-neutral-700 hover:bg-neutral-100'
+            }`}
+          >
+            <Ticket className="w-4 h-4" />
+            <span>Cupons ({coupons.length})</span>
           </button>
 
           <button
@@ -1249,6 +1370,163 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </tbody>
               </table>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================= */}
+      {/* TAB: CUPONS DE DESCONTO                                   */}
+      {/* ========================================================= */}
+      {activeTab === 'cupons' && (
+        <div className="space-y-6">
+          {/* Header */}
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+            <div>
+              <h3 className="text-lg font-black text-neutral-900 flex items-center gap-2">
+                <Ticket className="w-5 h-5 text-amber-500" />
+                <span>Cupons de Desconto</span>
+              </h3>
+              <p className="text-xs text-neutral-500 mt-0.5">
+                Crie e gerencie cupons promocionais para seus clientes utilizarem no checkout online.
+              </p>
+            </div>
+
+            <button
+              onClick={() => {
+                setCouponModalError('');
+                setIsCouponModalOpen(true);
+              }}
+              className="px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-xl text-xs flex items-center gap-1.5 shadow-sm shadow-amber-500/20 cursor-pointer"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Novo Cupom</span>
+            </button>
+          </div>
+
+          {/* Quick Metrics */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="bg-white p-4 rounded-2xl border border-neutral-200">
+              <span className="text-xs font-medium text-neutral-500">Total de Cupons</span>
+              <p className="text-2xl font-black text-neutral-900 mt-1">{coupons.length}</p>
+            </div>
+            <div className="bg-white p-4 rounded-2xl border border-neutral-200">
+              <span className="text-xs font-medium text-neutral-500">Cupons Ativos</span>
+              <p className="text-2xl font-black text-emerald-600 mt-1">
+                {coupons.filter(c => c.active).length}
+              </p>
+            </div>
+            <div className="bg-white p-4 rounded-2xl border border-neutral-200">
+              <span className="text-xs font-medium text-neutral-500">Usos Registrados</span>
+              <p className="text-2xl font-black text-amber-600 mt-1">
+                {coupons.reduce((sum, c) => sum + (c.usedCount || 0), 0)}
+              </p>
+            </div>
+          </div>
+
+          {/* Coupons Table */}
+          <div className="bg-white rounded-2xl border border-neutral-200 overflow-hidden shadow-xs">
+            {coupons.length === 0 ? (
+              <div className="text-center py-12 px-4">
+                <div className="w-12 h-12 bg-amber-50 text-amber-600 rounded-2xl flex items-center justify-center mx-auto mb-2">
+                  <Ticket className="w-6 h-6" />
+                </div>
+                <h4 className="font-bold text-sm text-neutral-900">Nenhum cupom cadastrado</h4>
+                <p className="text-xs text-neutral-500 mt-1 max-w-sm mx-auto">
+                  Crie cupons promocionais (ex: BEMVINDO10, SEXTOU, GELADA15) para aumentar as vendas do seu depósito.
+                </p>
+                <button
+                  onClick={() => setIsCouponModalOpen(true)}
+                  className="mt-4 px-4 py-2 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-xl text-xs inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Criar Primeiro Cupom</span>
+                </button>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-neutral-50 border-b border-neutral-200 text-neutral-500 uppercase tracking-wider font-bold">
+                    <tr>
+                      <th className="py-3 px-4">Código</th>
+                      <th className="py-3 px-4">Desconto</th>
+                      <th className="py-3 px-4">Pedido Mínimo</th>
+                      <th className="py-3 px-4">Usos / Limite</th>
+                      <th className="py-3 px-4">Validade</th>
+                      <th className="py-3 px-4">Status</th>
+                      <th className="py-3 px-4 text-right">Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-neutral-100">
+                    {coupons.map((c) => {
+                      const isExpired = c.expiresAt && new Date(c.expiresAt).getTime() < Date.now();
+                      const isMaxedOut = c.maxUses !== null && c.maxUses !== undefined && c.usedCount >= c.maxUses;
+
+                      return (
+                        <tr key={c.code} className="hover:bg-neutral-50/80 transition-colors">
+                          <td className="py-3.5 px-4 font-mono font-black text-sm text-neutral-900">
+                            <span className="px-2.5 py-1 rounded-lg bg-neutral-100 border border-neutral-300">
+                              {c.code}
+                            </span>
+                          </td>
+                          <td className="py-3.5 px-4 font-bold text-neutral-800">
+                            {c.type === 'percent'
+                              ? c.maxDiscount
+                                ? `${c.value}% até ${formatCurrency(c.maxDiscount)}`
+                                : `${c.value}% OFF`
+                              : `${formatCurrency(c.value)} OFF`}
+                          </td>
+                          <td className="py-3.5 px-4 text-neutral-600">
+                            {c.minOrder ? `R$ ${c.minOrder.toFixed(2)}` : 'Sem mínimo'}
+                          </td>
+                          <td className="py-3.5 px-4 text-neutral-600">
+                            <span className="font-bold text-neutral-900">{c.usedCount}</span>
+                            {c.maxUses ? ` / ${c.maxUses}` : ' / Ilimitado'}
+                            {isMaxedOut && (
+                              <span className="ml-1.5 text-[10px] text-red-600 bg-red-50 px-1.5 py-0.5 rounded font-bold">
+                                Esgotado
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3.5 px-4 text-neutral-600">
+                            {c.expiresAt ? (
+                              <span className={isExpired ? 'text-red-600 font-bold' : ''}>
+                                {new Date(c.expiresAt).toLocaleDateString('pt-BR')}
+                                {isExpired && ' (Expirado)'}
+                              </span>
+                            ) : (
+                              'Sem expiração'
+                            )}
+                          </td>
+                          <td className="py-3.5 px-4">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleCouponActive(c)}
+                              className={`px-2.5 py-1 rounded-full text-[11px] font-bold border transition-colors cursor-pointer ${
+                                c.active
+                                  ? 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100'
+                                  : 'bg-neutral-100 text-neutral-500 border-neutral-300 hover:bg-neutral-200'
+                              }`}
+                            >
+                              {c.active ? '🟢 Ativo' : '⚪ Desativado'}
+                            </button>
+                          </td>
+                          <td className="py-3.5 px-4 text-right">
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteCoupon(c.code)}
+                              title="Excluir Cupom"
+                              className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -2319,14 +2597,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="font-bold text-neutral-700 block mb-1">Qtd em Estoque *</label>
-                  <input
-                    type="number"
-                    required
-                    value={productForm.stock}
-                    onChange={(e) => setProductForm({ ...productForm, stock: parseInt(e.target.value, 10) || 0 })}
-                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-bold"
-                  />
+                  <label className="font-bold text-neutral-700 block mb-1">
+                    {editingProduct ? 'Estoque Atual (Real do Banco)' : 'Estoque Inicial *'}
+                  </label>
+                  {editingProduct ? (
+                    <div className="px-3 py-2 bg-neutral-100 border border-neutral-300 rounded-xl font-bold text-neutral-800 flex items-center justify-between">
+                      <span>{editingProduct.stock} un</span>
+                      <span className="text-[10px] text-neutral-500 font-normal">Ajuste na aba Estoque</span>
+                    </div>
+                  ) : (
+                    <input
+                      type="number"
+                      required
+                      value={productForm.stock}
+                      onChange={(e) => setProductForm({ ...productForm, stock: parseInt(e.target.value, 10) || 0 })}
+                      className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-bold"
+                    />
+                  )}
                 </div>
 
                 <div>
@@ -2471,6 +2758,169 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           setEditingCustomer(null);
         }}
       />
+
+      {/* Coupon Modal */}
+      {isCouponModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 overflow-y-auto">
+          <div className="bg-white rounded-3xl max-w-md w-full shadow-2xl overflow-hidden border border-neutral-200 my-6">
+            <div className="p-5 bg-neutral-900 text-white flex items-center justify-between">
+              <h3 className="font-black text-base flex items-center gap-2">
+                <Ticket className="w-5 h-5 text-amber-500" />
+                <span>Criar Novo Cupom de Desconto</span>
+              </h3>
+              <button
+                onClick={() => setIsCouponModalOpen(false)}
+                className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveCoupon} className="p-6 space-y-4 text-xs">
+              {couponModalError && (
+                <p className="p-2.5 rounded-xl bg-red-50 text-red-800 border border-red-200 font-bold">
+                  {couponModalError}
+                </p>
+              )}
+
+              <div>
+                <label className="font-bold text-neutral-700 block mb-1">Código do Cupom *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Ex: PROMO10, BEMVINDO15"
+                  value={couponForm.code}
+                  onChange={(e) => setCouponForm({ ...couponForm, code: e.target.value.toUpperCase() })}
+                  className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-mono font-bold uppercase text-sm"
+                />
+                <p className="text-[10px] text-neutral-400 mt-1">Os clientes digitarão esse código exatamente no checkout.</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">Tipo de Desconto *</label>
+                  <select
+                    value={couponForm.type}
+                    onChange={(e) => setCouponForm({ ...couponForm, type: e.target.value as 'percent' | 'fixed' })}
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium"
+                  >
+                    <option value="percent">Porcentagem (%)</option>
+                    <option value="fixed">Valor Fixo (R$)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">
+                    {couponForm.type === 'percent' ? 'Desconto (%) *' : 'Desconto (R$) *'}
+                  </label>
+                  <input
+                    type="number"
+                    step={couponForm.type === 'percent' ? '1' : '0.50'}
+                    min="0.1"
+                    required
+                    value={couponForm.value}
+                    onChange={(e) => setCouponForm({ ...couponForm, value: parseFloat(e.target.value) || 0 })}
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-bold text-neutral-900"
+                  />
+                </div>
+              </div>
+
+              {couponForm.type === 'percent' && (
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">Desconto máximo (R$)</label>
+                  <input
+                    type="number"
+                    step="0.50"
+                    min="0"
+                    placeholder="Opcional — teto em reais (ex: 15.00)"
+                    value={couponForm.maxDiscount ?? ''}
+                    onChange={(e) =>
+                      setCouponForm({
+                        ...couponForm,
+                        maxDiscount: e.target.value ? parseFloat(e.target.value) : undefined,
+                      })
+                    }
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                  />
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">Pedido Mínimo (R$)</label>
+                  <input
+                    type="number"
+                    step="1"
+                    min="0"
+                    placeholder="Opcional (ex: 50)"
+                    value={couponForm.minOrder ?? ''}
+                    onChange={(e) => setCouponForm({ ...couponForm, minOrder: e.target.value ? parseFloat(e.target.value) : undefined })}
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                  />
+                </div>
+
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">Limite Máximo de Usos</label>
+                  <input
+                    type="number"
+                    min="1"
+                    placeholder="Ilimitado se vazio"
+                    value={couponForm.maxUses ?? ''}
+                    onChange={(e) => setCouponForm({ ...couponForm, maxUses: e.target.value ? parseInt(e.target.value, 10) : undefined })}
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="font-bold text-neutral-700 block mb-1">Data de Expiração (Opcional)</label>
+                <input
+                  type="date"
+                  value={couponForm.expiresAt || ''}
+                  onChange={(e) => setCouponForm({ ...couponForm, expiresAt: e.target.value })}
+                  className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-neutral-800"
+                />
+              </div>
+
+              <div className="pt-2">
+                <label className="flex items-center gap-2 cursor-pointer font-bold text-neutral-800">
+                  <input
+                    type="checkbox"
+                    checked={couponForm.active}
+                    onChange={(e) => setCouponForm({ ...couponForm, active: e.target.checked })}
+                    className="w-4 h-4 rounded text-amber-500 focus:ring-amber-500"
+                  />
+                  <span>Cupom Ativo e pronto para uso</span>
+                </label>
+              </div>
+
+              <div className="pt-3 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsCouponModalOpen(false)}
+                  className="flex-1 py-2.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded-xl font-bold cursor-pointer transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingCoupon}
+                  className="flex-1 py-2.5 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black rounded-xl shadow-sm cursor-pointer transition-colors flex items-center justify-center gap-1.5"
+                >
+                  {isSavingCoupon ? (
+                    <span>Salvando...</span>
+                  ) : (
+                    <>
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Salvar Cupom</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* End Modals */}
     </div>

@@ -48,6 +48,7 @@ export interface OrderItem {
 export interface CustomerInfo {
   name: string;
   phone: string;
+  email?: string;
   address: string;
   number: string;
   neighborhood: string;
@@ -64,6 +65,7 @@ export interface CustomerInfo {
 
 export interface CustomerProfile extends CustomerInfo {
   id: string;
+  email?: string;
   createdAt: string;
   totalOrdersCount?: number;
   totalSpent?: number;
@@ -78,11 +80,26 @@ export interface DeliveryArea {
   active: boolean;
 }
 
+export interface Coupon {
+  code: string;
+  type: 'percent' | 'fixed';
+  value: number;
+  minOrder?: number;
+  maxDiscount?: number | null;
+  active: boolean;
+  expiresAt?: string | null;
+  maxUses?: number | null;
+  usedCount: number;
+}
+
 export interface Order {
   id: string;
   createdAt: string;
   source: 'online' | 'balcao';
   customer: CustomerInfo;
+  customerId?: string;
+  couponCode?: string;
+  discount?: number;
   deliveryType: 'delivery' | 'retirada';
   items: OrderItem[];
   subtotal: number;
@@ -127,4 +144,5 @@ export interface AppState {
   settings: StoreSettings;
   deliveryAreas: DeliveryArea[];
   customers: CustomerProfile[];
+  coupons?: Coupon[];
 }

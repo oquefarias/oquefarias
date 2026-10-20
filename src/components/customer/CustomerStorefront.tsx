@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import confetti from 'canvas-confetti';
-import { Product, StoreSettings, ProductCategory, Order, PaymentMethod, DeliveryArea, CustomerProfile } from '../../types';
-import { api } from '../../services/api';
+import { CustomerProfile, DeliveryArea, Order, OrderStatus, PaymentMethod, ProductCategory, Product, StoreSettings } from '../../types';
+import { api, CouponValidationResult } from '../../services/api';
 import { CustomerAuthModal } from './CustomerAuthModal';
 import { 
   Beer, 
@@ -28,6 +28,7 @@ import {
   Compass,
   Building2,
   Loader2,
+  Ticket,
 } from 'lucide-react';
 import {
   calculateDistanceKm,
@@ -79,6 +80,49 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [copiedPix, setCopiedPix] = useState<boolean>(false);
   const [checkingDistance, setCheckingDistance] = useState<boolean>(false);
   const [customerDistance, setCustomerDistance] = useState<{ km: number; inside: boolean } | null>(null);
+
+  // Coupon state
+  const [couponInput, setCouponInput] = useState<string>('');
+  const [appliedCoupon, setAppliedCoupon] = useState<CouponValidationResult | null>(null);
+  const [couponError, setCouponError] = useState<string>('');
+  const [isValidatingCoupon, setIsValidatingCoupon] = useState<boolean>(false);
+
+  // Customer Orders ("Meus pedidos") state
+  const [isMyOrdersOpen, setIsMyOrdersOpen] = useState<boolean>(false);
+  const [myOrders, setMyOrders] = useState<Order[]>([]);
+  const [isLoadingMyOrders, setIsLoadingMyOrders] = useState<boolean>(false);
+  const [myOrdersError, setMyOrdersError] = useState<string>('');
+
+  const handleOpenMyOrders = async () => {
+    setIsMyOrdersOpen(true);
+    setIsLoadingMyOrders(true);
+    setMyOrdersError('');
+    try {
+      const list = await api.getCustomerOrders();
+      setMyOrders(list);
+    } catch (err: any) {
+      setMyOrdersError(err.message || 'Não foi possível carregar seus pedidos.');
+    } finally {
+      setIsLoadingMyOrders(false);
+    }
+  };
+
+  // Poll placedOrder status every 15 seconds while the tracking screen is open
+  useEffect(() => {
+    if (!placedOrder || !api.isCustomerAuthenticated()) return;
+    const orderId = placedOrder.id;
+    const interval = setInterval(async () => {
+      try {
+        const updated = await api.getCustomerOrder(orderId);
+        if (updated && updated.id === orderId) {
+          setPlacedOrder(updated);
+        }
+      } catch {
+        // Ignore transient network errors during background refresh
+      }
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [placedOrder?.id]);
 
   // Keep fields synced when currentCustomer changes
   useEffect(() => {
@@ -236,8 +280,49 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return Math.round(fee * 100) / 100;
   }, [deliveryType, cartSubtotal, settings, matchedArea, customerDistance]);
 
-  const cartTotal = cartSubtotal + deliveryFee;
+  const cartDiscount = useMemo(() => {
+    if (!appliedCoupon) return 0;
+    if (appliedCoupon.type === 'percent') {
+      let disc = (appliedCoupon.value / 100) * cartSubtotal;
+      if (appliedCoupon.maxDiscount !== undefined && appliedCoupon.maxDiscount !== null && appliedCoupon.maxDiscount > 0) {
+        disc = Math.min(disc, appliedCoupon.maxDiscount);
+      }
+      disc = Math.min(disc, cartSubtotal);
+      return Math.round(disc * 100) / 100;
+    }
+    return Math.min(appliedCoupon.value, cartSubtotal);
+  }, [appliedCoupon, cartSubtotal]);
+
+  const cartTotal = Math.max(0, cartSubtotal - cartDiscount + deliveryFee);
   const totalCartCount = cart.reduce((sum, item) => sum + item.quantity, 0);
+
+  const handleApplyCoupon = async () => {
+    if (!couponInput.trim()) return;
+    if (!api.isCustomerAuthenticated() || !currentCustomer) {
+      setCouponError('Faça login ou crie sua conta para aplicar cupons de desconto.');
+      setIsAuthModalOpen(true);
+      return;
+    }
+
+    setIsValidatingCoupon(true);
+    setCouponError('');
+    try {
+      const res = await api.validateCoupon(couponInput.trim(), cartSubtotal);
+      setAppliedCoupon(res);
+      setCouponError('');
+    } catch (err: any) {
+      setAppliedCoupon(null);
+      setCouponError(err.message || 'Cupom inválido.');
+    } finally {
+      setIsValidatingCoupon(false);
+    }
+  };
+
+  const handleRemoveCoupon = () => {
+    setAppliedCoupon(null);
+    setCouponInput('');
+    setCouponError('');
+  };
 
   const addToCart = (product: Product) => {
     setCart((prev) => {
@@ -282,6 +367,13 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       return;
     }
     if (cart.length === 0) return;
+
+    // Requirement: Mandatory login/registration before completing order
+    if (!api.isCustomerAuthenticated() || !currentCustomer) {
+      setIsAuthModalOpen(true);
+      return;
+    }
+
     if (!customerName.trim() || !customerPhone.trim()) {
       alert('Por favor preencha seu nome e telefone.');
       return;
@@ -307,6 +399,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     try {
       const order = await api.createOrder({
         source: 'online',
+        couponCode: appliedCoupon?.code,
         customer: {
           name: customerName,
           phone: customerPhone,
@@ -337,21 +430,6 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         notes: orderNotes,
       });
 
-      // Save customer profile permanently
-      const updatedProfile = await api.saveCustomerProfile({
-        name: customerName,
-        phone: customerPhone,
-        cep: deliveryType === 'delivery' ? cep : (currentCustomer?.cep || ''),
-        address: deliveryType === 'delivery' ? address : (currentCustomer?.address || ''),
-        number: deliveryType === 'delivery' ? addressNumber : (currentCustomer?.number || ''),
-        neighborhood: deliveryType === 'delivery' ? neighborhood : (currentCustomer?.neighborhood || ''),
-        complement,
-        reference,
-        distanceKm: customerDistance?.km,
-        isWithinDeliveryRadius: customerDistance?.inside,
-      });
-      setCurrentCustomer(updatedProfile);
-
       confetti({
         particleCount: 100,
         spread: 70,
@@ -360,9 +438,13 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
       setPlacedOrder(order);
       setCart([]);
+      setAppliedCoupon(null);
+      setCouponInput('');
+      setCouponError('');
       setIsCartOpen(false);
     } catch (err: any) {
       console.error('Falha ao processar pedido:', err);
+      alert(err.message || 'Não foi possível finalizar o pedido. Verifique o estoque dos itens.');
     } finally {
       setIsSubmitting(false);
     }
@@ -386,8 +468,120 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     { id: 'petiscos', label: 'Petiscos & Copos', icon: Package },
   ];
 
-  // ORDER TRACKING SCREEN IF ORDER PLACED
+  const getStatusBadgeInfo = (status: OrderStatus, delivType: 'delivery' | 'retirada') => {
+    switch (status) {
+      case 'pendente':
+        return { label: 'Recebido', className: 'bg-amber-100 text-amber-800 border-amber-300' };
+      case 'em_separacao':
+        return { label: 'Em preparo', className: 'bg-blue-100 text-blue-800 border-blue-300' };
+      case 'em_rota':
+        return {
+          label: delivType === 'retirada' ? 'Pronto para retirada' : 'Saiu para entrega',
+          className: 'bg-purple-100 text-purple-800 border-purple-300',
+        };
+      case 'concluido':
+        return { label: 'Entregue', className: 'bg-emerald-100 text-emerald-800 border-emerald-300' };
+      case 'cancelado':
+        return { label: 'Pedido cancelado', className: 'bg-red-100 text-red-800 border-red-300' };
+      default:
+        return { label: 'Recebido', className: 'bg-amber-100 text-amber-800 border-amber-300' };
+    }
+  };
+
+  const buildOrderWhatsAppUrl = (order: Order) => {
+    const phoneDigits = (settings.whatsapp || '').replace(/\D/g, '');
+    const host = typeof window !== 'undefined' ? window.location.host : '';
+    const orderNumber = String(order.id).replace(/^#/, '');
+    const customerEmail = order.customer.email || currentCustomer?.email || '';
+    const lines: string[] = [];
+
+    lines.push(`🔔 Novo Pedido via ${host}`);
+    lines.push(`🧾 Pedido: #${orderNumber}`);
+    lines.push('');
+    lines.push(`👤 Cliente: ${order.customer.name}`);
+    lines.push(`📞 Telefone: ${order.customer.phone}`);
+    lines.push(`✉️ E-mail: ${customerEmail}`);
+    lines.push('');
+    lines.push('🛍️ Itens do Pedido:');
+    for (const it of order.items) {
+      const itemTotal = (Number(it.price) * Number(it.quantity)).toFixed(2);
+      lines.push(`- ${it.quantity}x ${it.name} ${it.volume} - R$ ${itemTotal}`);
+    }
+    lines.push('');
+    lines.push(`🛒 Valor dos itens: R$ ${Number(order.subtotal).toFixed(2)}`);
+    if (order.couponCode && order.discount && Number(order.discount) > 0) {
+      lines.push(`🏷️ Cupom ${order.couponCode}: - R$ ${Number(order.discount).toFixed(2)}`);
+    }
+    if (order.deliveryType === 'delivery') {
+      lines.push(`🛵 Taxa de entrega: R$ ${Number(order.deliveryFee).toFixed(2)}`);
+    }
+    lines.push('');
+    lines.push(`💰 Total a Pagar: R$ ${Number(order.total).toFixed(2)}`);
+    lines.push('');
+    lines.push(
+      `🍽️ Tipo entrega: ${
+        order.deliveryType === 'retirada' ? 'Retirar meu pedido' : 'Entrega no endereço'
+      }`
+    );
+    if (order.deliveryType === 'delivery') {
+      const comp = order.customer.complement ? ` ${order.customer.complement}` : '';
+      const city = order.customer.city || currentCustomer?.city || '';
+      const cityPart = city ? `, ${city}` : '';
+      lines.push(
+        `📍 Endereço: ${order.customer.address}, ${order.customer.number}${comp} - ${order.customer.neighborhood}${cityPart}`
+      );
+    }
+    const payMap: Record<string, string> = {
+      dinheiro: 'Dinheiro',
+      pix: 'Pix',
+      cartao_credito: 'Cartão',
+      cartao_debito: 'Cartão',
+    };
+    lines.push(`💳 Pagamento: ${payMap[order.paymentMethod] || 'Pix'}`);
+    if (order.paymentMethod === 'dinheiro' && order.cashChangeFor && Number(order.cashChangeFor) > 0) {
+      lines.push(`💵 Troco para: R$ ${Number(order.cashChangeFor).toFixed(2)}`);
+    }
+
+    const message = lines.join('\n');
+    return `https://wa.me/${phoneDigits}?text=${encodeURIComponent(message)}`;
+  };
+
+  // ORDER TRACKING SCREEN IF ORDER PLACED OR SELECTED
   if (placedOrder) {
+    const badge = getStatusBadgeInfo(placedOrder.status, placedOrder.deliveryType);
+    const timelineSteps = [
+      {
+        key: 'recebido',
+        label: 'Recebido',
+        done: ['pendente', 'em_separacao', 'em_rota', 'concluido'].includes(placedOrder.status),
+        current: placedOrder.status === 'pendente',
+      },
+      {
+        key: 'confirmado',
+        label: 'Confirmado',
+        done: ['em_separacao', 'em_rota', 'concluido'].includes(placedOrder.status),
+        current: false,
+      },
+      {
+        key: 'preparo',
+        label: 'Em preparo',
+        done: ['em_separacao', 'em_rota', 'concluido'].includes(placedOrder.status),
+        current: placedOrder.status === 'em_separacao',
+      },
+      {
+        key: 'rota',
+        label: placedOrder.deliveryType === 'retirada' ? 'Pronto para retirada' : 'Saiu para entrega',
+        done: ['em_rota', 'concluido'].includes(placedOrder.status),
+        current: placedOrder.status === 'em_rota',
+      },
+      {
+        key: 'entregue',
+        label: 'Entregue',
+        done: placedOrder.status === 'concluido',
+        current: placedOrder.status === 'concluido',
+      },
+    ];
+
     return (
       <div className="max-w-2xl mx-auto px-4 py-8">
         <div className="bg-white rounded-3xl shadow-xl border border-amber-200 overflow-hidden">
@@ -395,65 +589,64 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             <div className="w-16 h-16 bg-white/20 rounded-full flex items-center justify-center mx-auto mb-3 backdrop-blur-xs">
               <CheckCircle2 className="w-10 h-10 text-white" />
             </div>
-            <h2 className="text-2xl font-black">Pedido Recebido com Sucesso!</h2>
+            <h2 className="text-2xl font-black">Acompanhamento do Pedido</h2>
             <p className="text-amber-100 text-sm mt-1">
-              O depósito já recebeu seu pedido e a equipe está separando suas bebidas!
+              Atualização automática a cada 15 segundos • Realizado em{' '}
+              {new Date(placedOrder.createdAt).toLocaleString('pt-BR')}
             </p>
             <div className="inline-block mt-3 px-4 py-1.5 bg-white/25 rounded-full text-xs font-bold uppercase tracking-wider">
-              Comanda #{placedOrder.id}
+              Pedido #{placedOrder.id}
             </div>
           </div>
 
           <div className="p-6 space-y-6">
             <div className="bg-neutral-50 p-5 rounded-2xl border border-neutral-200">
               <h3 className="font-bold text-sm text-neutral-800 mb-4 flex items-center justify-between">
-                <span>Status da sua Entrega</span>
-                <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-800">
-                  {placedOrder.status === 'pendente' && 'Recebido no Depósito'}
-                  {placedOrder.status === 'em_separacao' && 'Em Separação no Estoque'}
-                  {placedOrder.status === 'em_rota' && (placedOrder.deliveryType === 'delivery' ? 'A Caminho com Motoboy' : 'Pronto p/ Retirada')}
-                  {placedOrder.status === 'concluido' && 'Entregue com Sucesso!'}
-                  {placedOrder.status === 'cancelado' && 'Cancelado'}
+                <span>Status do Pedido</span>
+                <span className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${badge.className}`}>
+                  {badge.label}
                 </span>
               </h3>
 
-              <div className="grid grid-cols-4 gap-2 text-center text-xs">
-                <div className="flex flex-col items-center">
-                  <div className="w-8 h-8 rounded-full bg-emerald-500 text-white flex items-center justify-center font-bold">✓</div>
-                  <span className="mt-1 font-semibold text-neutral-800">Recebido</span>
-                </div>
-                <div className="flex flex-col items-center">
-                  <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold ${
-                    ['em_separacao', 'em_rota', 'concluido'].includes(placedOrder.status)
-                      ? 'bg-emerald-500 text-white'
-                      : 'bg-amber-400 text-amber-950 animate-pulse'
-                  }`}>
-                    {['em_separacao', 'em_rota', 'concluido'].includes(placedOrder.status) ? '✓' : '2'}
+              {placedOrder.status === 'cancelado' ? (
+                <div className="p-4 rounded-2xl bg-red-50 border border-red-300 text-red-800 flex items-center gap-3">
+                  <AlertTriangle className="w-6 h-6 text-red-600 shrink-0" />
+                  <div>
+                    <p className="font-black text-sm text-red-900">Pedido cancelado</p>
+                    <p className="text-xs text-red-700 mt-0.5">
+                      Este pedido foi cancelado. Caso tenha dúvidas, entre em contato pelo WhatsApp da loja.
+                    </p>
                   </div>
-                  <span className="mt-1 font-semibold text-neutral-800">Separando</span>
                 </div>
-                <div className="flex flex-col items-center">
-                  <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold ${
-                    ['em_rota', 'concluido'].includes(placedOrder.status)
-                      ? 'bg-emerald-500 text-white'
-                      : 'bg-neutral-200 text-neutral-500'
-                  }`}>
-                    {['em_rota', 'concluido'].includes(placedOrder.status) ? '✓' : '3'}
-                  </div>
-                  <span className="mt-1 font-semibold text-neutral-800">A Caminho</span>
+              ) : (
+                <div className="grid grid-cols-5 gap-1.5 text-center text-[11px]">
+                  {timelineSteps.map((step, index) => (
+                    <div key={step.key} className="flex flex-col items-center">
+                      <div
+                        className={`w-8 h-8 rounded-full flex items-center justify-center font-bold transition-all ${
+                          step.done
+                            ? step.current && placedOrder.status !== 'concluido'
+                              ? 'bg-amber-500 text-neutral-950 ring-4 ring-amber-200 animate-pulse'
+                              : 'bg-emerald-500 text-white'
+                            : 'bg-neutral-200 text-neutral-500'
+                        }`}
+                      >
+                        {step.done ? '✓' : index + 1}
+                      </div>
+                      <span
+                        className={`mt-1.5 font-semibold leading-tight ${
+                          step.done ? 'text-neutral-900' : 'text-neutral-400'
+                        }`}
+                      >
+                        {step.label}
+                      </span>
+                    </div>
+                  ))}
                 </div>
-                <div className="flex flex-col items-center">
-                  <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold ${
-                    placedOrder.status === 'concluido' ? 'bg-emerald-500 text-white' : 'bg-neutral-200 text-neutral-500'
-                  }`}>
-                    {placedOrder.status === 'concluido' ? '✓' : '4'}
-                  </div>
-                  <span className="mt-1 font-semibold text-neutral-800">Entregue</span>
-                </div>
-              </div>
+              )}
             </div>
 
-            {placedOrder.paymentMethod === 'pix' && (
+            {placedOrder.paymentMethod === 'pix' && placedOrder.status !== 'cancelado' && (
               <div className="bg-amber-50 border border-amber-200 rounded-2xl p-5">
                 <div className="flex items-center justify-between mb-2">
                   <h4 className="font-bold text-amber-900 text-sm flex items-center gap-1.5">
@@ -472,7 +665,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   </span>
                   <button
                     onClick={handleCopyPix}
-                    className="flex items-center gap-1 px-3 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-xs font-bold transition-colors"
+                    className="flex items-center gap-1 px-3 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
                   >
                     {copiedPix ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                     {copiedPix ? 'Copiado!' : 'Copiar'}
@@ -506,10 +699,18 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   <span>Subtotal:</span>
                   <span>{formatCurrency(placedOrder.subtotal)}</span>
                 </div>
-                <div className="flex justify-between text-neutral-500">
-                  <span>Taxa de Entrega ({placedOrder.customer.neighborhood}):</span>
-                  <span>{placedOrder.deliveryFee === 0 ? 'Grátis' : formatCurrency(placedOrder.deliveryFee)}</span>
-                </div>
+                {placedOrder.couponCode && placedOrder.discount && placedOrder.discount > 0 ? (
+                  <div className="flex justify-between text-emerald-600 font-bold">
+                    <span>Cupom ({placedOrder.couponCode}):</span>
+                    <span>-{formatCurrency(placedOrder.discount)}</span>
+                  </div>
+                ) : null}
+                {placedOrder.deliveryType === 'delivery' && (
+                  <div className="flex justify-between text-neutral-500">
+                    <span>Taxa de Entrega ({placedOrder.customer.neighborhood}):</span>
+                    <span>{placedOrder.deliveryFee === 0 ? 'Grátis' : formatCurrency(placedOrder.deliveryFee)}</span>
+                  </div>
+                )}
                 <div className="flex justify-between text-sm font-black text-neutral-900 pt-1">
                   <span>Total:</span>
                   <span className="text-amber-600">{formatCurrency(placedOrder.total)}</span>
@@ -534,22 +735,32 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
             <div className="flex flex-col sm:flex-row gap-3 pt-2">
               <a
-                href={`https://wa.me/${settings.whatsapp.replace(/\D/g, '')}?text=${encodeURIComponent(
-                  `Olá! Fiz o pedido #${placedOrder.id} de ${formatCurrency(placedOrder.total)} pelo site.`
-                )}`}
+                href={buildOrderWhatsAppUrl(placedOrder)}
                 target="_blank"
                 rel="noreferrer"
                 className="flex-1 flex items-center justify-center gap-2 py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-sm shadow-sm transition-colors"
               >
                 <MessageCircle className="w-4 h-4" />
-                <span>Falar no WhatsApp do Depósito</span>
+                <span>Falar sobre o Pedido no WhatsApp</span>
               </a>
+
+              {currentCustomer && (
+                <button
+                  onClick={() => {
+                    setPlacedOrder(null);
+                    handleOpenMyOrders();
+                  }}
+                  className="py-3 px-4 border border-neutral-300 hover:bg-neutral-100 text-neutral-700 font-bold rounded-xl text-sm transition-colors cursor-pointer"
+                >
+                  Meus pedidos
+                </button>
+              )}
 
               <button
                 onClick={() => setPlacedOrder(null)}
-                className="py-3 px-5 border border-neutral-300 hover:bg-neutral-100 text-neutral-700 font-bold rounded-xl text-sm transition-colors"
+                className="py-3 px-5 border border-neutral-300 hover:bg-neutral-100 text-neutral-700 font-bold rounded-xl text-sm transition-colors cursor-pointer"
               >
-                Fazer Novo Pedido
+                Voltar à Loja
               </button>
             </div>
           </div>
@@ -601,18 +812,42 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             ) : (
               <div>
                 <p className="text-xs font-bold text-neutral-900">Já tem cadastro?</p>
-                <p className="text-[11px] text-neutral-500">Acesse com seu WhatsApp para carregar seu endereço salvo.</p>
+                <p className="text-[11px] text-neutral-500">Acesse com seu e-mail e senha para carregar seu endereço salvo.</p>
               </div>
             )}
           </div>
         </div>
 
-        <button
-          onClick={() => setIsAuthModalOpen(true)}
-          className="px-3.5 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-bold transition-colors"
-        >
-          {currentCustomer ? 'Alterar Endereço / Dados' : 'Entrar / Cadastrar'}
-        </button>
+        <div className="flex items-center gap-2 flex-wrap">
+          {currentCustomer && (
+            <button
+              onClick={handleOpenMyOrders}
+              className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 rounded-xl text-xs font-black transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
+            >
+              <Package className="w-3.5 h-3.5" />
+              <span>Meus pedidos</span>
+            </button>
+          )}
+          <button
+            onClick={() => setIsAuthModalOpen(true)}
+            className="px-3.5 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer"
+          >
+            {currentCustomer ? 'Minha Conta / Endereço' : 'Entrar / Cadastrar'}
+          </button>
+          {currentCustomer && (
+            <button
+              onClick={() => {
+                api.logoutCustomer();
+                setCurrentCustomer(null);
+                setAppliedCoupon(null);
+                setMyOrders([]);
+              }}
+              className="px-3 py-1.5 bg-neutral-100 hover:bg-red-50 text-neutral-600 hover:text-red-700 rounded-xl text-xs font-bold transition-colors cursor-pointer"
+            >
+              Sair
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Store Hero Banner */}
@@ -1271,12 +1506,85 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 />
               </div>
 
+              {/* Cupom de Desconto */}
+              <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200 space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <label className="font-bold text-neutral-800 flex items-center gap-1.5">
+                    <Ticket className="w-4 h-4 text-amber-600" />
+                    <span>Cupom de Desconto</span>
+                  </label>
+                  {appliedCoupon && (
+                    <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full">
+                      ✓ Ativo
+                    </span>
+                  )}
+                </div>
+
+                {appliedCoupon ? (
+                  <div className="flex items-center justify-between bg-emerald-50 border border-emerald-200 p-2.5 rounded-xl">
+                    <div>
+                      <span className="font-black text-emerald-950 font-mono tracking-wider">{appliedCoupon.code}</span>
+                      <span className="text-emerald-700 ml-2 font-semibold">
+                        (-{formatCurrency(cartDiscount)}
+                        {appliedCoupon.type === 'percent' && appliedCoupon.maxDiscount
+                          ? ` • ${appliedCoupon.value}% até ${formatCurrency(appliedCoupon.maxDiscount)}`
+                          : appliedCoupon.type === 'percent'
+                          ? ` • ${appliedCoupon.value}% OFF`
+                          : ''}
+                        )
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleRemoveCoupon}
+                      className="text-[11px] text-red-600 hover:text-red-800 font-bold underline cursor-pointer"
+                    >
+                      Remover
+                    </button>
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        placeholder="Ex: PROMO10"
+                        value={couponInput}
+                        onChange={(e) => {
+                          setCouponInput(e.target.value.toUpperCase());
+                          if (couponError) setCouponError('');
+                        }}
+                        className="flex-1 px-3 py-2 bg-white border border-neutral-300 rounded-xl font-mono font-bold uppercase text-xs outline-amber-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleApplyCoupon}
+                        disabled={isValidatingCoupon || !couponInput.trim()}
+                        className="px-3.5 py-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-neutral-950 font-black rounded-xl text-xs transition-colors cursor-pointer"
+                      >
+                        {isValidatingCoupon ? 'Validando...' : 'Aplicar'}
+                      </button>
+                    </div>
+                    {couponError && (
+                      <p className="text-[11px] font-bold text-red-600 bg-red-50 p-2 rounded-xl border border-red-200">
+                        {couponError}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+
               {/* Total summary */}
               <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200 space-y-2 text-xs">
                 <div className="flex justify-between text-neutral-600">
                   <span>Subtotal:</span>
                   <span>{formatCurrency(cartSubtotal)}</span>
                 </div>
+                {cartDiscount > 0 && (
+                  <div className="flex justify-between text-emerald-600 font-bold">
+                    <span>Desconto do Cupom ({appliedCoupon?.code}):</span>
+                    <span>-{formatCurrency(cartDiscount)}</span>
+                  </div>
+                )}
                 <div className="flex justify-between text-neutral-600">
                   <span>Taxa de Entrega:</span>
                   <span>{deliveryFee === 0 ? 'Grátis' : formatCurrency(deliveryFee)}</span>
@@ -1290,7 +1598,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
               <button
                 type="submit"
                 disabled={isSubmitting || cart.length === 0 || !isAreaCovered || !settings.isOpen}
-                className="w-full py-4 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 disabled:cursor-not-allowed text-white font-black text-base rounded-2xl shadow-xl shadow-amber-500/20 transition-all flex items-center justify-center gap-2"
+                className="w-full py-4 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 disabled:cursor-not-allowed text-white font-black text-base rounded-2xl shadow-xl shadow-amber-500/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
                 {!settings.isOpen ? (
                   <span>🔴 Depósito Fechado no Momento</span>
@@ -1308,6 +1616,78 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         </div>
       )}
 
+      {/* Customer Orders ("Meus pedidos") Modal */}
+      {isMyOrdersOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 overflow-y-auto">
+          <div className="bg-white rounded-3xl max-w-lg w-full shadow-2xl overflow-hidden border border-neutral-200 my-6">
+            <div className="p-5 bg-neutral-900 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Package className="w-5 h-5 text-amber-500" />
+                <h3 className="font-black text-base">Meus Pedidos</h3>
+              </div>
+              <button
+                onClick={() => setIsMyOrdersOpen(false)}
+                className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 max-h-[70vh] overflow-y-auto space-y-3">
+              {isLoadingMyOrders ? (
+                <div className="py-10 text-center text-neutral-500 text-xs flex flex-col items-center gap-2">
+                  <Loader2 className="w-6 h-6 animate-spin text-amber-500" />
+                  <span>Carregando seus pedidos...</span>
+                </div>
+              ) : myOrdersError ? (
+                <div className="p-4 bg-red-50 border border-red-200 text-red-700 rounded-2xl text-xs font-bold">
+                  {myOrdersError}
+                </div>
+              ) : myOrders.length === 0 ? (
+                <div className="py-10 text-center text-neutral-500 text-xs">
+                  <p className="font-bold text-neutral-800 text-sm mb-1">Você ainda não fez nenhum pedido</p>
+                  <p>Escolha suas bebidas favoritas na loja e faça seu primeiro pedido!</p>
+                </div>
+              ) : (
+                myOrders.map((ord) => {
+                  const stBadge = getStatusBadgeInfo(ord.status, ord.deliveryType);
+                  return (
+                    <button
+                      key={ord.id}
+                      type="button"
+                      onClick={() => {
+                        setIsMyOrdersOpen(false);
+                        setPlacedOrder(ord);
+                      }}
+                      className="w-full text-left p-4 rounded-2xl border border-neutral-200 hover:border-amber-400 hover:bg-amber-50/40 transition-all flex items-center justify-between gap-3 cursor-pointer"
+                    >
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-black text-sm text-neutral-900">#{ord.id}</span>
+                          <span className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${stBadge.className}`}>
+                            {stBadge.label}
+                          </span>
+                        </div>
+                        <p className="text-xs text-neutral-500">
+                          {new Date(ord.createdAt).toLocaleString('pt-BR')} • {ord.items.reduce((s, i) => s + i.quantity, 0)} un.
+                        </p>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <p className="font-black text-sm text-amber-600">{formatCurrency(ord.total)}</p>
+                        <span className="text-[11px] font-bold text-neutral-500 flex items-center justify-end gap-1 mt-0.5">
+                          <span>Acompanhar</span>
+                          <ArrowRight className="w-3 h-3" />
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Customer Auth / Register Modal */}
       <CustomerAuthModal
         isOpen={isAuthModalOpen}
@@ -1319,6 +1699,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
           setIsAuthModalOpen(false);
         }}
         onClose={() => setIsAuthModalOpen(false)}
+        onLogout={() => {
+          setCurrentCustomer(null);
+          setAppliedCoupon(null);
+          setMyOrders([]);
+        }}
       />
     </div>
   );
