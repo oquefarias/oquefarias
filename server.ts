@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { initialProducts, initialOrders, initialSettings, initialDeliveryAreas, initialCustomers } from './src/data/initialData.ts';
 import { Product, Order, StoreSettings, DeliveryArea, CustomerProfile } from './src/types/index.ts';
 
@@ -21,6 +22,23 @@ interface DatabaseSchema {
   settings: StoreSettings;
   deliveryAreas: DeliveryArea[];
   customers: CustomerProfile[];
+}
+
+let supabaseClient: SupabaseClient | null = null;
+
+function getSupabaseClient(customUrl?: string, customKey?: string): SupabaseClient | null {
+  const url = customUrl || process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || db?.settings?.supabaseUrl || 'https://daxtsgcjsyujykztxiox.supabase.co';
+  const key = customKey || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLISHABLE_KEY || process.env.VITE_SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || db?.settings?.supabaseAnonKey || 'sb_publishable_dFxrorp9joFJ8cpDkUfSrw_PcoUSuYN';
+  if (!url || !key) return null;
+  if (!supabaseClient) {
+    try {
+      supabaseClient = createClient(url.trim(), key.trim(), { auth: { persistSession: false } });
+    } catch (e) {
+      console.warn('Error creating Supabase client on server:', e);
+      return null;
+    }
+  }
+  return supabaseClient;
 }
 
 // Ensure database file exists
@@ -62,6 +80,29 @@ function saveDatabase(data: DatabaseSchema) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8');
+
+    // Async sync to Supabase if configured
+    const client = getSupabaseClient(data.settings?.supabaseUrl, data.settings?.supabaseAnonKey);
+    if (client) {
+      Promise.resolve().then(async () => {
+        try {
+          await client.from('app_state').upsert({
+            id: 'store_data',
+            payload: data,
+            updated_at: new Date().toISOString(),
+          });
+          if (data.settings) {
+            await client.from('store_settings').upsert({
+              id: 'default',
+              data: data.settings,
+              updated_at: new Date().toISOString(),
+            });
+          }
+        } catch (err) {
+          console.warn('[Supabase Server Sync] Warning:', err);
+        }
+      });
+    }
   } catch (e) {
     console.error('Error saving database file:', e);
   }
@@ -342,6 +383,53 @@ async function startServer() {
     saveDatabase(db);
     broadcastSSE('STATE_UPDATED', db);
     res.json({ success: true });
+  });
+
+  // Supabase test connection endpoint
+  app.post('/api/supabase/test', async (req, res) => {
+    const { url, key } = req.body || {};
+    const client = getSupabaseClient(url, key);
+    if (!client) {
+      return res.status(400).json({ success: false, message: 'URL e Chave do Supabase não fornecidas.' });
+    }
+    try {
+      const testRes = await client.from('store_settings').select('id').limit(1);
+      if (testRes.error && testRes.error.code !== 'PGRST116') {
+        return res.json({
+          success: true,
+          message: `Conectado ao Supabase! (Execute o script SQL para criar as tabelas se necessário). Detalhe: ${testRes.error.message}`,
+        });
+      }
+      return res.json({ success: true, message: 'Conectado com sucesso ao Supabase!' });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, message: `Erro ao conectar: ${err?.message || err}` });
+    }
+  });
+
+  // Supabase full sync endpoint
+  app.post('/api/supabase/sync', async (req, res) => {
+    const { url, key } = req.body || {};
+    const client = getSupabaseClient(url, key);
+    if (!client) {
+      return res.status(400).json({ success: false, message: 'Supabase não configurado no servidor.' });
+    }
+    try {
+      await client.from('app_state').upsert({
+        id: 'store_data',
+        payload: db,
+        updated_at: new Date().toISOString(),
+      });
+      if (db.settings) {
+        await client.from('store_settings').upsert({
+          id: 'default',
+          data: db.settings,
+          updated_at: new Date().toISOString(),
+        });
+      }
+      return res.json({ success: true, message: 'Dados sincronizados com o Supabase com sucesso!' });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, message: `Erro na sincronização: ${err?.message || err}` });
+    }
   });
 
   // Attach Vite or Static

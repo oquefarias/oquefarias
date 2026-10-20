@@ -8,7 +8,7 @@ import { ShieldCheck, Lock, ArrowRight, AlertCircle, ArrowLeft } from 'lucide-re
 
 export default function App() {
   const subscribe = (callback: () => void) => api.subscribe(callback);
-  const getSnapshot = () => `${api.getProducts().length}-${api.getOrders().length}-${api.getDeliveryAreas().length}-${api.getCustomers().length}-${JSON.stringify(api.getSettings())}`;
+  const getSnapshot = () => api.getVersion();
 
   useSyncExternalStore(subscribe, getSnapshot);
 

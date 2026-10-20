@@ -117,7 +117,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               <button
                 onClick={onLockAdmin}
                 className="flex items-center gap-1.5 px-3 py-2 bg-neutral-800 hover:bg-red-950/80 hover:text-red-400 text-neutral-300 border border-neutral-700 rounded-xl text-xs font-bold transition-colors"
-                title="Bloquear tela do computador"
+                title="Bloquear painel"
               >
                 <span>Bloquear</span>
               </button>

@@ -220,19 +220,30 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="font-bold text-neutral-700 block mb-1">Bairro Atendido *</label>
-                    <select
-                      value={neighborhood}
-                      onChange={(e) => setNeighborhood(e.target.value)}
-                      className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium"
-                      required
-                    >
-                      {deliveryAreas.filter(a => a.active).map(a => (
-                        <option key={a.id} value={a.name}>
-                          {a.name} (Taxa R$ {a.fee.toFixed(2)})
-                        </option>
-                      ))}
-                    </select>
+                    <label className="font-bold text-neutral-700 block mb-1">Bairro *</label>
+                    {deliveryAreas.filter(a => a.active).length > 0 ? (
+                      <select
+                        value={neighborhood}
+                        onChange={(e) => setNeighborhood(e.target.value)}
+                        className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium"
+                        required
+                      >
+                        {deliveryAreas.filter(a => a.active).map(a => (
+                          <option key={a.id} value={a.name}>
+                            {a.name} (Taxa R$ {a.fee.toFixed(2)})
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type="text"
+                        placeholder="Ex: Centro, Jardim..."
+                        value={neighborhood}
+                        onChange={(e) => setNeighborhood(e.target.value)}
+                        className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium"
+                        required
+                      />
+                    )}
                   </div>
 
                   <div>

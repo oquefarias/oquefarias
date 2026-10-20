@@ -20,6 +20,12 @@ export const initialSettings: StoreSettings = {
   openingHours: 'Segunda a Domingo: 10:00 às 23:00',
   soundEnabled: true,
   adminPin: '1234',
+  supabaseUrl: 'https://daxtsgcjsyujykztxiox.supabase.co',
+  supabaseAnonKey: 'sb_publishable_dFxrorp9joFJ8cpDkUfSrw_PcoUSuYN',
+  deliveryRadiusKm: 5,
+  storeLatitude: -23.55052,
+  storeLongitude: -46.633308,
+  deliveryModel: 'both',
 };
 
 // All simulation data wiped clean for real depot operation

@@ -1,6 +1,7 @@
 import { Product, Order, StoreSettings, OrderStatus, AppState, DeliveryArea, CustomerProfile } from '../types';
 import { initialProducts, initialOrders, initialSettings, initialDeliveryAreas, initialCustomers } from '../data/initialData';
 import { soundService } from '../utils/sound';
+import { supabaseService } from './supabase';
 
 const STORAGE_KEY_PRODUCTS = 'deposito_products_v4';
 const STORAGE_KEY_ORDERS = 'deposito_orders_v4';
@@ -23,11 +24,17 @@ class ApiService {
   private listeners: Array<() => void> = [];
   private eventSource: EventSource | null = null;
   private hasInitializedBackend: boolean = false;
+  private version: number = 0;
 
   constructor() {
     this.initLocalStorageIfEmpty();
     this.setupBroadcastChannel();
     this.setupServerEvents();
+    // Initialize Supabase if credentials are present in settings or env
+    const settings = this.getSettings();
+    if (settings.supabaseUrl && settings.supabaseAnonKey) {
+      supabaseService.initFromEnvOrStorage(settings.supabaseUrl, settings.supabaseAnonKey);
+    }
   }
 
   private initLocalStorageIfEmpty() {
@@ -46,8 +53,27 @@ class ApiService {
     if (!localStorage.getItem(STORAGE_KEY_ORDERS)) {
       localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify([]));
     }
-    if (!localStorage.getItem(STORAGE_KEY_SETTINGS)) {
+    const existingSettingsRaw = localStorage.getItem(STORAGE_KEY_SETTINGS);
+    if (!existingSettingsRaw) {
       localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(initialSettings));
+    } else {
+      try {
+        const parsed = JSON.parse(existingSettingsRaw);
+        let updated = false;
+        if (!parsed.supabaseUrl && initialSettings.supabaseUrl) {
+          parsed.supabaseUrl = initialSettings.supabaseUrl;
+          updated = true;
+        }
+        if (!parsed.supabaseAnonKey && initialSettings.supabaseAnonKey) {
+          parsed.supabaseAnonKey = initialSettings.supabaseAnonKey;
+          updated = true;
+        }
+        if (updated) {
+          localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(parsed));
+        }
+      } catch {
+        localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(initialSettings));
+      }
     }
     if (!localStorage.getItem(STORAGE_KEY_AREAS)) {
       localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify([]));
@@ -106,12 +132,33 @@ class ApiService {
   }
 
   private notifyListeners() {
+    this.version++;
     this.listeners.forEach(fn => fn());
+  }
+
+  public getVersion(): number {
+    return this.version;
   }
 
   public async syncWithBackend(): Promise<void> {
     if (this.hasInitializedBackend) return;
     try {
+      // 1. First attempt to load state from Supabase if configured
+      if (supabaseService.isConfigured()) {
+        const supaData = await supabaseService.loadAllFromSupabase();
+        if (supaData && (supaData.products || supaData.orders || supaData.settings || supaData.deliveryAreas || supaData.customers)) {
+          if (supaData.products) localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(supaData.products));
+          if (supaData.orders) localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify(supaData.orders));
+          if (supaData.settings) localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(supaData.settings));
+          if (supaData.deliveryAreas) localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(supaData.deliveryAreas));
+          if (supaData.customers) localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(supaData.customers));
+          this.hasInitializedBackend = true;
+          this.notifyListeners();
+          return;
+        }
+      }
+
+      // 2. Fallback to Express backend state
       const res = await fetch('/api/state');
       if (res.ok) {
         const data: AppState = await res.json();
@@ -188,6 +235,9 @@ class ApiService {
       broadcastChannel.postMessage({ type: 'PRODUCTS_UPDATED' });
     }
 
+    // Persist to Supabase
+    supabaseService.saveProduct(product).catch(err => console.warn('Supabase saveProduct error', err));
+
     try {
       await fetch(existingIndex >= 0 ? `/api/products/${product.id}` : '/api/products', {
         method: existingIndex >= 0 ? 'PUT' : 'POST',
@@ -208,6 +258,9 @@ class ApiService {
     localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(products));
     this.notifyListeners();
 
+    // Persist to Supabase
+    supabaseService.saveProduct(prod).catch(err => console.warn('Supabase adjustStock error', err));
+
     try {
       await fetch(`/api/products/${productId}/stock`, {
         method: 'POST',
@@ -223,6 +276,9 @@ class ApiService {
     const products = this.getProducts().filter(p => p.id !== productId);
     localStorage.setItem(STORAGE_KEY_PRODUCTS, JSON.stringify(products));
     this.notifyListeners();
+
+    // Persist to Supabase
+    supabaseService.deleteProduct(productId).catch(err => console.warn('Supabase deleteProduct error', err));
 
     try {
       await fetch(`/api/products/${productId}`, { method: 'DELETE' });
@@ -256,6 +312,9 @@ class ApiService {
     localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(updated));
     this.notifyListeners();
 
+    // Persist to Supabase
+    supabaseService.saveDeliveryArea(area).catch(err => console.warn('Supabase saveDeliveryArea error', err));
+
     try {
       await fetch(existingIndex >= 0 ? `/api/delivery-areas/${area.id}` : '/api/delivery-areas', {
         method: existingIndex >= 0 ? 'PUT' : 'POST',
@@ -271,6 +330,9 @@ class ApiService {
     const areas = this.getDeliveryAreas().filter(a => a.id !== id);
     localStorage.setItem(STORAGE_KEY_AREAS, JSON.stringify(areas));
     this.notifyListeners();
+
+    // Persist to Supabase
+    supabaseService.deleteDeliveryArea(id).catch(err => console.warn('Supabase deleteDeliveryArea error', err));
 
     try {
       await fetch(`/api/delivery-areas/${id}`, { method: 'DELETE' });
@@ -329,6 +391,9 @@ class ApiService {
 
     localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(customers));
     this.setCurrentCustomer(savedCust);
+
+    // Persist to Supabase
+    supabaseService.saveCustomer(savedCust).catch(err => console.warn('Supabase saveCustomer error', err));
 
     try {
       await fetch('/api/customers', {
@@ -407,6 +472,9 @@ class ApiService {
 
     this.notifyListeners();
 
+    // Persist to Supabase
+    supabaseService.saveOrder(order).catch(err => console.warn('Supabase saveOrder error', err));
+
     try {
       await fetch('/api/orders', {
         method: 'POST',
@@ -430,6 +498,9 @@ class ApiService {
 
     localStorage.setItem(STORAGE_KEY_ORDERS, JSON.stringify(orders));
     this.notifyListeners();
+
+    // Persist to Supabase
+    supabaseService.updateOrderStatus(orderId, status).catch(err => console.warn('Supabase updateOrderStatus error', err));
 
     try {
       await fetch(`/api/orders/${orderId}/status`, {
@@ -459,6 +530,13 @@ class ApiService {
     soundService.setSoundEnabled(updated.soundEnabled);
     this.notifyListeners();
 
+    // Re-initialize Supabase client if credentials changed
+    if (updated.supabaseUrl && updated.supabaseAnonKey) {
+      supabaseService.initFromEnvOrStorage(updated.supabaseUrl, updated.supabaseAnonKey);
+    }
+    // Persist to Supabase
+    supabaseService.saveSettings(updated).catch(err => console.warn('Supabase saveSettings error', err));
+
     try {
       await fetch('/api/settings', {
         method: 'PUT',
@@ -468,6 +546,25 @@ class ApiService {
     } catch {
       // Ignored
     }
+  }
+
+  // ================= SUPABASE HELPERS =================
+  public async testSupabase(): Promise<{ success: boolean; message: string }> {
+    return supabaseService.testConnection();
+  }
+
+  public async syncAllToSupabase(): Promise<{ success: boolean; message: string }> {
+    return supabaseService.syncAllToSupabase({
+      products: this.getProducts(),
+      orders: this.getOrders(),
+      settings: this.getSettings(),
+      deliveryAreas: this.getDeliveryAreas(),
+      customers: this.getCustomers(),
+    });
+  }
+
+  public isSupabaseConnected(): boolean {
+    return supabaseService.isConfigured();
   }
 
   public async clearAllSimulationData(): Promise<void> {

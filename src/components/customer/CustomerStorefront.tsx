@@ -24,8 +24,10 @@ import {
   Package,
   X,
   User,
-  AlertTriangle
+  AlertTriangle,
+  Compass,
 } from 'lucide-react';
+import { calculateDistanceKm, geocodeAddress, resolveAddressOrCep } from '../../utils/geo';
 
 interface CustomerStorefrontProps {
   products: Product[];
@@ -64,6 +66,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [placedOrder, setPlacedOrder] = useState<Order | null>(null);
   const [copiedPix, setCopiedPix] = useState<boolean>(false);
+  const [checkingDistance, setCheckingDistance] = useState<boolean>(false);
+  const [customerDistance, setCustomerDistance] = useState<{ km: number; inside: boolean } | null>(null);
 
   // Keep fields synced when currentCustomer changes
   useEffect(() => {
@@ -86,11 +90,41 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return activeAreas.find(a => a.name.toLowerCase().trim() === neighborhood.toLowerCase().trim());
   }, [activeAreas, neighborhood]);
 
+  const handleCheckDistance = async () => {
+    if (!address.trim()) {
+      alert('Por favor, digite a rua do seu endereço para verificar.');
+      return;
+    }
+    setCheckingDistance(true);
+    try {
+      const fullQuery = `${address}${addressNumber ? `, ${addressNumber}` : ''}${neighborhood ? `, ${neighborhood}` : ''}, Brasil`;
+      const res = await resolveAddressOrCep(fullQuery);
+      if (res && settings.storeLatitude && settings.storeLongitude) {
+        const d = calculateDistanceKm(settings.storeLatitude, settings.storeLongitude, res.lat, res.lng);
+        const maxRadius = settings.deliveryRadiusKm || 5;
+        setCustomerDistance({ km: d, inside: d <= maxRadius });
+      } else {
+        alert('Endereço não localizado com precisão. Verifique a rua, número ou CEP digitados.');
+      }
+    } catch {
+      alert('Não foi possível verificar a distância no momento.');
+    } finally {
+      setCheckingDistance(false);
+    }
+  };
+
   const isAreaCovered = useMemo(() => {
     if (deliveryType === 'retirada') return true;
+    if (customerDistance && !customerDistance.inside) {
+      return false;
+    }
+    if (matchedArea) return true;
+    if (settings.deliveryModel === 'radius' || (settings.deliveryRadiusKm && activeAreas.length === 0)) {
+      return true;
+    }
     if (activeAreas.length === 0) return true;
     return !!matchedArea;
-  }, [deliveryType, activeAreas.length, matchedArea]);
+  }, [deliveryType, activeAreas.length, matchedArea, customerDistance, settings.deliveryModel, settings.deliveryRadiusKm]);
 
   // Filter products
   const filteredProducts = useMemo(() => {
@@ -123,8 +157,13 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     if (matchedArea) {
       return matchedArea.fee;
     }
-    return settings.deliveryFee;
-  }, [deliveryType, cartSubtotal, settings, matchedArea]);
+    let fee = settings.deliveryFee || 5.0;
+    if (customerDistance && settings.pricePerKm && settings.pricePerKm > 0) {
+      const extraKm = Math.max(0, customerDistance.km - 1);
+      fee += extraKm * settings.pricePerKm;
+    }
+    return Math.round(fee * 100) / 100;
+  }, [deliveryType, cartSubtotal, settings, matchedArea, customerDistance]);
 
   const cartTotal = cartSubtotal + deliveryFee;
   const totalCartCount = cart.reduce((sum, item) => sum + item.quantity, 0);
@@ -881,7 +920,53 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 </div>
 
                 {deliveryType === 'delivery' && (
-                  <div className="space-y-2 pt-1">
+                  <div className="space-y-3 pt-1">
+                    {/* Delivery Radius / Coverage Info Banner */}
+                    {settings.deliveryRadiusKm && (
+                      <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex flex-wrap items-center justify-between gap-2 text-xs text-amber-950">
+                        <div className="flex items-center gap-2">
+                          <Compass className="w-4 h-4 text-amber-600 shrink-0" />
+                          <span>
+                            Entregamos em até <strong>{settings.deliveryRadiusKm} km</strong> de distância do depósito!
+                          </span>
+                        </div>
+                        {address && (
+                          <button
+                            type="button"
+                            onClick={handleCheckDistance}
+                            disabled={checkingDistance}
+                            className="text-[11px] font-bold text-amber-700 hover:text-amber-900 bg-white px-2.5 py-1 rounded-lg border border-amber-300 shadow-2xs transition-colors shrink-0"
+                          >
+                            {checkingDistance ? 'Calculando...' : 'Checar Distância'}
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {customerDistance && (
+                      <div className={`p-2.5 rounded-xl text-xs flex items-center gap-2 ${
+                        customerDistance.inside
+                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                          : 'bg-red-50 text-red-800 border border-red-200'
+                      }`}>
+                        {customerDistance.inside ? (
+                          <>
+                            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                            <span>
+                              Distância: <strong>{customerDistance.km} km</strong> — Dentro da área de entrega!
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                            <span>
+                              Distância: <strong>{customerDistance.km} km</strong> — Fora do raio máximo de {settings.deliveryRadiusKm} km. Escolha Retirada no Depósito.
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    )}
+
                     {/* Bairro Selector with delivery area enforcement */}
                     <div>
                       <label className="text-[11px] font-semibold text-neutral-700 block mb-1">

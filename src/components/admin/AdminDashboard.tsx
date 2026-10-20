@@ -1,9 +1,10 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Product, Order, StoreSettings, OrderStatus, ProductCategory, PaymentMethod, DeliveryArea, CustomerProfile } from '../../types';
 import { api } from '../../services/api';
 import { soundService } from '../../utils/sound';
 import { PrintReceiptModal } from '../PrintReceiptModal';
 import { QRCodeModal } from '../QRCodeModal';
+import { GoogleDeliveryRadiusMap } from './GoogleDeliveryRadiusMap';
 import {
   Bell,
   Package,
@@ -31,7 +32,8 @@ import {
   Upload,
   Camera,
   Image as ImageIcon,
-  Copy
+  Copy,
+  Compass,
 } from 'lucide-react';
 
 // Compress image uploaded from computer so it stays lightweight and fast
@@ -133,16 +135,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [showPin, setShowPin] = useState<boolean>(false);
   const [isUploadingLogo, setIsUploadingLogo] = useState<boolean>(false);
   const [isUploadingProductPhoto, setIsUploadingProductPhoto] = useState<boolean>(false);
-  const [copiedControlPanelUrl, setCopiedControlPanelUrl] = useState<boolean>(false);
 
-  const handleCopyControlPanelUrl = () => {
-    if (typeof window !== 'undefined' && navigator.clipboard) {
-      const url = `${window.location.origin}/control-panel`;
-      navigator.clipboard.writeText(url);
-      setCopiedControlPanelUrl(true);
-      setTimeout(() => setCopiedControlPanelUrl(false), 2500);
-    }
-  };
+  // Local optimistic state for instant order status changes without requiring page reload
+  const [localOrders, setLocalOrders] = useState<Order[]>(orders);
+
+  useEffect(() => {
+    setLocalOrders(orders);
+  }, [orders]);
+
+  // Sub-tab for Delivery Areas (Map vs Neighborhoods)
+  const [areaSubTab, setAreaSubTab] = useState<'mapa' | 'bairros'>('mapa');
 
   // Upload logo from computer
   const handleLogoFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -222,21 +224,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     return `${d.toLocaleDateString('pt-BR')} ${d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`;
   };
 
-  // Pending orders count
+  // Pending orders count (uses localOrders for instant real-time sync)
   const pendingOrders = useMemo(() => {
-    return orders.filter(o => o.status === 'pendente');
-  }, [orders]);
+    return localOrders.filter(o => o.status === 'pendente');
+  }, [localOrders]);
 
   // Low stock products count
   const lowStockProducts = useMemo(() => {
     return products.filter(p => p.stock <= p.minStock);
   }, [products]);
 
-  // Filtered orders list
+  // Filtered orders list (instant UI responsiveness without F5)
   const filteredOrders = useMemo(() => {
-    if (orderStatusFilter === 'todos') return orders;
-    return orders.filter(o => o.status === orderStatusFilter);
-  }, [orders, orderStatusFilter]);
+    if (orderStatusFilter === 'todos') return localOrders;
+    return localOrders.filter(o => o.status === orderStatusFilter);
+  }, [localOrders, orderStatusFilter]);
 
   // Filtered stock list
   const filteredProducts = useMemo(() => {
@@ -251,10 +253,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     });
   }, [products, stockCategoryFilter, onlyLowStock, stockSearch]);
 
-  // Order status actions
+  // Order status actions - Instant optimistic update without requiring page reload
   const handleUpdateStatus = async (orderId: string, newStatus: OrderStatus) => {
-    await api.updateOrderStatus(orderId, newStatus);
+    // 1. Instant local update
+    setLocalOrders(prev => prev.map(o => o.id === orderId ? { ...o, status: newStatus, updatedAt: new Date().toISOString() } : o));
     soundService.playSuccessSound();
+    // 2. Persist to API and Supabase
+    await api.updateOrderStatus(orderId, newStatus);
   };
 
   // Stock quick adjust
@@ -414,7 +419,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Financial Stats Calculation
   const financialStats = useMemo(() => {
     const today = new Date().toDateString();
-    const todayOrders = orders.filter(o => new Date(o.createdAt).toDateString() === today && o.status !== 'cancelado');
+    const todayOrders = localOrders.filter(o => new Date(o.createdAt).toDateString() === today && o.status !== 'cancelado');
     const totalRevenueToday = todayOrders.reduce((sum, o) => sum + o.total, 0);
     
     let totalCostToday = 0;
@@ -449,7 +454,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       paymentBreakdown,
       totalStockValue,
     };
-  }, [orders, products]);
+  }, [localOrders, products]);
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -608,7 +613,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <button
             onClick={onLockDashboard}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded-xl text-xs font-bold transition-colors"
-            title="Bloquear o sistema no computador"
+            title="Bloquear o painel"
           >
             <Lock className="w-3.5 h-3.5" />
             <span>Bloquear Painel</span>
@@ -624,12 +629,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <div className="flex items-center justify-between flex-wrap gap-3">
             <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
               {[
-                { id: 'todos', label: 'Todos os Pedidos', count: orders.length },
-                { id: 'pendente', label: 'Novos / Pendentes', count: orders.filter(o => o.status === 'pendente').length },
-                { id: 'em_separacao', label: 'Em Separação', count: orders.filter(o => o.status === 'em_separacao').length },
-                { id: 'em_rota', label: 'Em Rota / Despachados', count: orders.filter(o => o.status === 'em_rota').length },
-                { id: 'concluido', label: 'Concluídos', count: orders.filter(o => o.status === 'concluido').length },
-                { id: 'cancelado', label: 'Cancelados', count: orders.filter(o => o.status === 'cancelado').length },
+                { id: 'todos', label: 'Todos os Pedidos', count: localOrders.length },
+                { id: 'pendente', label: 'Novos / Pendentes', count: localOrders.filter(o => o.status === 'pendente').length },
+                { id: 'em_separacao', label: 'Em Separação', count: localOrders.filter(o => o.status === 'em_separacao').length },
+                { id: 'em_rota', label: 'Em Rota / Despachados', count: localOrders.filter(o => o.status === 'em_rota').length },
+                { id: 'concluido', label: 'Concluídos', count: localOrders.filter(o => o.status === 'concluido').length },
+                { id: 'cancelado', label: 'Cancelados', count: localOrders.filter(o => o.status === 'cancelado').length },
               ].map(item => (
                 <button
                   key={item.id}
@@ -848,93 +853,132 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {/* ========================================================= */}
       {activeTab === 'areas' && (
         <div className="space-y-6">
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-white p-5 rounded-3xl border border-neutral-200">
-            <div>
-              <h3 className="font-black text-lg text-neutral-900 flex items-center gap-2">
-                <MapPin className="w-5 h-5 text-amber-500" />
-                <span>Bairros e Regiões de Entrega Permitidas</span>
-              </h3>
-              <p className="text-xs text-neutral-500 mt-1 max-w-2xl">
-                Cadastre aqui exatamente os bairros onde seu depósito consegue entregar. Pedidos no site feitos para endereços fora desta lista serão <strong>automaticamente bloqueados</strong>, garantindo que você nunca receba pedidos fora do seu alcance!
-              </p>
-            </div>
-
+          {/* Sub-tab Navigation */}
+          <div className="flex flex-wrap items-center gap-2 p-1.5 bg-neutral-100 rounded-2xl w-fit">
             <button
-              onClick={handleOpenNewArea}
-              className="flex items-center gap-1.5 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs shadow-xs transition-colors shrink-0"
+              type="button"
+              onClick={() => setAreaSubTab('mapa')}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-xs transition-all ${
+                areaSubTab === 'mapa'
+                  ? 'bg-white text-neutral-900 shadow-xs'
+                  : 'text-neutral-600 hover:text-neutral-900'
+              }`}
             >
-              <Plus className="w-4 h-4" />
-              <span>Cadastrar Novo Bairro</span>
+              <Compass className="w-4 h-4 text-amber-500" />
+              <span>🗺️ Raio no Mapa (km)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setAreaSubTab('bairros')}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-xs transition-all ${
+                areaSubTab === 'bairros'
+                  ? 'bg-white text-neutral-900 shadow-xs'
+                  : 'text-neutral-600 hover:text-neutral-900'
+              }`}
+            >
+              <MapPin className="w-4 h-4 text-amber-500" />
+              <span>📋 Bairros Cadastrados ({deliveryAreas.length})</span>
             </button>
           </div>
 
-          {deliveryAreas.length === 0 ? (
-            <div className="bg-white rounded-3xl p-12 text-center border border-dashed border-neutral-300">
-              <MapPin className="w-12 h-12 text-neutral-300 mx-auto mb-3" />
-              <h4 className="font-bold text-base text-neutral-800">Nenhum bairro cadastrado ainda</h4>
-              <p className="text-xs text-neutral-500 mt-1 max-w-sm mx-auto">
-                Cadastre os bairros onde seu depósito realiza entregas com o tempo estimado e a taxa de frete correspondente.
-              </p>
-              <button
-                onClick={handleOpenNewArea}
-                className="mt-4 inline-flex items-center gap-1.5 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs transition-colors shadow-xs"
-              >
-                <Plus className="w-4 h-4" />
-                <span>Cadastrar Primeiro Bairro</span>
-              </button>
-            </div>
+          {areaSubTab === 'mapa' ? (
+            <GoogleDeliveryRadiusMap
+              settings={settings}
+              onSave={async (updated) => {
+                await api.updateSettings(updated);
+              }}
+            />
           ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              {deliveryAreas.map(area => (
-                <div
-                  key={area.id}
-                  className={`bg-white rounded-3xl border p-5 transition-all shadow-xs flex flex-col justify-between ${
-                    area.active ? 'border-neutral-200' : 'border-neutral-200 bg-neutral-50 opacity-60'
-                  }`}
-                >
-                  <div>
-                    <div className="flex items-start justify-between">
-                      <div>
-                        <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Bairro / Região</span>
-                        <h4 className="text-base font-black text-neutral-900">{area.name}</h4>
-                      </div>
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-                        area.active ? 'bg-emerald-100 text-emerald-800' : 'bg-neutral-200 text-neutral-600'
-                      }`}>
-                        {area.active ? 'Ativo' : 'Pausado'}
-                      </span>
-                    </div>
-
-                    <div className="mt-4 pt-3 border-t border-neutral-100 space-y-2 text-xs">
-                      <div className="flex justify-between items-center">
-                        <span className="text-neutral-500">Taxa de Entrega:</span>
-                        <span className="font-black text-sm text-neutral-900">{formatCurrency(area.fee)}</span>
-                      </div>
-                      <div className="flex justify-between items-center">
-                        <span className="text-neutral-500">Tempo Estimado:</span>
-                        <span className="font-semibold text-neutral-700">{area.estimatedTime}</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="mt-4 pt-3 border-t border-neutral-100 flex items-center justify-end gap-1">
-                    <button
-                      onClick={() => handleOpenEditArea(area)}
-                      className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg text-xs font-semibold flex items-center gap-1"
-                    >
-                      <Edit2 className="w-3.5 h-3.5" />
-                      <span>Editar</span>
-                    </button>
-                    <button
-                      onClick={() => handleDeleteArea(area.id)}
-                      className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg text-xs"
-                      title="Excluir bairro"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
+            <div className="space-y-6">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-white p-5 rounded-3xl border border-neutral-200">
+                <div>
+                  <h3 className="font-black text-lg text-neutral-900 flex items-center gap-2">
+                    <MapPin className="w-5 h-5 text-amber-500" />
+                    <span>Bairros e Regiões de Entrega Permitidas</span>
+                  </h3>
+                  <p className="text-xs text-neutral-500 mt-1 max-w-2xl">
+                    Cadastre aqui bairros específicos atendidos pelo seu depósito com taxas individuais por bairro.
+                  </p>
                 </div>
-              ))}
+
+                <button
+                  onClick={handleOpenNewArea}
+                  className="flex items-center gap-1.5 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs shadow-xs transition-colors shrink-0"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Cadastrar Novo Bairro</span>
+                </button>
+              </div>
+
+              {deliveryAreas.length === 0 ? (
+                <div className="bg-white rounded-3xl p-12 text-center border border-dashed border-neutral-300">
+                  <MapPin className="w-12 h-12 text-neutral-300 mx-auto mb-3" />
+                  <h4 className="font-bold text-base text-neutral-800">Nenhum bairro individual cadastrado</h4>
+                  <p className="text-xs text-neutral-500 mt-1 max-w-sm mx-auto">
+                    Você pode usar o <strong>Raio no Mapa (km)</strong> acima para atender automaticamente qualquer cliente dentro da sua distância, ou cadastrar bairros pontuais aqui.
+                  </p>
+                  <button
+                    onClick={handleOpenNewArea}
+                    className="mt-4 inline-flex items-center gap-1.5 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs transition-colors shadow-xs"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Cadastrar Bairro Específico</span>
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {deliveryAreas.map(area => (
+                    <div
+                      key={area.id}
+                      className={`bg-white rounded-3xl border p-5 transition-all shadow-xs flex flex-col justify-between ${
+                        area.active ? 'border-neutral-200' : 'border-neutral-200 bg-neutral-50 opacity-60'
+                      }`}
+                    >
+                      <div>
+                        <div className="flex items-start justify-between">
+                          <div>
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Bairro / Região</span>
+                            <h4 className="text-base font-black text-neutral-900">{area.name}</h4>
+                          </div>
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                            area.active ? 'bg-emerald-100 text-emerald-800' : 'bg-neutral-200 text-neutral-600'
+                          }`}>
+                            {area.active ? 'Ativo' : 'Pausado'}
+                          </span>
+                        </div>
+
+                        <div className="mt-4 pt-3 border-t border-neutral-100 space-y-2 text-xs">
+                          <div className="flex justify-between items-center">
+                            <span className="text-neutral-500">Taxa de Entrega:</span>
+                            <span className="font-black text-sm text-neutral-900">{formatCurrency(area.fee)}</span>
+                          </div>
+                          <div className="flex justify-between items-center">
+                            <span className="text-neutral-500">Tempo Estimado:</span>
+                            <span className="font-semibold text-neutral-700">{area.estimatedTime}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 pt-3 border-t border-neutral-100 flex items-center justify-end gap-1">
+                        <button
+                          onClick={() => handleOpenEditArea(area)}
+                          className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg text-xs font-semibold flex items-center gap-1"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                          <span>Editar</span>
+                        </button>
+                        <button
+                          onClick={() => handleDeleteArea(area.id)}
+                          className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg text-xs"
+                          title="Excluir bairro"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1630,61 +1674,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           )}
 
           <form onSubmit={handleSaveSettings} className="bg-white rounded-3xl border border-neutral-200 p-6 sm:p-8 shadow-xs space-y-6">
-            {/* PIN SECURITY SECTION & /control-panel ACCESS */}
-            <div className="bg-amber-50/70 border border-amber-200 p-6 rounded-3xl space-y-4">
-              <div className="flex items-center justify-between flex-wrap gap-2">
-                <div className="flex items-center gap-2">
-                  <Lock className="w-5 h-5 text-amber-700" />
-                  <h4 className="font-black text-sm text-neutral-900">Segurança & Acesso ao Computador do Dono</h4>
-                </div>
-                <span className="px-2.5 py-1 bg-emerald-100 text-emerald-800 text-[11px] font-bold rounded-lg border border-emerald-200">
-                  Rota Oficial: /control-panel
-                </span>
-              </div>
 
-              <p className="text-xs text-neutral-600 leading-relaxed">
-                O endereço antigo <code className="bg-neutral-200 text-neutral-800 px-1.5 py-0.5 rounded font-mono font-bold">/admin</code> foi <strong>desativado</strong> por segurança. O seu painel de gestão agora é acessado exclusivamente pelo endereço <code className="bg-amber-100 text-amber-900 px-1.5 py-0.5 rounded font-mono font-bold">/control-panel</code>. Os clientes que acessarem seu site não verão botões nem links para esta área.
-              </p>
 
-              {/* URL Box & Copy */}
-              <div className="bg-white p-3.5 rounded-2xl border border-neutral-300 flex items-center justify-between gap-3 text-xs">
-                <div className="truncate">
-                  <span className="text-[11px] text-neutral-400 block font-bold uppercase">Endereço Secreto do seu Computador</span>
-                  <span className="font-mono font-black text-neutral-900 truncate block">
-                    {typeof window !== 'undefined' ? `${window.location.origin}/control-panel` : '/control-panel'}
-                  </span>
-                </div>
+            {/* PIN / SENHA DE ACESSO AO PAINEL */}
+            <div className="bg-neutral-50 p-5 rounded-2xl border border-neutral-200 space-y-2">
+              <label className="font-bold text-xs text-neutral-800 block">
+                PIN / Senha de Acesso ao Painel
+              </label>
+              <div className="max-w-xs relative">
+                <input
+                  type={showPin ? 'text' : 'password'}
+                  value={settingsForm.adminPin}
+                  onChange={(e) => setSettingsForm({ ...settingsForm, adminPin: e.target.value })}
+                  className="w-full px-3 py-2 bg-white border border-neutral-300 rounded-xl text-sm font-mono font-bold pr-10 focus:border-amber-400 outline-none"
+                  required
+                />
                 <button
                   type="button"
-                  onClick={handleCopyControlPanelUrl}
-                  className="px-3.5 py-2 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl font-bold flex items-center gap-1.5 shrink-0 transition-colors shadow-xs"
+                  onClick={() => setShowPin(!showPin)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-600"
                 >
-                  {copiedControlPanelUrl ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
-                  <span>{copiedControlPanelUrl ? 'Copiado!' : 'Copiar Endereço'}</span>
+                  {showPin ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
-              </div>
-
-              <div className="max-w-xs pt-1">
-                <label className="font-bold text-xs text-neutral-800 block mb-1">PIN / Senha de Acesso</label>
-                <div className="relative">
-                  <input
-                    type={showPin ? 'text' : 'password'}
-                    value={settingsForm.adminPin}
-                    onChange={(e) => setSettingsForm({ ...settingsForm, adminPin: e.target.value })}
-                    className="w-full px-3 py-2 bg-white border border-neutral-300 rounded-xl text-sm font-mono font-bold pr-10"
-                    required
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPin(!showPin)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-600"
-                  >
-                    {showPin ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
-                </div>
-                <p className="text-[10px] text-neutral-500 mt-1">
-                  Protege o acesso a este painel no computador do seu depósito.
-                </p>
               </div>
             </div>
 
@@ -2288,6 +2299,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         isOpen={isQRCodeModalOpen}
         onClose={() => setIsQRCodeModalOpen(false)}
       />
+
+      {/* End Modals */}
     </div>
   );
 };
