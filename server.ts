@@ -453,20 +453,6 @@ async function startServer() {
   // ---------------------------------------------------------------------------
   // AUTH: VERIFY ADMIN PIN
   // ---------------------------------------------------------------------------
-// TEMPORARIO (diagnostico do PIN) - remover depois. Nao revela o PIN, so o formato.
-app.get('/api/_diag-pin', (_req, res) => {
-  const raw = process.env.ADMIN_PIN;
-  const s = raw === undefined ? '' : String(raw);
-  res.json({
-    definido: raw !== undefined,
-    tamanho: s.length,
-    tamanhoSemEspacos: s.trim().length,
-    soDigitos: /^\d+$/.test(s.trim()),
-    temAspas: /["']/.test(s),
-    temEspacoOuQuebra: /\s/.test(s),
-  });
-});
-
   app.post('/api/admin/verify-pin', (req, res) => {
     const { pin } = req.body || {};
     const configuredPin = process.env.ADMIN_PIN;
