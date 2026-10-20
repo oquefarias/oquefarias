@@ -53,6 +53,13 @@ export interface CustomerInfo {
   neighborhood: string;
   complement?: string;
   reference?: string;
+  cep?: string;
+  city?: string;
+  state?: string;
+  latitude?: number;
+  longitude?: number;
+  distanceKm?: number;
+  isWithinDeliveryRadius?: boolean;
 }
 
 export interface CustomerProfile extends CustomerInfo {

@@ -26,8 +26,16 @@ import {
   User,
   AlertTriangle,
   Compass,
+  Building2,
+  Loader2,
 } from 'lucide-react';
-import { calculateDistanceKm, geocodeAddress, resolveAddressOrCep } from '../../utils/geo';
+import {
+  calculateDistanceKm,
+  geocodeAddress,
+  resolveAddressOrCep,
+  fetchAddressByCep,
+  fetchCoordinatesByCepBrasilApi,
+} from '../../utils/geo';
 
 interface CustomerStorefrontProps {
   products: Product[];
@@ -55,6 +63,9 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [deliveryType, setDeliveryType] = useState<'delivery' | 'retirada'>('delivery');
   const [customerName, setCustomerName] = useState<string>(currentCustomer?.name || '');
   const [customerPhone, setCustomerPhone] = useState<string>(currentCustomer?.phone || '');
+  const [cep, setCep] = useState<string>(currentCustomer?.cep || '');
+  const [isSearchingCep, setIsSearchingCep] = useState<boolean>(false);
+  const [cepNotice, setCepNotice] = useState<string>('');
   const [address, setAddress] = useState<string>(currentCustomer?.address || '');
   const [addressNumber, setAddressNumber] = useState<string>(currentCustomer?.number || '');
   const [neighborhood, setNeighborhood] = useState<string>(currentCustomer?.neighborhood || (deliveryAreas[0]?.name || ''));
@@ -74,13 +85,73 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     if (currentCustomer) {
       setCustomerName(currentCustomer.name);
       setCustomerPhone(currentCustomer.phone);
+      if (currentCustomer.cep) setCep(currentCustomer.cep);
       setAddress(currentCustomer.address);
       setAddressNumber(currentCustomer.number);
       if (currentCustomer.neighborhood) setNeighborhood(currentCustomer.neighborhood);
       if (currentCustomer.complement) setComplement(currentCustomer.complement);
       if (currentCustomer.reference) setReference(currentCustomer.reference);
+      if (currentCustomer.distanceKm !== undefined && currentCustomer.isWithinDeliveryRadius !== undefined) {
+        setCustomerDistance({
+          km: currentCustomer.distanceKm,
+          inside: currentCustomer.isWithinDeliveryRadius,
+        });
+      }
     }
   }, [currentCustomer]);
+
+  // Handle CEP search in checkout
+  const handleSearchCheckoutCep = async (cleanCepArg?: string) => {
+    const rawDigits = (cleanCepArg || cep).replace(/\D/g, '');
+    if (rawDigits.length !== 8) {
+      setCepNotice('Digite um CEP válido com 8 dígitos.');
+      return;
+    }
+    setIsSearchingCep(true);
+    setCepNotice('');
+    try {
+      const viaCep = await fetchAddressByCep(rawDigits);
+      const brasilApi = await fetchCoordinatesByCepBrasilApi(rawDigits);
+
+      if (!viaCep && !brasilApi) {
+        setCepNotice('CEP não encontrado. Digite a rua manualmente.');
+        return;
+      }
+
+      const street = viaCep?.logradouro || brasilApi?.street || '';
+      const nh = viaCep?.bairro || brasilApi?.neighborhood || '';
+      if (street) setAddress(street);
+      if (nh) setNeighborhood(nh);
+
+      let lat = brasilApi?.lat;
+      let lng = brasilApi?.lng;
+      if ((lat === undefined || lng === undefined) && street) {
+        const geo = await geocodeAddress(`${street} ${nh} ${viaCep?.localidade || ''} Brasil`);
+        if (geo) {
+          lat = geo.lat;
+          lng = geo.lng;
+        }
+      }
+
+      if (lat !== undefined && lng !== undefined && settings.storeLatitude && settings.storeLongitude) {
+        const d = calculateDistanceKm(settings.storeLatitude, settings.storeLongitude, lat, lng);
+        const maxRadius = settings.deliveryRadiusKm || 5;
+        const inside = d <= maxRadius;
+        setCustomerDistance({ km: d, inside });
+        setCepNotice(
+          inside
+            ? `✓ CEP localizado! Distância: ${d} km (Dentro do raio de entrega de ${maxRadius} km).`
+            : `⚠️ CEP a ${d} km do depósito (Fora do raio de entrega de ${maxRadius} km).`
+        );
+      } else {
+        setCepNotice('Rua e bairro preenchidos pelo CEP!');
+      }
+    } catch {
+      setCepNotice('Erro ao buscar o CEP.');
+    } finally {
+      setIsSearchingCep(false);
+    }
+  };
 
   // Active delivery areas
   const activeAreas = useMemo(() => deliveryAreas.filter(a => a.active), [deliveryAreas]);
@@ -239,11 +310,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         customer: {
           name: customerName,
           phone: customerPhone,
+          cep: deliveryType === 'delivery' ? cep : undefined,
           address: deliveryType === 'delivery' ? address : 'Retirada no Depósito',
           number: deliveryType === 'delivery' ? addressNumber : 'S/N',
           neighborhood: deliveryType === 'delivery' ? neighborhood : 'Depósito',
           complement,
           reference,
+          distanceKm: customerDistance?.km,
+          isWithinDeliveryRadius: customerDistance?.inside,
         },
         deliveryType,
         items: cart.map((i) => ({
@@ -267,11 +341,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       const updatedProfile = await api.saveCustomerProfile({
         name: customerName,
         phone: customerPhone,
+        cep: deliveryType === 'delivery' ? cep : (currentCustomer?.cep || ''),
         address: deliveryType === 'delivery' ? address : (currentCustomer?.address || ''),
         number: deliveryType === 'delivery' ? addressNumber : (currentCustomer?.number || ''),
         neighborhood: deliveryType === 'delivery' ? neighborhood : (currentCustomer?.neighborhood || ''),
         complement,
         reference,
+        distanceKm: customerDistance?.km,
+        isWithinDeliveryRadius: customerDistance?.inside,
       });
       setCurrentCustomer(updatedProfile);
 
@@ -921,8 +998,60 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
                 {deliveryType === 'delivery' && (
                   <div className="space-y-3 pt-1">
+                    {/* CEP Search Card */}
+                    <div className="p-3.5 bg-amber-50/80 border border-amber-300 rounded-2xl space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-bold text-amber-950 flex items-center gap-1.5">
+                          <Building2 className="w-3.5 h-3.5 text-amber-600" />
+                          <span>Preencher Endereço por CEP</span>
+                        </label>
+                        <span className="text-[10px] text-amber-800 font-bold bg-amber-200/60 px-2 py-0.5 rounded">
+                          Raio Máx: {settings.deliveryRadiusKm || 5} km
+                        </span>
+                      </div>
+
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          maxLength={9}
+                          placeholder="Digite seu CEP (ex: 01310-100)"
+                          value={cep}
+                          onChange={(e) => {
+                            let val = e.target.value.replace(/\D/g, '');
+                            if (val.length > 8) val = val.slice(0, 8);
+                            let f = val;
+                            if (val.length > 5) f = `${val.slice(0, 5)}-${val.slice(5)}`;
+                            setCep(f);
+                            if (val.length === 8) handleSearchCheckoutCep(val);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              handleSearchCheckoutCep();
+                            }
+                          }}
+                          className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl font-mono font-bold text-xs outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleSearchCheckoutCep()}
+                          disabled={isSearchingCep}
+                          className="px-3.5 py-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black rounded-xl text-xs flex items-center gap-1 shrink-0 cursor-pointer"
+                        >
+                          {isSearchingCep ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                          <span>Buscar</span>
+                        </button>
+                      </div>
+
+                      {cepNotice && (
+                        <p className="text-[11px] font-bold text-amber-950 bg-amber-100/90 p-2 rounded-xl">
+                          {cepNotice}
+                        </p>
+                      )}
+                    </div>
+
                     {/* Delivery Radius / Coverage Info Banner */}
-                    {settings.deliveryRadiusKm && (
+                    {settings.deliveryRadiusKm && !cepNotice && (
                       <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex flex-wrap items-center justify-between gap-2 text-xs text-amber-950">
                         <div className="flex items-center gap-2">
                           <Compass className="w-4 h-4 text-amber-600 shrink-0" />
@@ -1185,6 +1314,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         isOpen={isAuthModalOpen}
         deliveryAreas={deliveryAreas}
         currentCustomer={currentCustomer}
+        settings={settings}
         onSuccess={(cust) => {
           setCurrentCustomer(cust);
           setIsAuthModalOpen(false);

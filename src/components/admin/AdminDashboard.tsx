@@ -5,6 +5,8 @@ import { soundService } from '../../utils/sound';
 import { PrintReceiptModal } from '../PrintReceiptModal';
 import { QRCodeModal } from '../QRCodeModal';
 import { GoogleDeliveryRadiusMap } from './GoogleDeliveryRadiusMap';
+import { CustomerModal } from './CustomerModal';
+import { calculateDistanceKm } from '../../utils/geo';
 import {
   Bell,
   Package,
@@ -34,6 +36,7 @@ import {
   Image as ImageIcon,
   Copy,
   Compass,
+  AlertTriangle,
 } from 'lucide-react';
 
 // Compress image uploaded from computer so it stays lightweight and fast
@@ -121,6 +124,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     estimatedTime: '30 a 45 min',
     active: true,
   });
+
+  // Customers state
+  const [isCustomerModalOpen, setIsCustomerModalOpen] = useState<boolean>(false);
+  const [editingCustomer, setEditingCustomer] = useState<CustomerProfile | null>(null);
+  const [customerSearch, setCustomerSearch] = useState<string>('');
 
   // PDV Counter State
   const [posSearch, setPosSearch] = useState<string>('');
@@ -989,20 +997,62 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {/* ========================================================= */}
       {activeTab === 'clientes' && (
         <div className="space-y-6">
-          <div className="bg-white p-5 rounded-3xl border border-neutral-200 flex items-center justify-between">
+          <div className="bg-white p-5 rounded-3xl border border-neutral-200 flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
               <h3 className="font-black text-lg text-neutral-900 flex items-center gap-2">
                 <Users className="w-5 h-5 text-amber-500" />
                 <span>Base de Clientes Cadastrados</span>
               </h3>
               <p className="text-xs text-neutral-500 mt-1">
-                Clientes que já realizaram cadastro ou pedidos no seu site com endereços e telefones salvos.
+                Cadastre clientes diretamente pelo <strong>CEP</strong> para preencher o endereço automático e verificar se o cliente está dentro do raio de entrega de <strong>{settings.deliveryRadiusKm || 5} km</strong>.
               </p>
             </div>
-            <div className="text-right">
-              <span className="text-xs text-neutral-400 block font-medium">Total de Clientes</span>
-              <span className="text-xl font-black text-neutral-900">{customers.length}</span>
+
+            <div className="flex items-center gap-3">
+              <div className="text-right hidden sm:block">
+                <span className="text-[11px] text-neutral-400 block font-medium">Total de Clientes</span>
+                <span className="text-xl font-black text-neutral-900">{customers.length}</span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setEditingCustomer(null);
+                  setIsCustomerModalOpen(true);
+                }}
+                className="px-5 py-3 bg-amber-500 hover:bg-amber-600 text-neutral-950 rounded-2xl font-black text-xs shadow-sm transition-all flex items-center gap-2 shrink-0 cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Cadastrar Cliente por CEP</span>
+              </button>
             </div>
+          </div>
+
+          {/* Search bar */}
+          <div className="flex items-center justify-between gap-3">
+            <div className="relative w-full sm:max-w-md">
+              <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-neutral-400" />
+              <input
+                type="text"
+                placeholder="Buscar cliente por nome, telefone, bairro ou CEP..."
+                value={customerSearch}
+                onChange={(e) => setCustomerSearch(e.target.value)}
+                className="w-full pl-9 pr-4 py-2.5 bg-white border border-neutral-200 rounded-2xl text-xs font-medium focus:outline-none focus:ring-2 focus:ring-amber-500 shadow-2xs"
+              />
+              {customerSearch && (
+                <button
+                  type="button"
+                  onClick={() => setCustomerSearch('')}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-600 text-xs font-bold"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            <span className="text-xs text-neutral-500 font-medium hidden sm:inline">
+              Raio de entrega da loja: <strong>{settings.deliveryRadiusKm || 5} km</strong>
+            </span>
           </div>
 
           <div className="bg-white rounded-3xl border border-neutral-200 overflow-hidden shadow-xs">
@@ -1013,59 +1063,186 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <th className="py-3 px-4">Nome do Cliente</th>
                     <th className="py-3 px-4">WhatsApp / Telefone</th>
                     <th className="py-3 px-4">Endereço Principal</th>
-                    <th className="py-3 px-4">Bairro</th>
+                    <th className="py-3 px-4">CEP & Bairro</th>
+                    <th className="py-3 px-4 text-center">Raio de Entrega</th>
                     <th className="py-3 px-4 text-center">Pedidos</th>
                     <th className="py-3 px-4 text-right">Total Gasto</th>
-                    <th className="py-3 px-4 text-right">Contato</th>
+                    <th className="py-3 px-4 text-right">Ações</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-neutral-100">
-                  {customers.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="py-12 text-center text-neutral-400">
-                        <Users className="w-10 h-10 mx-auto mb-2 text-neutral-300" />
-                        <p className="font-bold text-neutral-700 text-sm">Nenhum cliente cadastrado ainda</p>
-                        <p className="text-xs text-neutral-400 mt-1">Conforme os clientes fizerem pedidos ou se cadastrarem na loja, os dados aparecerão aqui automaticamente.</p>
-                      </td>
-                    </tr>
-                  ) : (
-                    customers.map(c => (
-                      <tr key={c.id} className="hover:bg-neutral-50 transition-colors">
-                        <td className="py-3 px-4 font-bold text-neutral-900 text-sm">
-                          {c.name}
-                        </td>
-                        <td className="py-3 px-4 font-mono font-medium text-neutral-600">
-                          {c.phone}
-                        </td>
-                        <td className="py-3 px-4">
-                          <span>{c.address}, {c.number}</span>
-                          {c.reference && <span className="block text-[11px] text-neutral-400 italic">Ref: {c.reference}</span>}
-                        </td>
-                        <td className="py-3 px-4 font-semibold text-neutral-800">
-                          {c.neighborhood}
-                        </td>
-                        <td className="py-3 px-4 text-center font-black">
-                          {c.totalOrdersCount || 1}
-                        </td>
-                        <td className="py-3 px-4 text-right font-mono font-bold text-emerald-700">
-                          {formatCurrency(c.totalSpent || 0)}
-                        </td>
-                        <td className="py-3 px-4 text-right">
-                          <a
-                            href={`https://wa.me/${c.phone.replace(/\D/g, '')}?text=${encodeURIComponent(
-                              `Olá ${c.name}! Tudo bem? Falamos do ${settings.storeName}.`
-                            )}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex items-center gap-1 px-3 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-lg text-xs font-bold"
-                          >
-                            <MessageCircle className="w-3.5 h-3.5" />
-                            <span>WhatsApp</span>
-                          </a>
-                        </td>
-                      </tr>
-                    ))
-                  )}
+                  {(() => {
+                    const filtered = customers.filter((c) => {
+                      if (!customerSearch.trim()) return true;
+                      const q = customerSearch.toLowerCase();
+                      return (
+                        c.name.toLowerCase().includes(q) ||
+                        c.phone.includes(q) ||
+                        (c.address && c.address.toLowerCase().includes(q)) ||
+                        (c.neighborhood && c.neighborhood.toLowerCase().includes(q)) ||
+                        (c.cep && c.cep.includes(q)) ||
+                        (c.city && c.city.toLowerCase().includes(q))
+                      );
+                    });
+
+                    if (filtered.length === 0) {
+                      return (
+                        <tr>
+                          <td colSpan={8} className="py-12 text-center text-neutral-400">
+                            <Users className="w-10 h-10 mx-auto mb-2 text-neutral-300" />
+                            <p className="font-bold text-neutral-700 text-sm">
+                              {customerSearch ? 'Nenhum cliente encontrado na busca' : 'Nenhum cliente cadastrado ainda'}
+                            </p>
+                            <p className="text-xs text-neutral-400 mt-1 max-w-md mx-auto">
+                              Clique no botão <strong>"Cadastrar Cliente por CEP"</strong> acima para cadastrar seu primeiro cliente ou aguarde os pedidos automáticos pelo site.
+                            </p>
+                          </td>
+                        </tr>
+                      );
+                    }
+
+                    return filtered.map((c) => {
+                      // Calculate or retrieve delivery radius status
+                      let dist = c.distanceKm;
+                      let inside = c.isWithinDeliveryRadius;
+
+                      if (dist === undefined && c.latitude && c.longitude && settings.storeLatitude && settings.storeLongitude) {
+                        dist = calculateDistanceKm(
+                          settings.storeLatitude,
+                          settings.storeLongitude,
+                          c.latitude,
+                          c.longitude
+                        );
+                        inside = dist <= (settings.deliveryRadiusKm || 5);
+                      }
+
+                      return (
+                        <tr key={c.id} className="hover:bg-neutral-50/80 transition-colors">
+                          <td className="py-3.5 px-4 font-bold text-neutral-900 text-sm">
+                            <div className="flex items-center gap-2">
+                              <div className="w-8 h-8 rounded-full bg-amber-100 text-amber-800 font-black flex items-center justify-center text-xs shrink-0">
+                                {c.name.charAt(0).toUpperCase()}
+                              </div>
+                              <div>
+                                <span className="block font-bold">{c.name}</span>
+                                {c.city && (
+                                  <span className="text-[10px] text-neutral-400 font-normal">
+                                    {c.city}{c.state ? ` - ${c.state}` : ''}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+
+                          <td className="py-3.5 px-4 font-mono font-medium text-neutral-700">
+                            {c.phone}
+                          </td>
+
+                          <td className="py-3.5 px-4">
+                            <span className="font-medium text-neutral-800">{c.address}, {c.number}</span>
+                            {c.complement && (
+                              <span className="block text-[11px] text-neutral-500">{c.complement}</span>
+                            )}
+                            {c.reference && (
+                              <span className="block text-[10px] text-neutral-400 italic">Ref: {c.reference}</span>
+                            )}
+                          </td>
+
+                          <td className="py-3.5 px-4">
+                            <div className="space-y-0.5">
+                              {c.cep && (
+                                <span className="inline-block px-1.5 py-0.5 bg-neutral-100 border border-neutral-200 rounded font-mono text-[10px] font-bold text-neutral-700">
+                                  CEP {c.cep}
+                                </span>
+                              )}
+                              <span className="block font-semibold text-neutral-800">{c.neighborhood}</span>
+                            </div>
+                          </td>
+
+                          {/* RAIO DE ENTREGA */}
+                          <td className="py-3.5 px-4 text-center">
+                            {dist !== undefined ? (
+                              <span
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-black border ${
+                                  inside
+                                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                                    : 'bg-red-50 text-red-800 border-red-300'
+                                }`}
+                              >
+                                {inside ? (
+                                  <>
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                                    <span>No raio ({dist} km)</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <AlertTriangle className="w-3.5 h-3.5 text-red-600" />
+                                    <span>Fora ({dist} km)</span>
+                                  </>
+                                )}
+                              </span>
+                            ) : (
+                              <span className="text-[11px] text-neutral-400 italic">
+                                CEP sem GPS
+                              </span>
+                            )}
+                          </td>
+
+                          <td className="py-3.5 px-4 text-center font-black">
+                            {c.totalOrdersCount || 0}
+                          </td>
+
+                          <td className="py-3.5 px-4 text-right font-mono font-bold text-emerald-700">
+                            {formatCurrency(c.totalSpent || 0)}
+                          </td>
+
+                          <td className="py-3.5 px-4 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              {/* Edit Button */}
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEditingCustomer(c);
+                                  setIsCustomerModalOpen(true);
+                                }}
+                                title="Editar Cliente / Conferir CEP"
+                                className="p-1.5 text-neutral-600 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-colors cursor-pointer"
+                              >
+                                <Edit2 className="w-4 h-4" />
+                              </button>
+
+                              {/* WhatsApp Contact */}
+                              <a
+                                href={`https://wa.me/${c.phone.replace(/\D/g, '')}?text=${encodeURIComponent(
+                                  `Olá ${c.name}! Tudo bem? Falamos do ${settings.storeName}.`
+                                )}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                title="Conversar no WhatsApp"
+                                className="p-1.5 text-emerald-700 hover:bg-emerald-50 rounded-lg transition-colors inline-flex items-center justify-center"
+                              >
+                                <MessageCircle className="w-4 h-4" />
+                              </a>
+
+                              {/* Delete Button */}
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  if (confirm(`Deseja realmente excluir o cadastro de ${c.name}?`)) {
+                                    await api.deleteCustomer(c.id);
+                                  }
+                                }}
+                                title="Excluir Cliente"
+                                className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    });
+                  })()}
                 </tbody>
               </table>
             </div>
@@ -2298,6 +2475,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         settings={settings}
         isOpen={isQRCodeModalOpen}
         onClose={() => setIsQRCodeModalOpen(false)}
+      />
+
+      <CustomerModal
+        isOpen={isCustomerModalOpen}
+        customer={editingCustomer}
+        settings={settings}
+        deliveryAreas={deliveryAreas}
+        onSave={async (custData) => {
+          await api.saveCustomerProfile(custData);
+          setIsCustomerModalOpen(false);
+          setEditingCustomer(null);
+        }}
+        onClose={() => {
+          setIsCustomerModalOpen(false);
+          setEditingCustomer(null);
+        }}
       />
 
       {/* End Modals */}

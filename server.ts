@@ -273,6 +273,14 @@ async function startServer() {
     res.json(found);
   });
 
+  app.delete('/api/customers/:id', (req, res) => {
+    const id = req.params.id;
+    db.customers = db.customers.filter(c => c.id !== id);
+    saveDatabase(db);
+    broadcastSSE('STATE_UPDATED', db);
+    res.json({ success: true });
+  });
+
   // Orders API
   app.get('/api/orders', (_req, res) => {
     res.json(db.orders);

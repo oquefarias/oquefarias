@@ -415,6 +415,19 @@ class ApiService {
     return customers.find(c => c.phone.replace(/\D/g, '') === clean) || null;
   }
 
+  public async deleteCustomer(id: string): Promise<void> {
+    let customers = this.getCustomers();
+    customers = customers.filter(c => c.id !== id);
+    localStorage.setItem(STORAGE_KEY_CUSTOMERS, JSON.stringify(customers));
+    this.notifyListeners();
+
+    try {
+      await fetch(`/api/customers/${id}`, { method: 'DELETE' });
+    } catch {
+      // Ignored
+    }
+  }
+
   // ================= ORDERS =================
   public getOrders(): Order[] {
     try {
