@@ -5,12 +5,18 @@ import { soundService } from '../utils/sound';
 const STORAGE_KEY_ADMIN_TOKEN = 'deposito_admin_token_v5';
 const STORAGE_KEY_CURRENT_CUSTOMER = 'deposito_current_customer_v4';
 
+export interface VerifyPinResult {
+  success: boolean;
+  status: number;
+  error?: string;
+}
+
 class ApiService {
   private listeners: Array<() => void> = [];
-  private eventSource: EventSource | null = null;
   private version: number = 0;
+  private pollingInterval: any = null;
 
-  // In-memory state synchronized strictly with the server API
+  // In-memory state synchronized directly with the server API
   private state: {
     products: Product[];
     orders: Order[];
@@ -27,11 +33,10 @@ class ApiService {
 
   constructor() {
     this.cleanLegacyLocalStorage();
-    this.setupServerEvents();
   }
 
   /**
-   * Purge any legacy localStorage data so it is never used as a source of truth.
+   * Purge legacy localStorage data so it is never used as source of truth.
    * Only admin token and cart are kept in localStorage.
    */
   private cleanLegacyLocalStorage() {
@@ -81,9 +86,6 @@ class ApiService {
     return headers;
   }
 
-  /**
-   * Displays an unmistakable user-facing alert when database operations fail.
-   */
   private notifyError(message: string) {
     console.error(`[Depósito API Error] ${message}`);
     if (typeof window !== 'undefined') {
@@ -98,7 +100,7 @@ class ApiService {
     }
   }
 
-  // ================= REACTIVITY & SSE =================
+  // ================= REACTIVITY =================
   public subscribe(listener: () => void): () => void {
     this.listeners.push(listener);
     return () => {
@@ -121,55 +123,63 @@ class ApiService {
     return this.version;
   }
 
-  private setupServerEvents() {
-    if (typeof window === 'undefined') return;
+  // ================= ORDER POLLING (EVERY 10 SECONDS - REPLACES SSE) =================
+  private startOrderPolling() {
+    this.stopOrderPolling();
+    if (!this.isAdminAuthenticated()) return;
 
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
+    // Poll immediately, then every 10 seconds
+    this.pollOrders();
+    this.pollingInterval = setInterval(() => {
+      this.pollOrders();
+    }, 10000);
+  }
+
+  private stopOrderPolling() {
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
+    }
+  }
+
+  private async pollOrders(): Promise<void> {
+    const token = this.getAdminToken();
+    if (!token) {
+      this.stopOrderPolling();
+      return;
     }
 
-    const token = this.getAdminToken();
-    if (!token) return; // SSE is restricted to authenticated admin
-
     try {
-      this.eventSource = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
+      const res = await fetch('/api/admin/orders', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
 
-      this.eventSource.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'NEW_ORDER') {
+      if (res.status === 401) {
+        this.logoutAdmin();
+        return;
+      }
+
+      if (res.ok) {
+        const fetchedOrders: Order[] = await res.json();
+        if (Array.isArray(fetchedOrders)) {
+          // Detect any new incoming pending order
+          const existingIds = new Set(this.state.orders.map((o) => o.id));
+          const hasNewPendingOrder = fetchedOrders.some(
+            (fo) => !existingIds.has(fo.id) && fo.status === 'pendente'
+          );
+
+          if (hasNewPendingOrder) {
             soundService.playNewOrderSound();
-            if (data.payload) {
-              const existingIdx = this.state.orders.findIndex((o) => o.id === data.payload.id);
-              if (existingIdx === -1) {
-                this.state.orders.unshift(data.payload);
-              }
-            }
           }
 
-          if (data.type === 'ORDER_STATUS_CHANGED' && data.payload) {
-            const idx = this.state.orders.findIndex((o) => o.id === data.payload.id);
-            if (idx >= 0) {
-              this.state.orders[idx] = data.payload;
-            }
-          }
-
-          if (data.type === 'STATE_UPDATED') {
-            this.syncWithBackend();
-          }
-
+          this.state.orders = fetchedOrders;
           this.notifyListeners();
-        } catch (err) {
-          console.warn('Erro ao processar evento SSE:', err);
         }
-      };
-
-      this.eventSource.onerror = () => {
-        // EventSource will auto-reconnect or close if unauthenticated
-      };
+      }
     } catch {
-      // Ignored
+      // Background poll silently continues
     }
   }
 
@@ -194,13 +204,12 @@ class ApiService {
             deliveryAreas: Array.isArray(data.deliveryAreas) ? data.deliveryAreas : [],
             customers: Array.isArray(data.customers) ? data.customers : [],
           };
-          this.setupServerEvents();
+          this.startOrderPolling();
           this.notifyListeners();
           return;
         }
 
         if (res.status === 401) {
-          // Token expired or invalid
           console.warn('[Admin] Sessão expirada ou inválida. Retornando ao estado público.');
           this.logoutAdmin();
           return;
@@ -212,6 +221,7 @@ class ApiService {
 
     // Public state for store customer
     try {
+      this.stopOrderPolling();
       const res = await fetch('/api/state');
       if (res.ok) {
         const data = await res.json();
@@ -230,7 +240,7 @@ class ApiService {
   }
 
   // ================= ADMIN SECURITY / PIN =================
-  public async verifyAdminPin(pin: string): Promise<boolean> {
+  public async verifyAdminPin(pin: string): Promise<VerifyPinResult> {
     try {
       const res = await fetch('/api/admin/verify-pin', {
         method: 'POST',
@@ -238,20 +248,34 @@ class ApiService {
         body: JSON.stringify({ pin }),
       });
 
+      if (res.status === 429) {
+        let msg = 'Muitas tentativas, aguarde 15 minutos.';
+        try {
+          const json = await res.json();
+          if (json?.error) msg = json.error;
+        } catch {}
+        return { success: false, status: 429, error: msg };
+      }
+
+      if (res.status >= 500) {
+        return { success: false, status: res.status, error: 'Servidor indisponível' };
+      }
+
       if (!res.ok) {
-        return false;
+        return { success: false, status: res.status, error: 'Senha de acesso incorreta. Tente novamente.' };
       }
 
       const data = await res.json();
       if (data && data.token) {
         localStorage.setItem(STORAGE_KEY_ADMIN_TOKEN, data.token);
         await this.syncWithBackend();
-        return true;
+        return { success: true, status: 200 };
       }
-      return false;
+
+      return { success: false, status: 500, error: 'Servidor indisponível' };
     } catch (err) {
-      console.error('Erro ao verificar PIN do admin:', err);
-      return false;
+      console.error('Erro de conexão ao verificar PIN do admin:', err);
+      return { success: false, status: 0, error: 'Servidor indisponível' };
     }
   }
 
@@ -259,10 +283,7 @@ class ApiService {
     if (typeof window !== 'undefined') {
       localStorage.removeItem(STORAGE_KEY_ADMIN_TOKEN);
     }
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-    }
+    this.stopOrderPolling();
     this.state.orders = [];
     this.state.customers = [];
     this.syncWithBackend();

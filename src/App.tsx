@@ -86,14 +86,20 @@ export default function App() {
     setIsVerifying(true);
     setPinError('');
 
-    const isOk = await api.verifyAdminPin(pinInput);
+    const res = await api.verifyAdminPin(pinInput);
     setIsVerifying(false);
 
-    if (isOk) {
+    if (res.success) {
       setPinInput('');
       setIsAdminAuth(true);
     } else {
-      setPinError('Senha de acesso incorreta. Tente novamente.');
+      if (res.status === 429) {
+        setPinError(res.error || 'Muitas tentativas, aguarde 15 minutos.');
+      } else if (res.status === 0 || res.status >= 500) {
+        setPinError('Servidor indisponível');
+      } else {
+        setPinError('Senha de acesso incorreta. Tente novamente.');
+      }
     }
   };
 

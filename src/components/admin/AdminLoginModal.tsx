@@ -25,14 +25,20 @@ export const AdminLoginModal: React.FC<AdminLoginModalProps> = ({ isOpen, onSucc
     setIsLoading(true);
     setError('');
 
-    const isOk = await api.verifyAdminPin(pin);
+    const res = await api.verifyAdminPin(pin);
     setIsLoading(false);
 
-    if (isOk) {
+    if (res.success) {
       setPin('');
       onSuccess();
     } else {
-      setError('Senha de acesso incorreta. Verifique e tente novamente.');
+      if (res.status === 429) {
+        setError(res.error || 'Muitas tentativas, aguarde 15 minutos.');
+      } else if (res.status === 0 || res.status >= 500) {
+        setError('Servidor indisponível');
+      } else {
+        setError('Senha de acesso incorreta. Tente novamente.');
+      }
     }
   };
 
