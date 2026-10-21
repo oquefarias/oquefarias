@@ -29,6 +29,19 @@ export interface CouponValidationResult {
   maxDiscount?: number;
 }
 
+export interface CustomerDeliveryQuoteResult {
+  distanceKm: number | null;
+  isWithinDeliveryRadius: boolean;
+  deliveryRadiusKm: number;
+  deliveryFee: number;
+  rawDeliveryFee: number;
+  freeDeliveryThreshold: number;
+  latitude: number | null;
+  longitude: number | null;
+}
+
+const STORAGE_PREFIX_PIN_CONFIRMED = 'deposito_pin_confirmed_v1_';
+
 class ApiService {
   private listeners: Array<() => void> = [];
   private version: number = 0;
@@ -171,10 +184,31 @@ class ApiService {
     }
     if (json.customer) {
       this.setCurrentCustomer(json.customer);
+      if (json.customer.id && json.customer.latitude !== undefined && json.customer.longitude !== undefined) {
+        this.markCustomerPinConfirmed(json.customer.id);
+      }
     }
 
     this.notifyListeners();
     return json.customer;
+  }
+
+  public isCustomerPinConfirmed(customerId?: string | null): boolean {
+    if (typeof window === 'undefined' || !customerId) return false;
+    try {
+      return localStorage.getItem(`${STORAGE_PREFIX_PIN_CONFIRMED}${customerId}`) === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  public markCustomerPinConfirmed(customerId?: string | null): void {
+    if (typeof window === 'undefined' || !customerId) return;
+    try {
+      localStorage.setItem(`${STORAGE_PREFIX_PIN_CONFIRMED}${customerId}`, '1');
+    } catch {
+      // ignore
+    }
   }
 
   public async loginCustomer(email: string, password: string): Promise<CustomerAuthResult> {
@@ -308,6 +342,33 @@ class ApiService {
     return await res.json();
   }
 
+  public async getCustomerDeliveryQuote(
+    subtotal?: number,
+    neighborhood?: string
+  ): Promise<CustomerDeliveryQuoteResult | null> {
+    const token = this.getCustomerToken();
+    if (!token) return null;
+
+    try {
+      const params = new URLSearchParams();
+      if (subtotal !== undefined && !Number.isNaN(subtotal)) {
+        params.set('subtotal', String(subtotal));
+      }
+      if (neighborhood && neighborhood.trim()) {
+        params.set('neighborhood', neighborhood.trim());
+      }
+      const qs = params.toString();
+      const res = await fetch(`/api/customer/delivery-quote${qs ? `?${qs}` : ''}`, {
+        headers: this.getCustomerHeaders(),
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (err) {
+      console.warn('Erro ao consultar cotação de entrega:', err);
+      return null;
+    }
+  }
+
   // ================= NOTIFICATIONS & ERRORS =================
   private notifyError(message: string) {
     console.error(`[Depósito API Error] ${message}`);
@@ -374,7 +435,9 @@ class ApiService {
         fetch('/api/admin/orders', {
           headers: { Authorization: `Bearer ${token}` },
         }),
-        fetch('/api/products'),
+        fetch('/api/products', {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
       ]);
 
       if (ordersRes.status === 401) {
@@ -528,7 +591,8 @@ class ApiService {
 
   public async reloadProducts(): Promise<void> {
     try {
-      const res = await fetch('/api/products');
+      const token = this.getAdminToken();
+      const res = await fetch('/api/products', token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
       if (res.ok) {
         const prods = await res.json();
         if (Array.isArray(prods)) {
@@ -539,6 +603,55 @@ class ApiService {
     } catch (err) {
       console.warn('Erro ao recarregar produtos:', err);
     }
+  }
+
+  public async setProductPromotion(
+    productId: string,
+    promoPrice: number,
+    promoEndsAt?: string | null
+  ): Promise<Product> {
+    const res = await fetch(`/api/admin/products/${encodeURIComponent(productId)}/promotion`, {
+      method: 'PUT',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({
+        promoPrice,
+        promoEndsAt: promoEndsAt || null,
+      }),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível salvar a promoção do produto.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+
+    const updated: Product = await res.json();
+    await this.reloadProducts();
+    return updated;
+  }
+
+  public async clearProductPromotion(productId: string): Promise<Product> {
+    const res = await fetch(`/api/admin/products/${encodeURIComponent(productId)}/promotion`, {
+      method: 'DELETE',
+      headers: this.getAdminHeaders(),
+    });
+
+    if (!res.ok) {
+      let message = 'Não foi possível encerrar a promoção do produto.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const updated: Product = await res.json();
+    await this.reloadProducts();
+    return updated;
   }
 
   public async saveProduct(product: Product): Promise<void> {
@@ -825,11 +938,15 @@ class ApiService {
     return this.state.coupons;
   }
 
-  public async validateCoupon(code: string, subtotal: number): Promise<CouponValidationResult> {
+  public async validateCoupon(
+    code: string,
+    subtotal: number,
+    items?: Array<{ productId: string; quantity: number }>
+  ): Promise<CouponValidationResult> {
     const res = await fetch('/api/coupons/validate', {
       method: 'POST',
       headers: this.getCustomerHeaders(),
-      body: JSON.stringify({ code, subtotal }),
+      body: JSON.stringify({ code, subtotal, items }),
     });
 
     if (!res.ok) {

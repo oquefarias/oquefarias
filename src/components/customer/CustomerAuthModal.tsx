@@ -21,8 +21,9 @@ import {
   fetchAddressByCep,
   fetchCoordinatesByCepBrasilApi,
   calculateDistanceKm,
-  geocodeAddress,
+  resolveFullAddressOnServer,
 } from '../../utils/geo';
+import { AddressPinMap } from '../AddressPinMap';
 
 interface CustomerAuthModalProps {
   isOpen: boolean;
@@ -68,6 +69,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
   const [lat, setLat] = useState<number | undefined>(undefined);
   const [lng, setLng] = useState<number | undefined>(undefined);
+  const [geoPrecisao, setGeoPrecisao] = useState<string | null>(null);
   const [distanceKm, setDistanceKm] = useState<number | null>(null);
   const [isWithinRadius, setIsWithinRadius] = useState<boolean | null>(null);
 
@@ -95,6 +97,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setReference(currentCustomer.reference || '');
       setLat(currentCustomer.latitude);
       setLng(currentCustomer.longitude);
+      setGeoPrecisao(null);
       setDistanceKm(currentCustomer.distanceKm ?? null);
       setIsWithinRadius(currentCustomer.isWithinDeliveryRadius ?? null);
     } else {
@@ -114,6 +117,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setReference('');
       setLat(undefined);
       setLng(undefined);
+      setGeoPrecisao(null);
       setDistanceKm(null);
       setIsWithinRadius(null);
       setLoginError('');
@@ -161,6 +165,56 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     }
   };
 
+  const updateCoordinatesAndDistance = (newLat: number, newLng: number, precisaoVal?: string | null) => {
+    setLat(newLat);
+    setLng(newLng);
+    if (precisaoVal !== undefined) {
+      setGeoPrecisao(precisaoVal);
+    }
+    if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
+      const dist = calculateDistanceKm(
+        settings.storeLatitude,
+        settings.storeLongitude,
+        newLat,
+        newLng
+      );
+      setDistanceKm(dist);
+      const maxRadius = settings.deliveryRadiusKm || 5;
+      const inside = dist <= maxRadius;
+      setIsWithinRadius(inside);
+    }
+  };
+
+  const executeServerGeoResolve = async (params: {
+    rua: string;
+    numero: string;
+    bairro: string;
+    cidade: string;
+    uf: string;
+    cep: string;
+  }) => {
+    const resolved = await resolveFullAddressOnServer(params);
+    if (resolved) {
+      updateCoordinatesAndDistance(resolved.latitude, resolved.longitude, resolved.precisao);
+      if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
+        const dist = calculateDistanceKm(
+          settings.storeLatitude,
+          settings.storeLongitude,
+          resolved.latitude,
+          resolved.longitude
+        );
+        const maxRadius = settings.deliveryRadiusKm || 5;
+        const inside = dist <= maxRadius;
+        setCepStatusMessage({
+          type: resolved.precisao === 'aproximada' ? 'warn' : 'success',
+          text: inside
+            ? `Endereço localizado! Distância de ${dist} km (Dentro do raio de entrega de ${maxRadius} km).`
+            : `Atenção: Endereço a ${dist} km, além do raio de entrega de ${maxRadius} km.`,
+        });
+      }
+    }
+  };
+
   const executeCepSearch = async (cleanCepArg?: string) => {
     const rawDigits = (cleanCepArg || cep).replace(/\D/g, '');
     if (rawDigits.length !== 8) {
@@ -186,46 +240,38 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
         return;
       }
 
-      const logradouro = viaCep?.logradouro || brasilApi?.street || '';
-      const bairro = viaCep?.bairro || brasilApi?.neighborhood || '';
-      const localidade = viaCep?.localidade || brasilApi?.city || '';
-      const uf = viaCep?.uf || brasilApi?.state || '';
+      const logradouro = viaCep?.logradouro || brasilApi?.street || address;
+      const bairro = viaCep?.bairro || brasilApi?.neighborhood || neighborhood;
+      const localidade = viaCep?.localidade || brasilApi?.city || city;
+      const uf = viaCep?.uf || brasilApi?.state || state;
 
       if (logradouro) setAddress(logradouro);
       if (bairro) setNeighborhood(bairro);
       if (localidade) setCity(localidade);
       if (uf) setState(uf);
 
-      let foundLat = brasilApi?.lat;
-      let foundLng = brasilApi?.lng;
+      const resolved = await resolveFullAddressOnServer({
+        rua: logradouro,
+        numero: number.trim(),
+        bairro,
+        cidade: localidade,
+        uf,
+        cep: rawDigits,
+      });
 
-      if ((foundLat === undefined || foundLng === undefined) && (logradouro || bairro || localidade)) {
-        const query = `${logradouro} ${bairro} ${localidade} ${uf} Brasil`;
-        const geo = await geocodeAddress(query);
-        if (geo) {
-          foundLat = geo.lat;
-          foundLng = geo.lng;
-        }
-      }
-
-      if (foundLat !== undefined && foundLng !== undefined) {
-        setLat(foundLat);
-        setLng(foundLng);
-
-        if (settings?.storeLatitude && settings?.storeLongitude) {
+      if (resolved) {
+        updateCoordinatesAndDistance(resolved.latitude, resolved.longitude, resolved.precisao);
+        if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
           const dist = calculateDistanceKm(
             settings.storeLatitude,
             settings.storeLongitude,
-            foundLat,
-            foundLng
+            resolved.latitude,
+            resolved.longitude
           );
-          setDistanceKm(dist);
           const maxRadius = settings.deliveryRadiusKm || 5;
           const inside = dist <= maxRadius;
-          setIsWithinRadius(inside);
-
           setCepStatusMessage({
-            type: 'success',
+            type: resolved.precisao === 'aproximada' ? 'warn' : 'success',
             text: inside
               ? `Endereço localizado! Distância de ${dist} km (Dentro do raio de entrega de ${maxRadius} km).`
               : `Atenção: Endereço a ${dist} km, além do raio de entrega de ${maxRadius} km.`,
@@ -246,6 +292,26 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setCepStatusMessage({
         type: 'error',
         text: 'Erro ao consultar o CEP.',
+      });
+    } finally {
+      setIsSearchingCep(false);
+    }
+  };
+
+  const handleNumberBlur = async () => {
+    const cleanCepDigits = cep.replace(/\D/g, '');
+    if (!address.trim() && cleanCepDigits.length !== 8) return;
+    if (!number.trim()) return;
+
+    setIsSearchingCep(true);
+    try {
+      await executeServerGeoResolve({
+        rua: address.trim(),
+        numero: number.trim(),
+        bairro: neighborhood.trim(),
+        cidade: city.trim(),
+        uf: state.trim(),
+        cep: cleanCepDigits,
       });
     } finally {
       setIsSearchingCep(false);
@@ -278,6 +344,23 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
     setIsSubmittingRegister(true);
     try {
+      let finalLat = lat;
+      let finalLng = lng;
+      if (finalLat === undefined || finalLng === undefined) {
+        const resolved = await resolveFullAddressOnServer({
+          rua: address.trim(),
+          numero: number.trim(),
+          bairro: neighborhood.trim(),
+          cidade: city.trim(),
+          uf: state.trim(),
+          cep: cep.replace(/\D/g, ''),
+        });
+        if (resolved) {
+          finalLat = resolved.latitude;
+          finalLng = resolved.longitude;
+        }
+      }
+
       const saved = await api.registerCustomer({
         name: name.trim(),
         email: email.trim().toLowerCase(),
@@ -291,12 +374,13 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
         state: state.trim(),
         complement: complement.trim(),
         reference: reference.trim(),
-        latitude: lat,
-        longitude: lng,
-        distanceKm: distanceKm ?? undefined,
-        isWithinDeliveryRadius: isWithinRadius ?? undefined,
+        latitude: finalLat,
+        longitude: finalLng,
       });
 
+      if (saved?.id) {
+        api.markCustomerPinConfirmed(saved.id);
+      }
       onSuccess(saved);
     } catch (err: any) {
       setRegisterError(err.message || 'Erro ao realizar cadastro.');
@@ -321,6 +405,23 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
     setIsSubmittingRegister(true);
     try {
+      let finalLat = lat;
+      let finalLng = lng;
+      if (finalLat === undefined || finalLng === undefined) {
+        const resolved = await resolveFullAddressOnServer({
+          rua: address.trim(),
+          numero: number.trim(),
+          bairro: neighborhood.trim(),
+          cidade: city.trim(),
+          uf: state.trim(),
+          cep: cep.replace(/\D/g, ''),
+        });
+        if (resolved) {
+          finalLat = resolved.latitude;
+          finalLng = resolved.longitude;
+        }
+      }
+
       const updated = await api.updateCustomerMe({
         name: name.trim(),
         phone: phone.trim(),
@@ -333,12 +434,13 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
         state: state.trim(),
         complement: complement.trim(),
         reference: reference.trim(),
-        latitude: lat,
-        longitude: lng,
-        distanceKm: distanceKm ?? undefined,
-        isWithinDeliveryRadius: isWithinRadius ?? undefined,
+        latitude: finalLat,
+        longitude: finalLng,
       });
 
+      if (updated?.id) {
+        api.markCustomerPinConfirmed(updated.id);
+      }
       onSuccess(updated);
     } catch (err: any) {
       setRegisterError(err.message || 'Erro ao atualizar dados.');
@@ -659,10 +761,22 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                     placeholder="123"
                     value={number}
                     onChange={(e) => setNumber(e.target.value)}
+                    onBlur={handleNumberBlur}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
                   />
                 </div>
               </div>
+
+              {lat !== undefined && lng !== undefined && (
+                <AddressPinMap
+                  latitude={lat}
+                  longitude={lng}
+                  precisao={geoPrecisao}
+                  onChange={(newLat, newLng) => {
+                    updateCoordinatesAndDistance(newLat, newLng, 'exata');
+                  }}
+                />
+              )}
 
               <div className="grid grid-cols-2 gap-2">
                 <div>

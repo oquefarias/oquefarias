@@ -12,6 +12,8 @@ export interface Product {
   category: ProductCategory;
   volume: string;
   price: number;
+  promoPrice?: number | null;
+  promoEndsAt?: string | null;
   costPrice: number;
   stock: number;
   minStock: number;
@@ -20,6 +22,32 @@ export interface Product {
   sku: string;
   active: boolean;
   description: string;
+}
+
+export function isProductPromoActive(product: Pick<Product, 'price' | 'promoPrice' | 'promoEndsAt'>): boolean {
+  const normalPrice = Number(product.price) || 0;
+  const promoPrice = product.promoPrice !== null && product.promoPrice !== undefined ? Number(product.promoPrice) : 0;
+  if (!(promoPrice > 0 && promoPrice < normalPrice)) {
+    return false;
+  }
+  if (product.promoEndsAt) {
+    const endsAtMs = new Date(product.promoEndsAt).getTime();
+    if (!Number.isNaN(endsAtMs) && endsAtMs <= Date.now()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function getEffectiveProductPrice(product: Pick<Product, 'price' | 'promoPrice' | 'promoEndsAt'>): number {
+  return isProductPromoActive(product) ? Number(product.promoPrice) : Number(product.price);
+}
+
+export function getPromoDiscountPercent(product: Pick<Product, 'price' | 'promoPrice'>): number {
+  const normalPrice = Number(product.price) || 0;
+  const promoPrice = Number(product.promoPrice) || 0;
+  if (normalPrice <= 0 || promoPrice <= 0 || promoPrice >= normalPrice) return 0;
+  return Math.round(((normalPrice - promoPrice) / normalPrice) * 100);
 }
 
 export type OrderStatus = 
@@ -40,6 +68,7 @@ export interface OrderItem {
   name: string;
   volume: string;
   price: number;
+  originalPrice?: number;
   costPrice?: number;
   quantity: number;
   isCold?: boolean;

@@ -100,72 +100,101 @@ export async function fetchCoordinatesByCepBrasilApi(cep: string): Promise<{
   return null;
 }
 
+export interface ServerGeoResolveResult {
+  latitude: number;
+  longitude: number;
+  precisao: 'exata' | 'rua' | 'aproximada' | string;
+  displayName?: string;
+}
+
 /**
- * Geocodes an address string using OpenStreetMap Nominatim.
+ * Resolves full address coordinates via the server endpoint POST /api/geo/resolve
+ * (OpenStreetMap Nominatim structured search on server -> BrasilAPI fallback).
+ * Never calls Nominatim directly from the browser.
  */
-export async function geocodeAddress(query: string): Promise<GeocodeResult | null> {
-  if (!query || !query.trim()) return null;
-
+export async function resolveFullAddressOnServer(params: {
+  rua?: string;
+  numero?: string;
+  bairro?: string;
+  cidade?: string;
+  uf?: string;
+  cep?: string;
+  query?: string;
+}): Promise<ServerGeoResolveResult | null> {
   try {
-    const cleanQuery = encodeURIComponent(query.trim());
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 6000);
-
-    const res = await fetch(
-      `https://nominatim.openstreetmap.org/search?format=json&q=${cleanQuery}&countrycodes=br&limit=1`,
-      {
-        headers: {
-          'Accept-Language': 'pt-BR,pt;q=0.9',
-        },
-        signal: controller.signal,
-      }
-    );
-    clearTimeout(timeoutId);
-
+    const res = await fetch('/api/geo/resolve', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(params),
+    });
     if (!res.ok) return null;
     const data = await res.json();
-    if (Array.isArray(data) && data.length > 0) {
-      const item = data[0];
+    if (
+      data &&
+      typeof data.latitude === 'number' &&
+      !Number.isNaN(data.latitude) &&
+      typeof data.longitude === 'number' &&
+      !Number.isNaN(data.longitude)
+    ) {
       return {
-        lat: parseFloat(item.lat),
-        lng: parseFloat(item.lon),
-        displayName: item.display_name,
+        latitude: data.latitude,
+        longitude: data.longitude,
+        precisao: data.precisao || 'rua',
+        displayName: data.displayName || '',
       };
     }
     return null;
   } catch (e) {
-    console.warn('Geocoding error:', e);
+    console.warn('Server geocoding error:', e);
     return null;
   }
 }
 
 /**
- * Resolves address and coordinates either by CEP or address string.
- * Tier 1: Check if input contains an 8-digit CEP (ViaCEP + BrasilAPI v2).
- * Tier 2: Geocode address string with Brazil country bias.
+ * Geocodes an address string via the backend POST /api/geo/resolve endpoint.
+ */
+export async function geocodeAddress(query: string): Promise<GeocodeResult | null> {
+  if (!query || !query.trim()) return null;
+
+  const resolved = await resolveFullAddressOnServer({ query: query.trim() });
+  if (!resolved) return null;
+
+  return {
+    lat: resolved.latitude,
+    lng: resolved.longitude,
+    displayName: resolved.displayName || query.trim(),
+  };
+}
+
+/**
+ * Resolves address and coordinates either by CEP or address string using ViaCEP + POST /api/geo/resolve.
  */
 export async function resolveAddressOrCep(
   input: string
-): Promise<{ address: string; lat: number; lng: number; source: 'cep' | 'geocode' } | null> {
+): Promise<{
+  address: string;
+  lat: number;
+  lng: number;
+  source: 'cep' | 'geocode';
+  precisao?: string;
+} | null> {
   if (!input || !input.trim()) return null;
 
-  // Extract any 8-digit pattern (e.g. 01310-100 or 01310100)
   const cepMatch = input.match(/\b\d{5}-?\d{3}\b/);
   const cleanDigits = input.replace(/\D/g, '');
-
-  const targetCep = cepMatch ? cepMatch[0].replace(/\D/g, '') : (cleanDigits.length === 8 ? cleanDigits : null);
+  const targetCep = cepMatch ? cepMatch[0].replace(/\D/g, '') : cleanDigits.length === 8 ? cleanDigits : null;
 
   if (targetCep) {
-    // 1. First try BrasilAPI for direct coordinates
-    const brasilApiData = await fetchCoordinatesByCepBrasilApi(targetCep);
     const viaCepData = await fetchAddressByCep(targetCep);
+    const brasilApiData = await fetchCoordinatesByCepBrasilApi(targetCep);
 
     const street = viaCepData?.logradouro || brasilApiData?.street || '';
     const neighborhood = viaCepData?.bairro || brasilApiData?.neighborhood || '';
     const city = viaCepData?.localidade || brasilApiData?.city || '';
     const uf = viaCepData?.uf || brasilApiData?.state || '';
 
-    // Check if user also specified a number in the input (e.g., "01310-100, 1500" or "Rua X 120, CEP 01310-100")
     const numberMatch = input.replace(targetCep, '').match(/\b\d{1,5}\b/);
     const streetNumber = numberMatch ? numberMatch[0] : '';
 
@@ -178,54 +207,47 @@ export async function resolveAddressOrCep(
       .filter(Boolean)
       .join(', ');
 
-    // If street and number exist, try Nominatim for exact house coordinates
-    if (street && streetNumber && city) {
-      const refined = await geocodeAddress(`${street}, ${streetNumber}, ${city}, ${uf}, Brasil`);
-      if (refined) {
-        return {
-          address: formattedAddress,
-          lat: refined.lat,
-          lng: refined.lng,
-          source: 'cep',
-        };
-      }
+    const serverGeo = await resolveFullAddressOnServer({
+      rua: street,
+      numero: streetNumber,
+      bairro: neighborhood,
+      cidade: city,
+      uf,
+      cep: targetCep,
+    });
+
+    if (serverGeo) {
+      return {
+        address: formattedAddress,
+        lat: serverGeo.latitude,
+        lng: serverGeo.longitude,
+        source: 'cep',
+        precisao: serverGeo.precisao,
+      };
     }
 
-    // Otherwise use BrasilAPI coordinates if available
     if (brasilApiData?.lat && brasilApiData?.lng) {
       return {
         address: formattedAddress,
         lat: brasilApiData.lat,
         lng: brasilApiData.lng,
         source: 'cep',
+        precisao: 'aproximada',
       };
-    }
-
-    // Fallback: Nominatim with street + neighborhood + city
-    if (street || city) {
-      const query = `${street} ${neighborhood} ${city} ${uf} Brasil`;
-      const refined = await geocodeAddress(query);
-      if (refined) {
-        return {
-          address: formattedAddress,
-          lat: refined.lat,
-          lng: refined.lng,
-          source: 'cep',
-        };
-      }
     }
   }
 
-  // Normal address search via Nominatim
-  const geo = await geocodeAddress(input);
+  const geo = await resolveFullAddressOnServer({ query: input.trim() });
   if (geo) {
     return {
-      address: geo.displayName,
-      lat: geo.lat,
-      lng: geo.lng,
+      address: geo.displayName || input.trim(),
+      lat: geo.latitude,
+      lng: geo.longitude,
       source: 'geocode',
+      precisao: geo.precisao,
     };
   }
 
   return null;
 }
+

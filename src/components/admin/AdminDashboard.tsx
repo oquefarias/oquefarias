@@ -1,5 +1,18 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { Product, Order, StoreSettings, OrderStatus, ProductCategory, PaymentMethod, DeliveryArea, CustomerProfile, Coupon } from '../../types';
+import {
+  Product,
+  Order,
+  StoreSettings,
+  OrderStatus,
+  ProductCategory,
+  PaymentMethod,
+  DeliveryArea,
+  CustomerProfile,
+  Coupon,
+  isProductPromoActive,
+  getEffectiveProductPrice,
+  getPromoDiscountPercent,
+} from '../../types';
 import { api } from '../../services/api';
 import { soundService } from '../../utils/sound';
 import { PrintReceiptModal } from '../PrintReceiptModal';
@@ -38,6 +51,7 @@ import {
   Compass,
   AlertTriangle,
   Ticket,
+  Tag,
 } from 'lucide-react';
 
 // Compress image uploaded from computer so it stays lightweight and fast
@@ -101,8 +115,122 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onLockDashboard,
   onPreviewCustomerView,
 }) => {
-  const [activeTab, setActiveTab] = useState<'pedidos' | 'estoque' | 'pdv' | 'areas' | 'clientes' | 'cupons' | 'financeiro' | 'configuracoes'>('pedidos');
+  const [activeTab, setActiveTab] = useState<'pedidos' | 'estoque' | 'promocoes' | 'pdv' | 'areas' | 'clientes' | 'cupons' | 'financeiro' | 'configuracoes'>('pedidos');
   
+  // Promotions state
+  const [isPromoModalOpen, setIsPromoModalOpen] = useState<boolean>(false);
+  const [promoProductSearch, setPromoProductSearch] = useState<string>('');
+  const [promoForm, setPromoForm] = useState<{
+    productId: string;
+    promoPrice: string;
+    promoEndsAt: string;
+  }>({
+    productId: '',
+    promoPrice: '',
+    promoEndsAt: '',
+  });
+  const [isSavingPromo, setIsSavingPromo] = useState<boolean>(false);
+  const [promoModalError, setPromoModalError] = useState<string>('');
+
+  const activePromotions = useMemo(() => {
+    return products.filter((p) => isProductPromoActive(p));
+  }, [products]);
+
+  const selectedPromoProduct = useMemo(() => {
+    return products.find((p) => p.id === promoForm.productId) || null;
+  }, [products, promoForm.productId]);
+
+  const calculatedModalDiscountPercent = useMemo(() => {
+    if (!selectedPromoProduct) return 0;
+    const numPromo = parseFloat(promoForm.promoPrice);
+    if (Number.isNaN(numPromo) || numPromo <= 0 || numPromo >= selectedPromoProduct.price) return 0;
+    return Math.round(((selectedPromoProduct.price - numPromo) / selectedPromoProduct.price) * 100);
+  }, [selectedPromoProduct, promoForm.promoPrice]);
+
+  const toLocalDateTimeInputValue = (iso?: string | null) => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+
+  const handleOpenNewPromo = () => {
+    setPromoModalError('');
+    setPromoProductSearch('');
+    setPromoForm({
+      productId: '',
+      promoPrice: '',
+      promoEndsAt: '',
+    });
+    setIsPromoModalOpen(true);
+  };
+
+  const handleOpenEditPromo = (prod: Product) => {
+    setPromoModalError('');
+    setPromoProductSearch(prod.name);
+    setPromoForm({
+      productId: prod.id,
+      promoPrice: prod.promoPrice ? String(prod.promoPrice) : '',
+      promoEndsAt: toLocalDateTimeInputValue(prod.promoEndsAt),
+    });
+    setIsPromoModalOpen(true);
+  };
+
+  const handleEndPromotion = async (prod: Product) => {
+    if (!window.confirm(`Deseja encerrar a promoção de "${prod.name}"?`)) return;
+    try {
+      await api.clearProductPromotion(prod.id);
+    } catch (err: any) {
+      console.error('Erro ao encerrar promoção:', err);
+    }
+  };
+
+  const handleSavePromotion = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPromoModalError('');
+    if (!selectedPromoProduct) {
+      setPromoModalError('Selecione um produto para aplicar a promoção.');
+      return;
+    }
+
+    const numPromo = parseFloat(promoForm.promoPrice);
+    if (Number.isNaN(numPromo) || numPromo <= 0) {
+      setPromoModalError('O preço promocional precisa ser maior que zero.');
+      return;
+    }
+
+    if (numPromo >= selectedPromoProduct.price) {
+      setPromoModalError(
+        `O preço promocional precisa ser menor que o preço normal (${selectedPromoProduct.price.toLocaleString('pt-BR', {
+          style: 'currency',
+          currency: 'BRL',
+        })}).`
+      );
+      return;
+    }
+
+    let isoEndsAt: string | null = null;
+    if (promoForm.promoEndsAt && promoForm.promoEndsAt.trim()) {
+      const parsedDate = new Date(promoForm.promoEndsAt);
+      if (Number.isNaN(parsedDate.getTime()) || parsedDate.getTime() <= Date.now()) {
+        setPromoModalError('A data de término precisa ser uma data e hora no futuro.');
+        return;
+      }
+      isoEndsAt = parsedDate.toISOString();
+    }
+
+    setIsSavingPromo(true);
+    try {
+      await api.setProductPromotion(selectedPromoProduct.id, numPromo, isoEndsAt);
+      setIsPromoModalOpen(false);
+    } catch (err: any) {
+      setPromoModalError(err.message || 'Erro ao salvar promoção.');
+    } finally {
+      setIsSavingPromo(false);
+    }
+  };
+
   // Coupons state
   const [coupons, setCoupons] = useState<Coupon[]>(() => api.getCoupons());
   const [isCouponModalOpen, setIsCouponModalOpen] = useState<boolean>(false);
@@ -489,7 +617,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const posSubtotal = useMemo(() => {
-    return posCart.reduce((sum, item) => sum + item.product.price * item.quantity, 0);
+    return posCart.reduce((sum, item) => sum + getEffectiveProductPrice(item.product) * item.quantity, 0);
   }, [posCart]);
 
   const handleFinishPosSale = async () => {
@@ -510,7 +638,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           productId: i.product.id,
           name: i.product.name,
           volume: i.product.volume,
-          price: i.product.price,
+          price: getEffectiveProductPrice(i.product),
+          originalPrice: i.product.price,
           costPrice: i.product.costPrice,
           quantity: i.quantity,
           isCold: i.product.isCold,
@@ -653,6 +782,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             {lowStockProducts.length > 0 && (
               <span className="w-5 h-5 rounded-full bg-amber-200 text-amber-900 text-[10px] font-bold flex items-center justify-center">
                 {lowStockProducts.length}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => setActiveTab('promocoes')}
+            className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs sm:text-sm font-bold transition-all ${
+              activeTab === 'promocoes' ? 'bg-amber-500 text-white shadow-sm' : 'text-neutral-700 hover:bg-neutral-100'
+            }`}
+          >
+            <Tag className="w-4 h-4" />
+            <span>Promoções</span>
+            {activePromotions.length > 0 && (
+              <span className="w-5 h-5 rounded-full bg-red-600 text-white text-[10px] font-black flex items-center justify-center">
+                {activePromotions.length}
               </span>
             )}
           </button>
@@ -878,18 +1022,33 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400 block mb-1">
                           Itens do Pedido ({order.items.reduce((s, i) => s + i.quantity, 0)} un):
                         </span>
-                        {order.items.map((it, idx) => (
-                          <div key={idx} className="flex justify-between items-center py-1 border-b border-neutral-100 last:border-0">
-                            <div>
-                              <span className="font-black text-amber-600 text-sm">{it.quantity}x </span>
-                              <span className="font-bold text-neutral-800">{it.name}</span>
-                              <span className="text-neutral-500 text-[11px] ml-1">
-                                ({it.volume}) {it.isCold ? '• Gelada ❄️' : ''}
-                              </span>
+                        {order.items.map((it, idx) => {
+                          const wasPromo = it.originalPrice !== undefined && it.originalPrice > it.price;
+                          return (
+                            <div key={idx} className="flex justify-between items-center py-1 border-b border-neutral-100 last:border-0">
+                              <div>
+                                <span className="font-black text-amber-600 text-sm">{it.quantity}x </span>
+                                <span className="font-bold text-neutral-800">{it.name}</span>
+                                <span className="text-neutral-500 text-[11px] ml-1">
+                                  ({it.volume}) {it.isCold ? '• Gelada ❄️' : ''}
+                                </span>
+                                {wasPromo && (
+                                  <span className="ml-1.5 px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-black rounded uppercase">
+                                    PROMO ({formatCurrency(it.price)} un)
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-right">
+                                {wasPromo && it.originalPrice && (
+                                  <span className="text-[10px] text-neutral-400 line-through mr-1.5">
+                                    {formatCurrency(it.originalPrice * it.quantity)}
+                                  </span>
+                                )}
+                                <span className="font-bold text-neutral-900">{formatCurrency(it.price * it.quantity)}</span>
+                              </div>
                             </div>
-                            <span className="font-bold text-neutral-900">{formatCurrency(it.price * it.quantity)}</span>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
 
                       <div className="flex items-center justify-between p-3 bg-neutral-100 rounded-2xl text-xs mb-4">
@@ -1644,7 +1803,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   ) : (
                     filteredProducts.map(p => {
                     const isLow = p.stock <= p.minStock;
-                    const margin = p.price > 0 ? ((p.price - p.costPrice) / p.price) * 100 : 0;
+                    const promoActive = isProductPromoActive(p);
+                    const effectivePrice = getEffectiveProductPrice(p);
+                    const margin = effectivePrice > 0 ? ((effectivePrice - p.costPrice) / effectivePrice) * 100 : 0;
 
                     return (
                       <tr key={p.id} className="hover:bg-neutral-50 transition-colors">
@@ -1656,7 +1817,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               className="w-10 h-10 rounded-xl object-cover border border-neutral-200 shrink-0"
                             />
                             <div>
-                              <div className="font-bold text-neutral-900 text-sm">{p.name}</div>
+                              <div className="flex items-center gap-2">
+                                <span className="font-bold text-neutral-900 text-sm">{p.name}</span>
+                                {promoActive && (
+                                  <span className="px-1.5 py-0.5 bg-red-600 text-white text-[10px] font-black rounded uppercase tracking-wider">
+                                    PROMO
+                                  </span>
+                                )}
+                              </div>
                               <div className="text-[11px] text-neutral-500">
                                 {p.volume} {p.isCold ? '• Gelada ❄️' : ''}
                               </div>
@@ -1668,7 +1836,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           <span className="text-[10px] font-mono text-neutral-400">{p.sku}</span>
                         </td>
                         <td className="py-3 px-4 font-mono text-neutral-600">{formatCurrency(p.costPrice)}</td>
-                        <td className="py-3 px-4 font-mono font-bold text-neutral-900">{formatCurrency(p.price)}</td>
+                        <td className="py-3 px-4 font-mono">
+                          {promoActive ? (
+                            <div>
+                              <span className="text-[10px] text-neutral-400 line-through block">
+                                {formatCurrency(p.price)}
+                              </span>
+                              <span className="font-black text-red-600">
+                                {formatCurrency(effectivePrice)}
+                              </span>
+                            </div>
+                          ) : (
+                            <span className="font-bold text-neutral-900">{formatCurrency(p.price)}</span>
+                          )}
+                        </td>
                         <td className="py-3 px-4">
                           <span className={`font-bold px-1.5 py-0.5 rounded text-[11px] ${
                             margin >= 30 ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
@@ -1744,6 +1925,134 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* ========================================================= */}
+      {/* TAB: PROMOÇÕES DE PRODUTOS                                */}
+      {/* ========================================================= */}
+      {activeTab === 'promocoes' && (
+        <div className="space-y-6">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-white p-5 rounded-3xl border border-neutral-200">
+            <div>
+              <h3 className="text-lg font-black text-neutral-900 flex items-center gap-2">
+                <Tag className="w-5 h-5 text-red-600" />
+                <span>Promoções de Produtos</span>
+              </h3>
+              <p className="text-xs text-neutral-500 mt-0.5">
+                Gerencie ofertas com desconto direto nos produtos. Os preços promocionais ativos aparecem automaticamente em destaque na loja.
+              </p>
+            </div>
+
+            <button
+              onClick={handleOpenNewPromo}
+              className="px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-xl text-xs flex items-center gap-1.5 shadow-sm shadow-amber-500/20 cursor-pointer shrink-0"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Nova promoção</span>
+            </button>
+          </div>
+
+          <div className="bg-white rounded-3xl border border-neutral-200 overflow-hidden shadow-xs">
+            {activePromotions.length === 0 ? (
+              <div className="text-center py-14 px-4">
+                <div className="w-12 h-12 bg-red-50 text-red-600 rounded-2xl flex items-center justify-center mx-auto mb-3">
+                  <Tag className="w-6 h-6" />
+                </div>
+                <h4 className="font-bold text-sm text-neutral-900">Nenhuma promoção ativa no momento</h4>
+                <p className="text-xs text-neutral-500 mt-1 max-w-sm mx-auto">
+                  Clique em <strong>Nova promoção</strong> para destacar produtos com desconto na vitrine da loja.
+                </p>
+                <button
+                  onClick={handleOpenNewPromo}
+                  className="mt-4 px-4 py-2 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-xl text-xs inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Nova promoção</span>
+                </button>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs text-neutral-700">
+                  <thead className="bg-neutral-50 border-b border-neutral-200 text-neutral-500 uppercase tracking-wider font-bold">
+                    <tr>
+                      <th className="py-3 px-4">Produto</th>
+                      <th className="py-3 px-4">Preço Normal</th>
+                      <th className="py-3 px-4">Preço Promocional</th>
+                      <th className="py-3 px-4">Desconto</th>
+                      <th className="py-3 px-4">Término</th>
+                      <th className="py-3 px-4 text-right">Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-neutral-100">
+                    {activePromotions.map((prod) => {
+                      const discountPct = getPromoDiscountPercent(prod);
+                      const promoVal = getEffectiveProductPrice(prod);
+
+                      return (
+                        <tr key={prod.id} className="hover:bg-neutral-50/80 transition-colors">
+                          <td className="py-3.5 px-4">
+                            <div className="flex items-center gap-3">
+                              <img
+                                src={prod.image}
+                                alt={prod.name}
+                                className="w-11 h-11 rounded-xl object-cover border border-neutral-200 shrink-0"
+                              />
+                              <div>
+                                <div className="font-bold text-neutral-900 text-sm flex items-center gap-2">
+                                  <span>{prod.name}</span>
+                                  <span className="px-1.5 py-0.5 bg-red-600 text-white text-[10px] font-black rounded uppercase">
+                                    PROMO
+                                  </span>
+                                </div>
+                                <div className="text-[11px] text-neutral-500">
+                                  {prod.volume} • Estoque: {prod.stock} un
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="py-3.5 px-4 font-mono text-neutral-400 line-through">
+                            {formatCurrency(prod.price)}
+                          </td>
+                          <td className="py-3.5 px-4 font-mono font-black text-sm text-red-600">
+                            {formatCurrency(promoVal)}
+                          </td>
+                          <td className="py-3.5 px-4">
+                            <span className="px-2.5 py-1 rounded-full bg-red-100 text-red-800 font-black text-xs">
+                              -{discountPct}% OFF
+                            </span>
+                          </td>
+                          <td className="py-3.5 px-4 font-medium text-neutral-700">
+                            {prod.promoEndsAt ? formatDate(prod.promoEndsAt) : 'Sem data de término'}
+                          </td>
+                          <td className="py-3.5 px-4 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenEditPromo(prod)}
+                                className="px-3 py-1.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 rounded-xl font-bold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+                              >
+                                <Edit2 className="w-3.5 h-3.5" />
+                                <span>Editar</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleEndPromotion(prod)}
+                                className="px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded-xl font-bold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                                <span>Encerrar promoção</span>
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================= */}
       {/* TAB: PDV BALCÃO                                           */}
       {/* ========================================================= */}
       {activeTab === 'pdv' && (
@@ -1796,6 +2105,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   .map(product => {
                     const inCart = posCart.find(i => i.product.id === product.id);
                     const isOutOfStock = product.stock <= 0;
+                    const promoActive = isProductPromoActive(product);
+                    const effPrice = getEffectiveProductPrice(product);
 
                     return (
                       <button
@@ -1813,15 +2124,31 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <div>
                           <div className="flex justify-between items-start gap-1">
                             <span className="text-[10px] font-bold text-neutral-400 uppercase">{product.volume}</span>
-                            <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-neutral-100 text-neutral-600">
-                              Est: {product.stock}
-                            </span>
+                            <div className="flex items-center gap-1">
+                              {promoActive && (
+                                <span className="text-[9px] font-black px-1.5 py-0.2 rounded bg-red-600 text-white uppercase">
+                                  PROMO
+                                </span>
+                              )}
+                              <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-neutral-100 text-neutral-600">
+                                Est: {product.stock}
+                              </span>
+                            </div>
                           </div>
                           <h4 className="font-bold text-xs text-neutral-900 mt-1 line-clamp-2">{product.name}</h4>
                         </div>
 
                         <div className="mt-3 pt-2 border-t border-neutral-100 flex items-center justify-between">
-                          <span className="font-black text-sm text-neutral-900">{formatCurrency(product.price)}</span>
+                          <div>
+                            {promoActive && (
+                              <span className="text-[10px] text-neutral-400 line-through block">
+                                {formatCurrency(product.price)}
+                              </span>
+                            )}
+                            <span className={`font-black text-sm ${promoActive ? 'text-red-600' : 'text-neutral-900'}`}>
+                              {formatCurrency(effPrice)}
+                            </span>
+                          </div>
                           {inCart && (
                             <span className="w-5 h-5 rounded-full bg-amber-500 text-white font-black text-xs flex items-center justify-center">
                               {inCart.quantity}
@@ -1865,34 +2192,37 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     Nenhum produto adicionado.<br />Clique nos produtos ao lado para incluir no caixa.
                   </div>
                 ) : (
-                  posCart.map(item => (
-                    <div key={item.product.id} className="flex items-center justify-between gap-2 p-2 bg-neutral-50 rounded-xl text-xs">
-                      <div className="flex-1 truncate">
-                        <div className="font-bold text-neutral-900 truncate">{item.product.name}</div>
-                        <div className="text-[10px] text-neutral-500">{formatCurrency(item.product.price)} un</div>
-                      </div>
+                  posCart.map(item => {
+                    const effPrice = getEffectiveProductPrice(item.product);
+                    return (
+                      <div key={item.product.id} className="flex items-center justify-between gap-2 p-2 bg-neutral-50 rounded-xl text-xs">
+                        <div className="flex-1 truncate">
+                          <div className="font-bold text-neutral-900 truncate">{item.product.name}</div>
+                          <div className="text-[10px] text-neutral-500">{formatCurrency(effPrice)} un</div>
+                        </div>
 
-                      <div className="flex items-center gap-1">
-                        <button
-                          onClick={() => removeFromPosCart(item.product.id)}
-                          className="w-5 h-5 flex items-center justify-center bg-white rounded text-neutral-600 hover:bg-neutral-200 font-bold"
-                        >
-                          -
-                        </button>
-                        <span className="w-5 text-center font-black">{item.quantity}</span>
-                        <button
-                          onClick={() => addToPosCart(item.product)}
-                          className="w-5 h-5 flex items-center justify-center bg-white rounded text-neutral-600 hover:bg-neutral-200 font-bold"
-                        >
-                          +
-                        </button>
-                      </div>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => removeFromPosCart(item.product.id)}
+                            className="w-5 h-5 flex items-center justify-center bg-white rounded text-neutral-600 hover:bg-neutral-200 font-bold"
+                          >
+                            -
+                          </button>
+                          <span className="w-5 text-center font-black">{item.quantity}</span>
+                          <button
+                            onClick={() => addToPosCart(item.product)}
+                            className="w-5 h-5 flex items-center justify-center bg-white rounded text-neutral-600 hover:bg-neutral-200 font-bold"
+                          >
+                            +
+                          </button>
+                        </div>
 
-                      <span className="font-bold text-neutral-900 w-16 text-right">
-                        {formatCurrency(item.product.price * item.quantity)}
-                      </span>
-                    </div>
-                  ))
+                        <span className="font-bold text-neutral-900 w-16 text-right">
+                          {formatCurrency(effPrice * item.quantity)}
+                        </span>
+                      </div>
+                    );
+                  })
                 )}
               </div>
 
@@ -2913,6 +3243,159 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <>
                       <CheckCircle2 className="w-4 h-4" />
                       <span>Salvar Cupom</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Promotion Modal */}
+      {isPromoModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 overflow-y-auto">
+          <div className="bg-white rounded-3xl max-w-md w-full shadow-2xl overflow-hidden border border-neutral-200 my-6">
+            <div className="p-5 bg-neutral-900 text-white flex items-center justify-between">
+              <h3 className="font-black text-base flex items-center gap-2">
+                <Tag className="w-5 h-5 text-amber-500" />
+                <span>{promoForm.productId && isProductPromoActive(selectedPromoProduct || { price: 0 }) ? 'Editar Promoção' : 'Nova Promoção'}</span>
+              </h3>
+              <button
+                onClick={() => setIsPromoModalOpen(false)}
+                className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSavePromotion} className="p-6 space-y-4 text-xs">
+              {promoModalError && (
+                <p className="p-2.5 rounded-xl bg-red-50 text-red-800 border border-red-200 font-bold">
+                  {promoModalError}
+                </p>
+              )}
+
+              <div>
+                <label className="font-bold text-neutral-700 block mb-1">Buscar e Selecionar Produto *</label>
+                <div className="relative mb-2">
+                  <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
+                  <input
+                    type="text"
+                    placeholder="Digite o nome ou SKU para filtrar..."
+                    value={promoProductSearch}
+                    onChange={(e) => setPromoProductSearch(e.target.value)}
+                    className="w-full pl-8 pr-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
+                  />
+                </div>
+                <select
+                  required
+                  value={promoForm.productId}
+                  onChange={(e) => {
+                    const pid = e.target.value;
+                    const found = products.find((p) => p.id === pid);
+                    setPromoForm((prev) => ({
+                      ...prev,
+                      productId: pid,
+                      promoPrice:
+                        found && found.promoPrice && found.promoPrice > 0
+                          ? String(found.promoPrice)
+                          : prev.promoPrice,
+                    }));
+                  }}
+                  className="w-full px-3 py-2.5 bg-neutral-50 border border-neutral-300 rounded-xl font-bold text-neutral-900"
+                >
+                  <option value="">-- Selecione um produto --</option>
+                  {products
+                    .filter((p) => {
+                      if (!promoProductSearch.trim()) return true;
+                      const q = promoProductSearch.toLowerCase();
+                      return (
+                        p.name.toLowerCase().includes(q) ||
+                        p.sku.toLowerCase().includes(q) ||
+                        p.volume.toLowerCase().includes(q)
+                      );
+                    })
+                    .map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name} ({p.volume}) — Normal: {formatCurrency(p.price)}
+                      </option>
+                    ))}
+                </select>
+              </div>
+
+              {selectedPromoProduct && (
+                <div className="p-3 bg-neutral-50 rounded-2xl border border-neutral-200 flex items-center gap-3">
+                  <img
+                    src={selectedPromoProduct.image}
+                    alt={selectedPromoProduct.name}
+                    className="w-12 h-12 rounded-xl object-cover border border-neutral-200"
+                  />
+                  <div className="flex-1 min-w-0">
+                    <p className="font-bold text-neutral-900 truncate">{selectedPromoProduct.name}</p>
+                    <p className="text-[11px] text-neutral-500">
+                      Preço normal: <strong className="text-neutral-900">{formatCurrency(selectedPromoProduct.price)}</strong> • Estoque: {selectedPromoProduct.stock} un
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="font-bold text-neutral-700 block mb-1">Preço promocional (R$) *</label>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    required
+                    placeholder="Ex: 7.99"
+                    value={promoForm.promoPrice}
+                    onChange={(e) => setPromoForm({ ...promoForm, promoPrice: e.target.value })}
+                    className="flex-1 px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-bold text-neutral-900 text-sm"
+                  />
+                  <div className="px-3 py-2 rounded-xl bg-red-50 border border-red-200 text-red-700 font-black text-xs whitespace-nowrap">
+                    {calculatedModalDiscountPercent > 0 ? `-${calculatedModalDiscountPercent}% OFF` : '0% OFF'}
+                  </div>
+                </div>
+                {selectedPromoProduct && (
+                  <p className="text-[10px] text-neutral-500 mt-1">
+                    Deve ser maior que R$ 0,00 e menor que {formatCurrency(selectedPromoProduct.price)}.
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="font-bold text-neutral-700 block mb-1">Termina em (Opcional — Data e Hora)</label>
+                <input
+                  type="datetime-local"
+                  value={promoForm.promoEndsAt}
+                  onChange={(e) => setPromoForm({ ...promoForm, promoEndsAt: e.target.value })}
+                  className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-neutral-800"
+                />
+                <p className="text-[10px] text-neutral-400 mt-1">
+                  Deixe em branco para manter a promoção ativa sem data de término.
+                </p>
+              </div>
+
+              <div className="pt-3 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsPromoModalOpen(false)}
+                  className="flex-1 py-2.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded-xl font-bold cursor-pointer transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingPromo}
+                  className="flex-1 py-2.5 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black rounded-xl shadow-sm cursor-pointer transition-colors flex items-center justify-center gap-1.5"
+                >
+                  {isSavingPromo ? (
+                    <span>Salvando...</span>
+                  ) : (
+                    <>
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Salvar Promoção</span>
                     </>
                   )}
                 </button>

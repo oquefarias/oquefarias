@@ -44,13 +44,186 @@ function getSupabase(): SupabaseClient | null {
 // -----------------------------------------------------------------------------
 // 2. COLUMN MAPPINGS (camelCase <-> snake_case)
 // -----------------------------------------------------------------------------
+export function isPromoActive(product: any): boolean {
+  if (!product) return false;
+  const normalPrice = Number(product.price) || 0;
+  const rawPromo = product.promoPrice !== undefined ? product.promoPrice : product.promo_price;
+  const promoPrice = rawPromo !== null && rawPromo !== undefined ? Number(rawPromo) : 0;
+
+  if (!(promoPrice > 0 && promoPrice < normalPrice)) {
+    return false;
+  }
+
+  const rawEndsAt = product.promoEndsAt !== undefined ? product.promoEndsAt : product.promo_ends_at;
+  if (rawEndsAt) {
+    const endsAtMs = new Date(rawEndsAt).getTime();
+    if (!Number.isNaN(endsAtMs) && endsAtMs <= Date.now()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export function getEffectivePrice(product: any): number {
+  if (!product) return 0;
+  const normalPrice = Number(product.price) || 0;
+  const rawPromo = product.promoPrice !== undefined ? product.promoPrice : product.promo_price;
+  return isPromoActive(product) ? Number(rawPromo) : normalPrice;
+}
+
+export function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const R = 6371; // Raio da Terra em km
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c * 100) / 100;
+}
+
+async function fetchNominatimStructured(
+  params: Record<string, string>,
+  userAgent: string
+): Promise<{ lat: number; lon: number; displayName: string } | null> {
+  try {
+    const searchParams = new URLSearchParams({
+      format: 'json',
+      countrycodes: 'br',
+      limit: '1',
+      ...params,
+    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6500);
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?${searchParams.toString()}`, {
+      headers: {
+        'User-Agent': userAgent,
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (Array.isArray(data) && data.length > 0 && data[0].lat && data[0].lon) {
+      const lat = parseFloat(data[0].lat);
+      const lon = parseFloat(data[0].lon);
+      if (!Number.isNaN(lat) && !Number.isNaN(lon)) {
+        return {
+          lat,
+          lon,
+          displayName: String(data[0].display_name || ''),
+        };
+      }
+    }
+    return null;
+  } catch (err) {
+    console.warn('[Geo Warning] Nominatim request failed:', err);
+    return null;
+  }
+}
+
+async function fetchBrasilApiCepServer(cleanCep: string): Promise<{
+  lat?: number;
+  lng?: number;
+  street: string;
+  neighborhood: string;
+  city: string;
+  state: string;
+} | null> {
+  if (cleanCep.length !== 8) return null;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch(`https://brasilapi.com.br/api/cep/v2/${cleanCep}`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const rawLat = data?.location?.coordinates?.latitude;
+    const rawLng = data?.location?.coordinates?.longitude;
+    const lat = rawLat !== undefined && rawLat !== null ? parseFloat(String(rawLat)) : undefined;
+    const lng = rawLng !== undefined && rawLng !== null ? parseFloat(String(rawLng)) : undefined;
+    return {
+      lat: lat !== undefined && !Number.isNaN(lat) ? lat : undefined,
+      lng: lng !== undefined && !Number.isNaN(lng) ? lng : undefined,
+      street: String(data?.street || ''),
+      neighborhood: String(data?.neighborhood || ''),
+      city: String(data?.city || ''),
+      state: String(data?.state || ''),
+    };
+  } catch (err) {
+    console.warn('[Geo Warning] BrasilAPI lookup failed:', err);
+    return null;
+  }
+}
+
+async function computeCustomerServerMetrics(
+  supabase: SupabaseClient,
+  latitude: number | undefined | null,
+  longitude: number | undefined | null
+): Promise<{ distanceKm?: number; isWithinDeliveryRadius?: boolean }> {
+  if (
+    latitude === undefined ||
+    latitude === null ||
+    Number.isNaN(Number(latitude)) ||
+    longitude === undefined ||
+    longitude === null ||
+    Number.isNaN(Number(longitude))
+  ) {
+    return { distanceKm: undefined, isWithinDeliveryRadius: undefined };
+  }
+
+  const { data: settingsRow } = await supabase
+    .from('store_settings')
+    .select('data')
+    .eq('id', 'default')
+    .maybeSingle();
+  const dbSettings: StoreSettings = settingsRow?.data
+    ? sanitizePublicSettings(settingsRow.data)
+    : initialSettings;
+
+  if (
+    dbSettings.storeLatitude === undefined ||
+    dbSettings.storeLatitude === null ||
+    dbSettings.storeLongitude === undefined ||
+    dbSettings.storeLongitude === null
+  ) {
+    return { distanceKm: undefined, isWithinDeliveryRadius: undefined };
+  }
+
+  const distanceKm = haversineKm(
+    Number(dbSettings.storeLatitude),
+    Number(dbSettings.storeLongitude),
+    Number(latitude),
+    Number(longitude)
+  );
+  const maxRadius = Number(dbSettings.deliveryRadiusKm) || 5;
+  return {
+    distanceKm,
+    isWithinDeliveryRadius: distanceKm <= maxRadius,
+  };
+}
+
+
 function productToDB(p: Product) {
+  const promoPriceVal =
+    p.promoPrice !== undefined && p.promoPrice !== null && Number(p.promoPrice) > 0
+      ? Number(p.promoPrice)
+      : null;
+  const promoEndsAtVal = p.promoEndsAt ? String(p.promoEndsAt) : null;
+
   return {
     id: p.id,
     name: p.name,
     category: p.category,
     volume: p.volume || null,
     price: Number(p.price) || 0,
+    promo_price: promoPriceVal,
+    promo_ends_at: promoEndsAtVal,
     cost_price: Number(p.costPrice) || 0,
     stock: Number(p.stock) || 0,
     min_stock: Number(p.minStock ?? 10),
@@ -70,6 +243,11 @@ function productFromDB(row: any): Product {
     category: row.category as any,
     volume: row.volume || '',
     price: Number(row.price || 0),
+    promoPrice:
+      row.promo_price !== null && row.promo_price !== undefined && Number(row.promo_price) > 0
+        ? Number(row.promo_price)
+        : null,
+    promoEndsAt: row.promo_ends_at ? String(row.promo_ends_at) : null,
     costPrice: Number(row.cost_price || 0),
     stock: Number(row.stock || 0),
     minStock: row.min_stock !== null && row.min_stock !== undefined ? Number(row.min_stock) : 10,
@@ -78,6 +256,15 @@ function productFromDB(row: any): Product {
     sku: row.sku || '',
     active: row.active ?? true,
     description: row.description || '',
+  };
+}
+
+function sanitizePublicProduct(p: Product): Product {
+  const activePromo = isPromoActive(p);
+  return {
+    ...p,
+    promoPrice: activePromo ? (p.promoPrice ?? null) : null,
+    promoEndsAt: activePromo ? (p.promoEndsAt ?? null) : null,
   };
 }
 
@@ -521,6 +708,192 @@ export function createApp(): express.Express {
   });
 
   // ---------------------------------------------------------------------------
+  // GEOCODING RESOLVE ON SERVER: POST /geo/resolve
+  // Rate-limited to 20 calls/min per IP using admin_login_attempts with 'geo:' prefix
+  // ---------------------------------------------------------------------------
+  router.post('/geo/resolve', async (req, res) => {
+    const supabase = getSupabase();
+    const clientIp = getClientIp(req);
+    const geoIpKey = `geo:${clientIp}`;
+    const oneMinuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
+
+    let contactEmail = process.env.CONTACT_EMAIL || 'contato@depositoexpress.com.br';
+
+    if (supabase) {
+      try {
+        const { count, error: countErr } = await supabase
+          .from('admin_login_attempts')
+          .select('*', { count: 'exact', head: true })
+          .eq('ip', geoIpKey)
+          .gte('created_at', oneMinuteAgo);
+
+        if (!countErr && (count ?? 0) >= 20) {
+          return res.status(429).json({
+            error: 'Limite de consultas de localização atingido (20 por minuto). Aguarde um instante.',
+          });
+        }
+
+        await supabase.from('admin_login_attempts').insert({
+          ip: geoIpKey,
+          success: true,
+          created_at: new Date().toISOString(),
+        });
+
+        const { data: settingsRow } = await supabase
+          .from('store_settings')
+          .select('data')
+          .eq('id', 'default')
+          .maybeSingle();
+        const sData = settingsRow?.data;
+        if (sData) {
+          if (sData.email && typeof sData.email === 'string' && sData.email.includes('@')) {
+            contactEmail = sData.email.trim();
+          } else if (sData.pixKey && typeof sData.pixKey === 'string' && sData.pixKey.includes('@')) {
+            contactEmail = sData.pixKey.trim();
+          }
+        }
+      } catch (err) {
+        console.warn('[Geo Warning] Rate limit check warning:', err);
+      }
+    }
+
+    const userAgent = `DepositoExpress/1.0 (${contactEmail})`;
+    const body = req.body || {};
+
+    let rua = String(body.rua || body.street || body.address || body.logradouro || '').trim();
+    const numero = String(body.numero || body.number || '').trim();
+    let bairro = String(body.bairro || body.neighborhood || '').trim();
+    let cidade = String(body.cidade || body.city || body.localidade || '').trim();
+    let uf = String(body.uf || body.state || '').trim();
+    const rawCep = String(body.cep || body.postalcode || '').replace(/\D/g, '');
+    const freeQuery = String(body.query || '').trim();
+
+    let brasilApiData: Awaited<ReturnType<typeof fetchBrasilApiCepServer>> = null;
+    if (rawCep.length === 8 && (!rua || !cidade)) {
+      brasilApiData = await fetchBrasilApiCepServer(rawCep);
+      if (brasilApiData) {
+        if (!rua && brasilApiData.street) rua = brasilApiData.street;
+        if (!bairro && brasilApiData.neighborhood) bairro = brasilApiData.neighborhood;
+        if (!cidade && brasilApiData.city) cidade = brasilApiData.city;
+        if (!uf && brasilApiData.state) uf = brasilApiData.state;
+      }
+    }
+
+    const formattedPostal =
+      rawCep.length === 8 ? `${rawCep.slice(0, 5)}-${rawCep.slice(5)}` : rawCep;
+
+    // (a) 1. Structured search with street=[número rua], city, state, postalcode
+    if (rua && numero) {
+      const params1: Record<string, string> = {
+        street: `${numero} ${rua}`,
+      };
+      if (cidade) params1.city = cidade;
+      if (uf) params1.state = uf;
+      if (formattedPostal) params1.postalcode = formattedPostal;
+
+      const hit1 = await fetchNominatimStructured(params1, userAgent);
+      if (hit1) {
+        return res.json({
+          latitude: hit1.lat,
+          longitude: hit1.lon,
+          precisao: 'exata',
+          displayName: hit1.displayName,
+        });
+      }
+    }
+
+    // (a) 2. Retry without number: street=[rua], city, state, postalcode
+    if (rua) {
+      const params2: Record<string, string> = {
+        street: rua,
+      };
+      if (cidade) params2.city = cidade;
+      if (uf) params2.state = uf;
+      if (formattedPostal) params2.postalcode = formattedPostal;
+
+      const hit2 = await fetchNominatimStructured(params2, userAgent);
+      if (hit2) {
+        return res.json({
+          latitude: hit2.lat,
+          longitude: hit2.lon,
+          precisao: 'rua',
+          displayName: hit2.displayName,
+        });
+      }
+    }
+
+    // (a) 3. Retry with only street + city (first with number if available, then street only)
+    if (rua && cidade) {
+      if (numero) {
+        const hit3WithNum = await fetchNominatimStructured(
+          { street: `${numero} ${rua}`, city: cidade },
+          userAgent
+        );
+        if (hit3WithNum) {
+          return res.json({
+            latitude: hit3WithNum.lat,
+            longitude: hit3WithNum.lon,
+            precisao: 'exata',
+            displayName: hit3WithNum.displayName,
+          });
+        }
+      }
+
+      const hit3 = await fetchNominatimStructured(
+        { street: rua, city: cidade },
+        userAgent
+      );
+      if (hit3) {
+        return res.json({
+          latitude: hit3.lat,
+          longitude: hit3.lon,
+          precisao: 'rua',
+          displayName: hit3.displayName,
+        });
+      }
+    }
+
+    // Free-form query fallback if caller passed a raw query (e.g. store settings search)
+    if (freeQuery && !rua && !rawCep) {
+      const hitFree = await fetchNominatimStructured({ q: freeQuery }, userAgent);
+      if (hitFree) {
+        return res.json({
+          latitude: hitFree.lat,
+          longitude: hitFree.lon,
+          precisao: 'rua',
+          displayName: hitFree.displayName,
+        });
+      }
+    }
+
+    // (b) Fallback: BrasilAPI coordinates and mark precisao as 'aproximada'
+    if (rawCep.length === 8) {
+      if (!brasilApiData) {
+        brasilApiData = await fetchBrasilApiCepServer(rawCep);
+      }
+      if (brasilApiData && brasilApiData.lat !== undefined && brasilApiData.lng !== undefined) {
+        return res.json({
+          latitude: brasilApiData.lat,
+          longitude: brasilApiData.lng,
+          precisao: 'aproximada',
+          displayName: [
+            brasilApiData.street || rua,
+            brasilApiData.neighborhood || bairro,
+            brasilApiData.city || cidade,
+            brasilApiData.state || uf,
+          ]
+            .filter(Boolean)
+            .join(', '),
+        });
+      }
+    }
+
+    return res.status(404).json({
+      error: 'Não foi possível localizar as coordenadas deste endereço.',
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // CUSTOMER AUTH: REGISTER, LOGIN, ME
   // ---------------------------------------------------------------------------
   router.post('/customer/register', async (req, res) => {
@@ -539,8 +912,6 @@ export function createApp(): express.Express {
       state,
       latitude,
       longitude,
-      distanceKm,
-      isWithinDeliveryRadius,
     } = req.body || {};
 
     if (!name || typeof name !== 'string' || !name.trim()) {
@@ -584,6 +955,18 @@ export function createApp(): express.Express {
       const passwordHash = await hashPassword(password);
       const customerId = `cust-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
 
+      const parsedLat =
+        latitude !== undefined && latitude !== null && !Number.isNaN(Number(latitude))
+          ? Number(latitude)
+          : undefined;
+      const parsedLng =
+        longitude !== undefined && longitude !== null && !Number.isNaN(Number(longitude))
+          ? Number(longitude)
+          : undefined;
+
+      // Always calculate distance_km and is_within_delivery_radius on the server; ignore browser values
+      const serverMetrics = await computeCustomerServerMetrics(supabase, parsedLat, parsedLng);
+
       const newCustProfile: CustomerProfile = {
         id: customerId,
         name: name.trim(),
@@ -597,10 +980,10 @@ export function createApp(): express.Express {
         cep: cep ? cep.trim() : undefined,
         city: city ? city.trim() : undefined,
         state: state ? state.trim() : undefined,
-        latitude: latitude !== undefined && latitude !== null ? Number(latitude) : undefined,
-        longitude: longitude !== undefined && longitude !== null ? Number(longitude) : undefined,
-        distanceKm: distanceKm !== undefined && distanceKm !== null ? Number(distanceKm) : undefined,
-        isWithinDeliveryRadius: isWithinDeliveryRadius !== undefined ? Boolean(isWithinDeliveryRadius) : undefined,
+        latitude: parsedLat,
+        longitude: parsedLng,
+        distanceKm: serverMetrics.distanceKm,
+        isWithinDeliveryRadius: serverMetrics.isWithinDeliveryRadius,
         createdAt: new Date().toISOString(),
         totalOrdersCount: 0,
         totalSpent: 0,
@@ -745,6 +1128,22 @@ export function createApp(): express.Express {
       newPasswordHash = await hashPassword(body.password);
     }
 
+    const nextLat =
+      body.latitude !== undefined && body.latitude !== null && !Number.isNaN(Number(body.latitude))
+        ? Number(body.latitude)
+        : existing.latitude !== null && existing.latitude !== undefined
+        ? Number(existing.latitude)
+        : undefined;
+    const nextLng =
+      body.longitude !== undefined && body.longitude !== null && !Number.isNaN(Number(body.longitude))
+        ? Number(body.longitude)
+        : existing.longitude !== null && existing.longitude !== undefined
+        ? Number(existing.longitude)
+        : undefined;
+
+    // Always calculate distance_km and is_within_delivery_radius on the server; ignore browser values
+    const serverMetrics = await computeCustomerServerMetrics(supabase, nextLat, nextLng);
+
     const updatedProfile: CustomerProfile = {
       ...customerFromDB(existing),
       name: body.name !== undefined ? body.name : existing.name,
@@ -757,13 +1156,10 @@ export function createApp(): express.Express {
       cep: body.cep !== undefined ? body.cep : existing.cep,
       city: body.city !== undefined ? body.city : existing.city,
       state: body.state !== undefined ? body.state : existing.state,
-      latitude: body.latitude !== undefined ? Number(body.latitude) : existing.latitude,
-      longitude: body.longitude !== undefined ? Number(body.longitude) : existing.longitude,
-      distanceKm: body.distanceKm !== undefined ? Number(body.distanceKm) : existing.distance_km,
-      isWithinDeliveryRadius:
-        body.isWithinDeliveryRadius !== undefined
-          ? Boolean(body.isWithinDeliveryRadius)
-          : existing.is_within_delivery_radius,
+      latitude: nextLat,
+      longitude: nextLng,
+      distanceKm: serverMetrics.distanceKm,
+      isWithinDeliveryRadius: serverMetrics.isWithinDeliveryRadius,
     };
 
     const updateDBData = customerToDB(updatedProfile, newPasswordHash);
@@ -780,6 +1176,107 @@ export function createApp(): express.Express {
     }
 
     return res.json(customerFromDB(savedRow));
+  });
+
+  // ---------------------------------------------------------------------------
+  // CUSTOMER DELIVERY QUOTE: GET /customer/delivery-quote (Protected by requireCustomer)
+  // Calculates distance, radius check, and delivery fee on the server
+  // ---------------------------------------------------------------------------
+  router.get('/customer/delivery-quote', requireCustomer, async (req, res) => {
+    const customerId = (req as any).customerId;
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const [custRes, areasRes, settingsRes] = await Promise.all([
+      supabase.from('customers').select('*').eq('id', customerId).maybeSingle(),
+      supabase.from('delivery_areas').select('*').eq('active', true),
+      supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+    ]);
+
+    if (custRes.error || !custRes.data) {
+      return res.status(404).json({ error: 'Cliente não encontrado.' });
+    }
+
+    const dbCustomer = customerFromDB(custRes.data);
+    const dbAreas = (areasRes.data || []).map(deliveryAreaFromDB);
+    const dbSettings: StoreSettings = settingsRes.data?.data
+      ? sanitizePublicSettings(settingsRes.data.data)
+      : initialSettings;
+
+    const maxRadiusKm = Number(dbSettings.deliveryRadiusKm) || 5;
+    let distanceKm: number | null = null;
+    let isWithinDeliveryRadius = true;
+
+    if (
+      dbCustomer.latitude !== undefined &&
+      dbCustomer.latitude !== null &&
+      dbCustomer.longitude !== undefined &&
+      dbCustomer.longitude !== null &&
+      dbSettings.storeLatitude !== undefined &&
+      dbSettings.storeLatitude !== null &&
+      dbSettings.storeLongitude !== undefined &&
+      dbSettings.storeLongitude !== null
+    ) {
+      distanceKm = haversineKm(
+        Number(dbSettings.storeLatitude),
+        Number(dbSettings.storeLongitude),
+        Number(dbCustomer.latitude),
+        Number(dbCustomer.longitude)
+      );
+      isWithinDeliveryRadius = distanceKm <= maxRadiusKm;
+
+      // Sync customer's stored distance if outdated
+      if (
+        dbCustomer.distanceKm !== distanceKm ||
+        dbCustomer.isWithinDeliveryRadius !== isWithinDeliveryRadius
+      ) {
+        await supabase
+          .from('customers')
+          .update({
+            distance_km: distanceKm,
+            is_within_delivery_radius: isWithinDeliveryRadius,
+          })
+          .eq('id', customerId);
+      }
+    }
+
+    const requestedNh = String(req.query.neighborhood || dbCustomer.neighborhood || '')
+      .toLowerCase()
+      .trim();
+    const matchedArea = dbAreas.find((a) => a.active && a.name.toLowerCase().trim() === requestedNh);
+
+    let rawDeliveryFee = 0;
+    if (matchedArea) {
+      rawDeliveryFee = matchedArea.fee;
+    } else {
+      rawDeliveryFee = Number(dbSettings.deliveryFee) || 5.0;
+      if (dbSettings.pricePerKm && distanceKm !== null && distanceKm > 1) {
+        rawDeliveryFee += (distanceKm - 1) * Number(dbSettings.pricePerKm);
+      }
+    }
+    rawDeliveryFee = Math.round(rawDeliveryFee * 100) / 100;
+
+    const subtotalParam = req.query.subtotal !== undefined ? Number(req.query.subtotal) : null;
+    let deliveryFee = rawDeliveryFee;
+    if (
+      subtotalParam !== null &&
+      !Number.isNaN(subtotalParam) &&
+      dbSettings.freeDeliveryThreshold &&
+      subtotalParam >= Number(dbSettings.freeDeliveryThreshold)
+    ) {
+      deliveryFee = 0;
+    }
+
+    return res.json({
+      distanceKm,
+      isWithinDeliveryRadius,
+      deliveryRadiusKm: maxRadiusKm,
+      deliveryFee,
+      rawDeliveryFee,
+      freeDeliveryThreshold: Number(dbSettings.freeDeliveryThreshold) || 0,
+      latitude: dbCustomer.latitude ?? null,
+      longitude: dbCustomer.longitude ?? null,
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -833,7 +1330,7 @@ export function createApp(): express.Express {
   // COUPONS: VALIDATE (Requires Customer) & ADMIN MANAGEMENT (Requires Admin)
   // ---------------------------------------------------------------------------
   router.post('/coupons/validate', requireCustomer, async (req, res) => {
-    const { code, subtotal } = req.body || {};
+    const { code, subtotal, items } = req.body || {};
     if (!code || typeof code !== 'string') {
       return res.status(400).json({ error: 'Código de cupom obrigatório.' });
     }
@@ -866,7 +1363,25 @@ export function createApp(): express.Express {
       return res.status(400).json({ error: 'Este cupom está esgotado (limite máximo de usos atingido).' });
     }
 
-    const numSubtotal = Number(subtotal) || 0;
+    let numSubtotal = Number(subtotal) || 0;
+    if (Array.isArray(items) && items.length > 0) {
+      const { data: prodRows } = await supabase.from('products').select('*');
+      if (prodRows) {
+        const dbProds = prodRows.map(productFromDB);
+        let calculatedSub = 0;
+        for (const it of items) {
+          const sp = dbProds.find((p) => p.id === (it.productId || it.id));
+          if (sp && sp.active) {
+            const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
+            calculatedSub += getEffectivePrice(sp) * qty;
+          }
+        }
+        if (calculatedSub > 0) {
+          numSubtotal = Math.round(calculatedSub * 100) / 100;
+        }
+      }
+    }
+
     if (coupon.minOrder && numSubtotal < coupon.minOrder) {
       const formattedMin = coupon.minOrder.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
       return res.status(400).json({ error: `Pedido abaixo do mínimo de ${formattedMin} para utilizar este cupom.` });
@@ -1006,7 +1521,7 @@ export function createApp(): express.Express {
         });
       }
 
-      const products = (prodRes.data || []).map(productFromDB);
+      const products = (prodRes.data || []).map(productFromDB).map(sanitizePublicProduct);
       const deliveryAreas = (areasRes.data || []).map(deliveryAreaFromDB);
 
       return res.json({
@@ -1094,13 +1609,20 @@ export function createApp(): express.Express {
   // ---------------------------------------------------------------------------
   // PRODUCTS ROUTES
   // ---------------------------------------------------------------------------
-  router.get('/products', async (_req, res) => {
+  router.get('/products', async (req, res) => {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado.' });
 
     const { data, error } = await supabase.from('products').select('*').order('name');
     if (error) return res.status(500).json({ error: error.message });
-    res.json((data || []).map(productFromDB));
+
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+    const signed = token ? verifySignedToken(token) : null;
+    const isAdmin = signed?.role === 'admin';
+
+    const mapped = (data || []).map(productFromDB);
+    res.json(isAdmin ? mapped : mapped.map(sanitizePublicProduct));
   });
 
   router.post('/products', requireAdmin, async (req, res) => {
@@ -1122,13 +1644,14 @@ export function createApp(): express.Express {
   });
 
   // Requirement: Em PUT /api/products/:id NUNCA altere a coluna stock (ignore stock do corpo)
+  // e não apague a promoção sem querer (só altera promo_price e promo_ends_at se esses campos vierem explicitamente no corpo)
   router.put('/products/:id', requireAdmin, async (req, res) => {
     const { id } = req.params;
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
     const body = req.body || {};
-    const updateData = {
+    const updateData: Record<string, any> = {
       name: body.name,
       category: body.category,
       volume: body.volume || null,
@@ -1143,6 +1666,16 @@ export function createApp(): express.Express {
       updated_at: new Date().toISOString(),
     };
 
+    if (Object.prototype.hasOwnProperty.call(body, 'promoPrice')) {
+      updateData.promo_price =
+        body.promoPrice !== null && body.promoPrice !== undefined && Number(body.promoPrice) > 0
+          ? Number(body.promoPrice)
+          : null;
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'promoEndsAt')) {
+      updateData.promo_ends_at = body.promoEndsAt ? String(body.promoEndsAt) : null;
+    }
+
     const { data, error } = await supabase
       .from('products')
       .update(updateData)
@@ -1156,6 +1689,80 @@ export function createApp(): express.Express {
     }
 
     res.json(productFromDB(data));
+  });
+
+  // Requirement: Rotas exclusivas para gerenciar promoção do produto (sem mexer em price nem stock)
+  router.put('/admin/products/:id/promotion', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { promoPrice, promoEndsAt } = req.body || {};
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { data: existing, error: fetchErr } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (fetchErr || !existing) {
+      return res.status(404).json({ error: 'Produto não encontrado.' });
+    }
+
+    const normalPrice = Number(existing.price) || 0;
+    const numPromo = Number(promoPrice);
+
+    if (Number.isNaN(numPromo) || numPromo <= 0) {
+      return res.status(400).json({ error: 'O preço promocional deve ser maior que zero.' });
+    }
+
+    if (numPromo >= normalPrice) {
+      const formattedNormal = normalPrice.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+      return res.status(400).json({
+        error: `O preço promocional precisa ser menor que o preço normal (${formattedNormal}).`,
+      });
+    }
+
+    const cleanEndsAt = promoEndsAt && String(promoEndsAt).trim() ? new Date(promoEndsAt).toISOString() : null;
+
+    const { data: updated, error: updateErr } = await supabase
+      .from('products')
+      .update({
+        promo_price: Math.round(numPromo * 100) / 100,
+        promo_ends_at: cleanEndsAt,
+      })
+      .eq('id', id)
+      .select('*')
+      .single();
+
+    if (updateErr || !updated) {
+      console.error('[Supabase Error] product promotion update:', updateErr?.message);
+      return res.status(500).json({ error: updateErr?.message || 'Erro ao salvar promoção.' });
+    }
+
+    res.json(productFromDB(updated));
+  });
+
+  router.delete('/admin/products/:id/promotion', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { data: updated, error: updateErr } = await supabase
+      .from('products')
+      .update({
+        promo_price: null,
+        promo_ends_at: null,
+      })
+      .eq('id', id)
+      .select('*')
+      .maybeSingle();
+
+    if (updateErr || !updated) {
+      console.error('[Supabase Error] product promotion delete:', updateErr?.message);
+      return res.status(404).json({ error: updateErr?.message || 'Produto não encontrado.' });
+    }
+
+    res.json(productFromDB(updated));
   });
 
   // Requirement: Alteração de estoque manual via POST /api/products/:id/stock (decrement_stock para delta negativo e restore_stock para positivo)
@@ -1292,9 +1899,24 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
+    const parsedLat =
+      cust.latitude !== undefined && cust.latitude !== null && !Number.isNaN(Number(cust.latitude))
+        ? Number(cust.latitude)
+        : undefined;
+    const parsedLng =
+      cust.longitude !== undefined && cust.longitude !== null && !Number.isNaN(Number(cust.longitude))
+        ? Number(cust.longitude)
+        : undefined;
+
+    const serverMetrics = await computeCustomerServerMetrics(supabase, parsedLat, parsedLng);
+
     const newCust: CustomerProfile = {
       ...cust,
       id: cust.id || `cust-${Date.now()}`,
+      latitude: parsedLat,
+      longitude: parsedLng,
+      distanceKm: serverMetrics.distanceKm,
+      isWithinDeliveryRadius: serverMetrics.isWithinDeliveryRadius,
       createdAt: new Date().toISOString(),
       totalOrdersCount: 0,
       totalSpent: 0,
@@ -1319,7 +1941,27 @@ export function createApp(): express.Express {
       return res.status(404).json({ error: 'Cliente não encontrado.' });
     }
 
-    const updated: CustomerProfile = { ...customerFromDB(existing), ...req.body, id };
+    const existingMapped = customerFromDB(existing);
+    const nextLat =
+      req.body?.latitude !== undefined && req.body?.latitude !== null && !Number.isNaN(Number(req.body.latitude))
+        ? Number(req.body.latitude)
+        : existingMapped.latitude;
+    const nextLng =
+      req.body?.longitude !== undefined && req.body?.longitude !== null && !Number.isNaN(Number(req.body.longitude))
+        ? Number(req.body.longitude)
+        : existingMapped.longitude;
+
+    const serverMetrics = await computeCustomerServerMetrics(supabase, nextLat, nextLng);
+
+    const updated: CustomerProfile = {
+      ...existingMapped,
+      ...req.body,
+      id,
+      latitude: nextLat,
+      longitude: nextLng,
+      distanceKm: serverMetrics.distanceKm,
+      isWithinDeliveryRadius: serverMetrics.isWithinDeliveryRadius,
+    };
     const { data: saved, error } = await supabase
       .from('customers')
       .update(customerToDB(updated))
@@ -1372,8 +2014,23 @@ export function createApp(): express.Express {
     const isAdmin = signed?.role === 'admin';
     const isCustomer = signed?.role === 'customer' && Boolean(signed.customerId);
 
+    // 1. Fetch current products, delivery areas, settings directly from Supabase
+    const [prodRes, areasRes, settingsRes] = await Promise.all([
+      supabase.from('products').select('*'),
+      supabase.from('delivery_areas').select('*').eq('active', true),
+      supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+    ]);
+
+    if (prodRes.error) return res.status(500).json({ error: prodRes.error.message });
+    const dbProducts = (prodRes.data || []).map(productFromDB);
+    const dbAreas = (areasRes.data || []).map(deliveryAreaFromDB);
+    const dbSettings = settingsRes.data?.data ? sanitizePublicSettings(settingsRes.data.data) : initialSettings;
+
+    const maxRadiusKm = Number(dbSettings.deliveryRadiusKm) || 5;
     let customerId: string | undefined = undefined;
     let customerData: any = null;
+    let serverDistanceKm: number | undefined = undefined;
+    let serverIsWithinRadius: boolean | undefined = undefined;
 
     if (rawOrder.source === 'balcao' && isAdmin) {
       // Admin POS sale
@@ -1407,6 +2064,27 @@ export function createApp(): express.Express {
       }
 
       const dbCustomer = customerFromDB(custRow);
+
+      // Calculate distance strictly from the customer's saved DB coordinates (never from req.body)
+      if (
+        dbCustomer.latitude !== undefined &&
+        dbCustomer.latitude !== null &&
+        dbCustomer.longitude !== undefined &&
+        dbCustomer.longitude !== null &&
+        dbSettings.storeLatitude !== undefined &&
+        dbSettings.storeLatitude !== null &&
+        dbSettings.storeLongitude !== undefined &&
+        dbSettings.storeLongitude !== null
+      ) {
+        serverDistanceKm = haversineKm(
+          Number(dbSettings.storeLatitude),
+          Number(dbSettings.storeLongitude),
+          Number(dbCustomer.latitude),
+          Number(dbCustomer.longitude)
+        );
+        serverIsWithinRadius = serverDistanceKm <= maxRadiusKm;
+      }
+
       // Use customer data directly from the database by the token's id
       customerData = {
         name: dbCustomer.name,
@@ -1420,24 +2098,12 @@ export function createApp(): express.Express {
         cep: dbCustomer.cep || rawOrder.customer?.cep || undefined,
         city: dbCustomer.city || rawOrder.customer?.city || undefined,
         state: dbCustomer.state || rawOrder.customer?.state || undefined,
-        latitude: dbCustomer.latitude ?? rawOrder.customer?.latitude,
-        longitude: dbCustomer.longitude ?? rawOrder.customer?.longitude,
-        distanceKm: dbCustomer.distanceKm ?? rawOrder.customer?.distanceKm,
-        isWithinDeliveryRadius: dbCustomer.isWithinDeliveryRadius ?? rawOrder.customer?.isWithinDeliveryRadius,
+        latitude: dbCustomer.latitude,
+        longitude: dbCustomer.longitude,
+        distanceKm: serverDistanceKm,
+        isWithinDeliveryRadius: serverIsWithinRadius,
       };
     }
-
-    // 1. Fetch current products, delivery areas, settings directly from Supabase
-    const [prodRes, areasRes, settingsRes] = await Promise.all([
-      supabase.from('products').select('*'),
-      supabase.from('delivery_areas').select('*').eq('active', true),
-      supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
-    ]);
-
-    if (prodRes.error) return res.status(500).json({ error: prodRes.error.message });
-    const dbProducts = (prodRes.data || []).map(productFromDB);
-    const dbAreas = (areasRes.data || []).map(deliveryAreaFromDB);
-    const dbSettings = settingsRes.data?.data ? sanitizePublicSettings(settingsRes.data.data) : initialSettings;
 
     // 2. Validate items and recalculate subtotal
     let recalculatedSubtotal = 0;
@@ -1459,14 +2125,16 @@ export function createApp(): express.Express {
         });
       }
 
-      const itemTotal = serverProduct.price * requestedQty;
+      const effectivePrice = getEffectivePrice(serverProduct);
+      const itemTotal = effectivePrice * requestedQty;
       recalculatedSubtotal += itemTotal;
 
       validatedItems.push({
         productId: serverProduct.id,
         name: serverProduct.name,
         volume: serverProduct.volume,
-        price: serverProduct.price,
+        price: effectivePrice,
+        originalPrice: serverProduct.price,
         costPrice: serverProduct.costPrice,
         quantity: requestedQty,
         isCold: serverProduct.isCold,
@@ -1478,11 +2146,23 @@ export function createApp(): express.Express {
       });
     }
 
-    // 3. Recalculate Delivery Fee
+    // 3. Recalculate Delivery Fee & Enforce Delivery Radius on Server
     const deliveryType = rawOrder.deliveryType === 'retirada' ? 'retirada' : 'delivery';
     let deliveryFee = 0;
 
     if (deliveryType === 'delivery') {
+      // Entrega exige localização confirmada (sem coordenada não dá para checar o raio)
+      if (rawOrder.source !== 'balcao' && serverDistanceKm === undefined) {
+        return res.status(400).json({
+          error: 'Confirme sua localização no mapa (Meus dados > Endereço) antes de pedir entrega, ou escolha Retirar no Depósito.',
+        });
+      }
+      if (rawOrder.source !== 'balcao' && serverDistanceKm !== undefined && serverDistanceKm > maxRadiusKm) {
+        return res.status(400).json({
+          error: `Endereço fora do raio de entrega de ${maxRadiusKm} km. Escolha Retirar no Depósito.`,
+        });
+      }
+
       const customerNh = (customerData.neighborhood || '').toLowerCase().trim();
       const matchedArea = dbAreas.find((a) => a.active && a.name.toLowerCase().trim() === customerNh);
 
@@ -1490,13 +2170,13 @@ export function createApp(): express.Express {
         deliveryFee = matchedArea.fee;
       } else {
         deliveryFee = dbSettings.deliveryFee || 5.0;
-        if (dbSettings.pricePerKm && customerData.distanceKm) {
-          const dist = Number(customerData.distanceKm);
-          if (dist > 1) {
-            deliveryFee += (dist - 1) * dbSettings.pricePerKm;
+        if (dbSettings.pricePerKm && serverDistanceKm !== undefined) {
+          if (serverDistanceKm > 1) {
+            deliveryFee += (serverDistanceKm - 1) * dbSettings.pricePerKm;
           }
         }
       }
+      deliveryFee = Math.round(deliveryFee * 100) / 100;
 
       if (dbSettings.freeDeliveryThreshold && recalculatedSubtotal >= dbSettings.freeDeliveryThreshold) {
         deliveryFee = 0;

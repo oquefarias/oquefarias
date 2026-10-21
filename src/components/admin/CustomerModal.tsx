@@ -17,8 +17,9 @@ import {
   fetchAddressByCep,
   fetchCoordinatesByCepBrasilApi,
   calculateDistanceKm,
-  geocodeAddress,
+  resolveFullAddressOnServer,
 } from '../../utils/geo';
+import { AddressPinMap } from '../AddressPinMap';
 
 interface CustomerModalProps {
   isOpen: boolean;
@@ -51,6 +52,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
   // Geographic and delivery radius state
   const [lat, setLat] = useState<number | undefined>(undefined);
   const [lng, setLng] = useState<number | undefined>(undefined);
+  const [geoPrecisao, setGeoPrecisao] = useState<string | null>(null);
   const [distanceKm, setDistanceKm] = useState<number | null>(null);
   const [isWithinRadius, setIsWithinRadius] = useState<boolean | null>(null);
 
@@ -75,6 +77,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
       setReference(customer.reference || '');
       setLat(customer.latitude);
       setLng(customer.longitude);
+      setGeoPrecisao(null);
       setDistanceKm(customer.distanceKm ?? null);
       setIsWithinRadius(customer.isWithinDeliveryRadius ?? null);
       setCepStatusMessage(null);
@@ -91,6 +94,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
       setReference('');
       setLat(undefined);
       setLng(undefined);
+      setGeoPrecisao(null);
       setDistanceKm(null);
       setIsWithinRadius(null);
       setCepStatusMessage(null);
@@ -150,10 +154,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
     setCepStatusMessage(null);
 
     try {
-      // 1. Fetch address details from ViaCEP
       const viaCep = await fetchAddressByCep(rawDigits);
-
-      // 2. Fetch coordinates from BrasilAPI v2
       const brasilApi = await fetchCoordinatesByCepBrasilApi(rawDigits);
 
       if (!viaCep && !brasilApi) {
@@ -164,39 +165,36 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
         return;
       }
 
-      const logradouro = viaCep?.logradouro || brasilApi?.street || '';
-      const bairro = viaCep?.bairro || brasilApi?.neighborhood || '';
-      const localidade = viaCep?.localidade || brasilApi?.city || '';
-      const uf = viaCep?.uf || brasilApi?.state || '';
+      const logradouro = viaCep?.logradouro || brasilApi?.street || address;
+      const bairro = viaCep?.bairro || brasilApi?.neighborhood || neighborhood;
+      const localidade = viaCep?.localidade || brasilApi?.city || city;
+      const uf = viaCep?.uf || brasilApi?.state || state;
 
       if (logradouro) setAddress(logradouro);
       if (bairro) setNeighborhood(bairro);
       if (localidade) setCity(localidade);
       if (uf) setState(uf);
 
-      let foundLat = brasilApi?.lat;
-      let foundLng = brasilApi?.lng;
+      const resolved = await resolveFullAddressOnServer({
+        rua: logradouro,
+        numero: number.trim(),
+        bairro,
+        cidade: localidade,
+        uf,
+        cep: rawDigits,
+      });
 
-      // If BrasilAPI didn't have coordinates, geocode via Nominatim
-      if ((foundLat === undefined || foundLng === undefined) && (logradouro || bairro || localidade)) {
-        const query = `${logradouro} ${bairro} ${localidade} ${uf} Brasil`;
-        const geo = await geocodeAddress(query);
-        if (geo) {
-          foundLat = geo.lat;
-          foundLng = geo.lng;
-        }
-      }
-
-      if (foundLat !== undefined && foundLng !== undefined) {
-        setLat(foundLat);
-        setLng(foundLng);
+      if (resolved) {
+        setLat(resolved.latitude);
+        setLng(resolved.longitude);
+        setGeoPrecisao(resolved.precisao);
 
         if (settings.storeLatitude && settings.storeLongitude) {
           const dist = calculateDistanceKm(
             settings.storeLatitude,
             settings.storeLongitude,
-            foundLat,
-            foundLng
+            resolved.latitude,
+            resolved.longitude
           );
           setDistanceKm(dist);
           const maxRadius = settings.deliveryRadiusKm || 5;
@@ -204,7 +202,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
           setIsWithinRadius(inside);
 
           setCepStatusMessage({
-            type: 'success',
+            type: resolved.precisao === 'aproximada' ? 'warn' : 'success',
             text: inside
               ? `Endereço localizado! Distância de ${dist} km (DENTRO do raio de ${maxRadius} km).`
               : `Endereço localizado! Distância de ${dist} km (ATENÇÃO: Fora do raio de ${maxRadius} km).`,
@@ -231,26 +229,23 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
     }
   };
 
-  // When number is modified, optionally refine coordinates
+  // When number is modified, refine coordinates via POST /api/geo/resolve
   const handleNumberBlur = async () => {
-    if (!number.trim() || !address.trim() || !city.trim()) return;
+    const cleanCepDigits = cep.replace(/\D/g, '');
+    if (!number.trim() || (!address.trim() && cleanCepDigits.length !== 8)) return;
     try {
-      const fullQuery = `${address}, ${number}, ${neighborhood || ''}, ${city}, ${state || ''}, Brasil`;
-      const geo = await geocodeAddress(fullQuery);
-      if (geo) {
-        setLat(geo.lat);
-        setLng(geo.lng);
-        if (settings.storeLatitude && settings.storeLongitude) {
-          const dist = calculateDistanceKm(
-            settings.storeLatitude,
-            settings.storeLongitude,
-            geo.lat,
-            geo.lng
-          );
-          setDistanceKm(dist);
-          const maxRadius = settings.deliveryRadiusKm || 5;
-          setIsWithinRadius(dist <= maxRadius);
-        }
+      const resolved = await resolveFullAddressOnServer({
+        rua: address.trim(),
+        numero: number.trim(),
+        bairro: neighborhood.trim(),
+        cidade: city.trim(),
+        uf: state.trim(),
+        cep: cleanCepDigits,
+      });
+      if (resolved) {
+        setLat(resolved.latitude);
+        setLng(resolved.longitude);
+        setGeoPrecisao(resolved.precisao);
       }
     } catch {
       // Ignored
@@ -512,6 +507,19 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
                 />
               </div>
             </div>
+
+            {lat !== undefined && lng !== undefined && (
+              <AddressPinMap
+                latitude={lat}
+                longitude={lng}
+                precisao={geoPrecisao}
+                onChange={(newLat, newLng) => {
+                  setLat(newLat);
+                  setLng(newLng);
+                  setGeoPrecisao('exata');
+                }}
+              />
+            )}
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <div>
