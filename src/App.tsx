@@ -41,7 +41,7 @@ export default function App() {
   const [pinError, setPinError] = useState<string>('');
   const [isVerifying, setIsVerifying] = useState<boolean>(false);
 
-  // Listen to popstate (browser back/forward) & keyboard shortcut for the owner (Alt + C)
+  // Listen to popstate (browser back/forward), keyboard shortcut (Alt + C), & admin session expiration
   useEffect(() => {
     const handleLocationChange = () => {
       setIsAdmRoute(checkIsAdmRoute());
@@ -57,13 +57,35 @@ export default function App() {
       }
     };
 
+    const handleAdminExpired = (e: Event) => {
+      const customEvent = e as CustomEvent<{ message?: string }>;
+      setIsAdminAuth(false);
+      setPinError(
+        customEvent.detail?.message ||
+          api.getAdminSessionExpiredMessage() ||
+          'Sua sessão expirou. Digite o PIN novamente.'
+      );
+    };
+
     window.addEventListener('popstate', handleLocationChange);
     window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('deposito_admin_expired', handleAdminExpired);
     return () => {
       window.removeEventListener('popstate', handleLocationChange);
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('deposito_admin_expired', handleAdminExpired);
     };
   }, []);
+
+  useEffect(() => {
+    const expiredMsg = api.getAdminSessionExpiredMessage();
+    if (!api.isAdminAuthenticated() && isAdminAuth) {
+      setIsAdminAuth(false);
+      if (expiredMsg) {
+        setPinError(expiredMsg);
+      }
+    }
+  }, [isAdminAuth]);
 
   useEffect(() => {
     api.syncWithBackend();
@@ -90,6 +112,7 @@ export default function App() {
     setIsVerifying(false);
 
     if (res.success) {
+      api.clearAdminSessionExpiredMessage();
       setPinInput('');
       setIsAdminAuth(true);
     } else {
@@ -120,7 +143,7 @@ export default function App() {
   // =====================================================================
   if (isAdmRoute) {
     return (
-      <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col font-sans antialiased selection:bg-amber-500 selection:text-white">
+      <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col font-sans antialiased selection:bg-amber-500 selection:text-white overflow-x-hidden">
         {/* Admin Navbar */}
         <Navbar
           isAdmin={isAdminAuth}
@@ -131,7 +154,7 @@ export default function App() {
           onPreviewCustomerView={() => navigateTo('/')}
         />
 
-        <main className="flex-1">
+        <main className="flex-1 min-w-0">
           {isAdminAuth ? (
             /* Authenticated Admin Dashboard */
             <AdminDashboard
@@ -240,7 +263,7 @@ export default function App() {
   // ZERO botões de admin, ZERO senhas, ZERO risco de clientes acessarem!
   // =====================================================================
   return (
-    <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col font-sans antialiased selection:bg-amber-500 selection:text-white">
+    <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col font-sans antialiased selection:bg-amber-500 selection:text-white overflow-x-hidden">
       {/* Customer Header - Clean e-commerce */}
       <Navbar
         isAdmin={false}
@@ -251,7 +274,7 @@ export default function App() {
       />
 
       {/* Customer Storefront */}
-      <main className="flex-1">
+      <main className="flex-1 min-w-0">
         <CustomerStorefront
           products={products}
           settings={settings}

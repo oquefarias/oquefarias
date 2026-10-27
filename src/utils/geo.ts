@@ -21,6 +21,69 @@ export function calculateDistanceKm(
   return Math.round(d * 100) / 100; // 2 decimal places
 }
 
+/**
+ * Calculates the great-circle distance between two points in meters (rounded integer).
+ */
+export function calculateDistanceMeters(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
+  const R = 6371000; // Earth's radius in meters
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c);
+}
+
+/**
+ * Checks whether the pin offset from the geocoded address exceeds the allowed threshold.
+ * - 'exata': max 300m
+ * - 'rua': max 800m
+ * - 'aproximada': no hard limit
+ */
+export function checkPinOffsetLimit(
+  geoLat: number | null | undefined,
+  geoLng: number | null | undefined,
+  pinLat: number | null | undefined,
+  pinLng: number | null | undefined,
+  precisao: string | null | undefined
+): { offsetM: number | null; maxOffsetM: number | null; isTooFar: boolean } {
+  if (
+    geoLat === undefined ||
+    geoLat === null ||
+    Number.isNaN(Number(geoLat)) ||
+    geoLng === undefined ||
+    geoLng === null ||
+    Number.isNaN(Number(geoLng)) ||
+    pinLat === undefined ||
+    pinLat === null ||
+    Number.isNaN(Number(pinLat)) ||
+    pinLng === undefined ||
+    pinLng === null ||
+    Number.isNaN(Number(pinLng))
+  ) {
+    return { offsetM: null, maxOffsetM: null, isTooFar: false };
+  }
+
+  const offsetM = calculateDistanceMeters(
+    Number(geoLat),
+    Number(geoLng),
+    Number(pinLat),
+    Number(pinLng)
+  );
+  const maxOffsetM =
+    precisao === 'exata' ? 300 : precisao === 'rua' ? 800 : null;
+  const isTooFar = maxOffsetM !== null && offsetM > maxOffsetM;
+
+  return { offsetM, maxOffsetM, isTooFar };
+}
+
 function toRad(degrees: number): number {
   return (degrees * Math.PI) / 180;
 }

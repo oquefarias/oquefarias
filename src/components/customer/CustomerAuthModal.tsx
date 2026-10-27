@@ -22,6 +22,7 @@ import {
   fetchCoordinatesByCepBrasilApi,
   calculateDistanceKm,
   resolveFullAddressOnServer,
+  checkPinOffsetLimit,
 } from '../../utils/geo';
 import { AddressPinMap } from '../AddressPinMap';
 
@@ -69,7 +70,10 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
   const [lat, setLat] = useState<number | undefined>(undefined);
   const [lng, setLng] = useState<number | undefined>(undefined);
+  const [geoLat, setGeoLat] = useState<number | undefined>(undefined);
+  const [geoLng, setGeoLng] = useState<number | undefined>(undefined);
   const [geoPrecisao, setGeoPrecisao] = useState<string | null>(null);
+  const [isPinManuallyAdjusted, setIsPinManuallyAdjusted] = useState<boolean>(false);
   const [distanceKm, setDistanceKm] = useState<number | null>(null);
   const [isWithinRadius, setIsWithinRadius] = useState<boolean | null>(null);
 
@@ -97,7 +101,18 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setReference(currentCustomer.reference || '');
       setLat(currentCustomer.latitude);
       setLng(currentCustomer.longitude);
-      setGeoPrecisao(null);
+      setGeoLat(
+        currentCustomer.geoLatitude !== undefined && currentCustomer.geoLatitude !== null
+          ? Number(currentCustomer.geoLatitude)
+          : currentCustomer.latitude
+      );
+      setGeoLng(
+        currentCustomer.geoLongitude !== undefined && currentCustomer.geoLongitude !== null
+          ? Number(currentCustomer.geoLongitude)
+          : currentCustomer.longitude
+      );
+      setGeoPrecisao(currentCustomer.geoPrecision || null);
+      setIsPinManuallyAdjusted(false);
       setDistanceKm(currentCustomer.distanceKm ?? null);
       setIsWithinRadius(currentCustomer.isWithinDeliveryRadius ?? null);
     } else {
@@ -117,7 +132,10 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setReference('');
       setLat(undefined);
       setLng(undefined);
+      setGeoLat(undefined);
+      setGeoLng(undefined);
       setGeoPrecisao(null);
+      setIsPinManuallyAdjusted(false);
       setDistanceKm(null);
       setIsWithinRadius(null);
       setLoginError('');
@@ -126,6 +144,15 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   }, [currentCustomer, isOpen, deliveryAreas]);
 
   if (!isOpen) return null;
+
+  const pinCheck = checkPinOffsetLimit(
+    geoLat ?? lat,
+    geoLng ?? lng,
+    lat,
+    lng,
+    geoPrecisao || 'rua'
+  );
+  const isPinTooFar = pinCheck.isTooFar;
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -159,18 +186,21 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       formatted = `${val.slice(0, 5)}-${val.slice(5)}`;
     }
     setCep(formatted);
+    setIsPinManuallyAdjusted(false);
 
     if (val.length === 8) {
       executeCepSearch(val);
     }
   };
 
-  const updateCoordinatesAndDistance = (newLat: number, newLng: number, precisaoVal?: string | null) => {
+  const applyServerGeocode = (newLat: number, newLng: number, precisaoVal: string) => {
+    setGeoLat(newLat);
+    setGeoLng(newLng);
+    setGeoPrecisao(precisaoVal);
     setLat(newLat);
     setLng(newLng);
-    if (precisaoVal !== undefined) {
-      setGeoPrecisao(precisaoVal);
-    }
+    setIsPinManuallyAdjusted(false);
+
     if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
       const dist = calculateDistanceKm(
         settings.storeLatitude,
@@ -180,8 +210,24 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       );
       setDistanceKm(dist);
       const maxRadius = settings.deliveryRadiusKm || 5;
-      const inside = dist <= maxRadius;
-      setIsWithinRadius(inside);
+      setIsWithinRadius(dist <= maxRadius);
+    }
+  };
+
+  const updatePinOnly = (newLat: number, newLng: number) => {
+    setLat(newLat);
+    setLng(newLng);
+    setIsPinManuallyAdjusted(true);
+    if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
+      const dist = calculateDistanceKm(
+        settings.storeLatitude,
+        settings.storeLongitude,
+        newLat,
+        newLng
+      );
+      setDistanceKm(dist);
+      const maxRadius = settings.deliveryRadiusKm || 5;
+      setIsWithinRadius(dist <= maxRadius);
     }
   };
 
@@ -195,7 +241,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   }) => {
     const resolved = await resolveFullAddressOnServer(params);
     if (resolved) {
-      updateCoordinatesAndDistance(resolved.latitude, resolved.longitude, resolved.precisao);
+      applyServerGeocode(resolved.latitude, resolved.longitude, resolved.precisao);
       if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
         const dist = calculateDistanceKm(
           settings.storeLatitude,
@@ -260,7 +306,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       });
 
       if (resolved) {
-        updateCoordinatesAndDistance(resolved.latitude, resolved.longitude, resolved.precisao);
+        applyServerGeocode(resolved.latitude, resolved.longitude, resolved.precisao);
         if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
           const dist = calculateDistanceKm(
             settings.storeLatitude,
@@ -298,7 +344,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     }
   };
 
-  const handleNumberBlur = async () => {
+  const handleAddressOrNumberBlur = async () => {
     const cleanCepDigits = cep.replace(/\D/g, '');
     if (!address.trim() && cleanCepDigits.length !== 8) return;
     if (!number.trim()) return;
@@ -342,25 +388,13 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       return;
     }
 
+    if (isPinTooFar) {
+      setRegisterError('Alfinete muito longe do endereço digitado.');
+      return;
+    }
+
     setIsSubmittingRegister(true);
     try {
-      let finalLat = lat;
-      let finalLng = lng;
-      if (finalLat === undefined || finalLng === undefined) {
-        const resolved = await resolveFullAddressOnServer({
-          rua: address.trim(),
-          numero: number.trim(),
-          bairro: neighborhood.trim(),
-          cidade: city.trim(),
-          uf: state.trim(),
-          cep: cep.replace(/\D/g, ''),
-        });
-        if (resolved) {
-          finalLat = resolved.latitude;
-          finalLng = resolved.longitude;
-        }
-      }
-
       const saved = await api.registerCustomer({
         name: name.trim(),
         email: email.trim().toLowerCase(),
@@ -374,8 +408,8 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
         state: state.trim(),
         complement: complement.trim(),
         reference: reference.trim(),
-        latitude: finalLat,
-        longitude: finalLng,
+        latitude: isPinManuallyAdjusted ? lat : undefined,
+        longitude: isPinManuallyAdjusted ? lng : undefined,
       });
 
       if (saved?.id) {
@@ -403,25 +437,13 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       return;
     }
 
+    if (isPinTooFar) {
+      setRegisterError('Alfinete muito longe do endereço digitado.');
+      return;
+    }
+
     setIsSubmittingRegister(true);
     try {
-      let finalLat = lat;
-      let finalLng = lng;
-      if (finalLat === undefined || finalLng === undefined) {
-        const resolved = await resolveFullAddressOnServer({
-          rua: address.trim(),
-          numero: number.trim(),
-          bairro: neighborhood.trim(),
-          cidade: city.trim(),
-          uf: state.trim(),
-          cep: cep.replace(/\D/g, ''),
-        });
-        if (resolved) {
-          finalLat = resolved.latitude;
-          finalLng = resolved.longitude;
-        }
-      }
-
       const updated = await api.updateCustomerMe({
         name: name.trim(),
         phone: phone.trim(),
@@ -434,8 +456,8 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
         state: state.trim(),
         complement: complement.trim(),
         reference: reference.trim(),
-        latitude: finalLat,
-        longitude: finalLng,
+        latitude: isPinManuallyAdjusted ? lat : undefined,
+        longitude: isPinManuallyAdjusted ? lng : undefined,
       });
 
       if (updated?.id) {
@@ -749,7 +771,11 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                     required
                     placeholder="Ex: Rua das Flores"
                     value={address}
-                    onChange={(e) => setAddress(e.target.value)}
+                    onChange={(e) => {
+                      setAddress(e.target.value);
+                      setIsPinManuallyAdjusted(false);
+                    }}
+                    onBlur={handleAddressOrNumberBlur}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
                   />
                 </div>
@@ -760,8 +786,11 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                     required
                     placeholder="123"
                     value={number}
-                    onChange={(e) => setNumber(e.target.value)}
-                    onBlur={handleNumberBlur}
+                    onChange={(e) => {
+                      setNumber(e.target.value);
+                      setIsPinManuallyAdjusted(false);
+                    }}
+                    onBlur={handleAddressOrNumberBlur}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
                   />
                 </div>
@@ -771,9 +800,11 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                 <AddressPinMap
                   latitude={lat}
                   longitude={lng}
+                  geoLatitude={geoLat ?? lat}
+                  geoLongitude={geoLng ?? lng}
                   precisao={geoPrecisao}
                   onChange={(newLat, newLng) => {
-                    updateCoordinatesAndDistance(newLat, newLng, 'exata');
+                    updatePinOnly(newLat, newLng);
                   }}
                 />
               )}
@@ -785,7 +816,10 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                     type="text"
                     placeholder="Ex: Centro"
                     value={neighborhood}
-                    onChange={(e) => setNeighborhood(e.target.value)}
+                    onChange={(e) => {
+                      setNeighborhood(e.target.value);
+                      setIsPinManuallyAdjusted(false);
+                    }}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium"
                     required
                   />
@@ -809,7 +843,10 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                     type="text"
                     placeholder="São Paulo"
                     value={city}
-                    onChange={(e) => setCity(e.target.value)}
+                    onChange={(e) => {
+                      setCity(e.target.value);
+                      setIsPinManuallyAdjusted(false);
+                    }}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
                   />
                 </div>
@@ -820,7 +857,10 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                     maxLength={2}
                     placeholder="SP"
                     value={state}
-                    onChange={(e) => setState(e.target.value.toUpperCase())}
+                    onChange={(e) => {
+                      setState(e.target.value.toUpperCase());
+                      setIsPinManuallyAdjusted(false);
+                    }}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl uppercase font-bold"
                   />
                 </div>
@@ -841,8 +881,8 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
             <div className="pt-2">
               <button
                 type="submit"
-                disabled={isSubmittingRegister}
-                className="w-full py-3 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
+                disabled={isSubmittingRegister || isPinTooFar}
+                className="w-full py-3 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed text-neutral-950 font-black text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
                 {isSubmittingRegister ? (
                   <>

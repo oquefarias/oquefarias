@@ -18,6 +18,7 @@ import {
   fetchCoordinatesByCepBrasilApi,
   calculateDistanceKm,
   resolveFullAddressOnServer,
+  checkPinOffsetLimit,
 } from '../../utils/geo';
 import { AddressPinMap } from '../AddressPinMap';
 
@@ -52,7 +53,10 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
   // Geographic and delivery radius state
   const [lat, setLat] = useState<number | undefined>(undefined);
   const [lng, setLng] = useState<number | undefined>(undefined);
+  const [geoLat, setGeoLat] = useState<number | undefined>(undefined);
+  const [geoLng, setGeoLng] = useState<number | undefined>(undefined);
   const [geoPrecisao, setGeoPrecisao] = useState<string | null>(null);
+  const [isPinManuallyAdjusted, setIsPinManuallyAdjusted] = useState<boolean>(false);
   const [distanceKm, setDistanceKm] = useState<number | null>(null);
   const [isWithinRadius, setIsWithinRadius] = useState<boolean | null>(null);
 
@@ -77,7 +81,18 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
       setReference(customer.reference || '');
       setLat(customer.latitude);
       setLng(customer.longitude);
-      setGeoPrecisao(null);
+      setGeoLat(
+        customer.geoLatitude !== undefined && customer.geoLatitude !== null
+          ? Number(customer.geoLatitude)
+          : customer.latitude
+      );
+      setGeoLng(
+        customer.geoLongitude !== undefined && customer.geoLongitude !== null
+          ? Number(customer.geoLongitude)
+          : customer.longitude
+      );
+      setGeoPrecisao(customer.geoPrecision || null);
+      setIsPinManuallyAdjusted(false);
       setDistanceKm(customer.distanceKm ?? null);
       setIsWithinRadius(customer.isWithinDeliveryRadius ?? null);
       setCepStatusMessage(null);
@@ -94,7 +109,10 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
       setReference('');
       setLat(undefined);
       setLng(undefined);
+      setGeoLat(undefined);
+      setGeoLng(undefined);
       setGeoPrecisao(null);
+      setIsPinManuallyAdjusted(false);
       setDistanceKm(null);
       setIsWithinRadius(null);
       setCepStatusMessage(null);
@@ -123,6 +141,15 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
 
   if (!isOpen) return null;
 
+  const pinCheck = checkPinOffsetLimit(
+    geoLat ?? lat,
+    geoLng ?? lng,
+    lat,
+    lng,
+    geoPrecisao || 'rua'
+  );
+  const isPinTooFar = pinCheck.isTooFar;
+
   // Format and search CEP
   const handleCepChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     let val = e.target.value.replace(/\D/g, '');
@@ -133,6 +160,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
       formatted = `${val.slice(0, 5)}-${val.slice(5)}`;
     }
     setCep(formatted);
+    setIsPinManuallyAdjusted(false);
 
     // Auto-search when 8 digits are typed
     if (val.length === 8) {
@@ -185,9 +213,12 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
       });
 
       if (resolved) {
+        setGeoLat(resolved.latitude);
+        setGeoLng(resolved.longitude);
         setLat(resolved.latitude);
         setLng(resolved.longitude);
         setGeoPrecisao(resolved.precisao);
+        setIsPinManuallyAdjusted(false);
 
         if (settings.storeLatitude && settings.storeLongitude) {
           const dist = calculateDistanceKm(
@@ -229,8 +260,8 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
     }
   };
 
-  // When number is modified, refine coordinates via POST /api/geo/resolve
-  const handleNumberBlur = async () => {
+  // When street or number is modified, refine coordinates via POST /api/geo/resolve
+  const handleAddressOrNumberBlur = async () => {
     const cleanCepDigits = cep.replace(/\D/g, '');
     if (!number.trim() || (!address.trim() && cleanCepDigits.length !== 8)) return;
     try {
@@ -243,31 +274,41 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
         cep: cleanCepDigits,
       });
       if (resolved) {
+        setGeoLat(resolved.latitude);
+        setGeoLng(resolved.longitude);
         setLat(resolved.latitude);
         setLng(resolved.longitude);
         setGeoPrecisao(resolved.precisao);
+        setIsPinManuallyAdjusted(false);
       }
     } catch {
       // Ignored
     }
   };
 
+  const [formError, setFormError] = useState<string>('');
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setFormError('');
     if (!name.trim()) {
-      alert('Por favor, informe o nome do cliente.');
+      setFormError('Por favor, informe o nome do cliente.');
       return;
     }
     if (!phone.trim()) {
-      alert('Por favor, informe o telefone/WhatsApp do cliente.');
+      setFormError('Por favor, informe o telefone/WhatsApp do cliente.');
       return;
     }
     if (!address.trim()) {
-      alert('Por favor, informe a rua ou consulte pelo CEP.');
+      setFormError('Por favor, informe a rua ou consulte pelo CEP.');
       return;
     }
     if (!number.trim()) {
-      alert('Por favor, informe o número do imóvel.');
+      setFormError('Por favor, informe o número do imóvel.');
+      return;
+    }
+    if (isPinTooFar) {
+      setFormError('Alfinete muito longe do endereço digitado.');
       return;
     }
 
@@ -285,14 +326,14 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
         state: state.trim(),
         complement: complement.trim(),
         reference: reference.trim(),
-        latitude: lat,
-        longitude: lng,
+        latitude: isPinManuallyAdjusted ? lat : undefined,
+        longitude: isPinManuallyAdjusted ? lng : undefined,
         distanceKm: distanceKm ?? undefined,
         isWithinDeliveryRadius: isWithinRadius ?? undefined,
       });
       onClose();
-    } catch (err) {
-      alert('Erro ao salvar o cliente. Tente novamente.');
+    } catch (err: any) {
+      setFormError(err?.message || 'Erro ao salvar o cliente. Tente novamente.');
       console.error(err);
     } finally {
       setIsSubmitting(false);
@@ -328,6 +369,12 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
 
         {/* Form Body */}
         <form onSubmit={handleSubmit} className="p-6 space-y-4 text-xs">
+          {formError && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-red-700 font-bold flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-red-600" />
+              <span>{formError}</span>
+            </div>
+          )}
           {/* 1. Nome e Telefone */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
@@ -487,7 +534,11 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
                   required
                   placeholder="Ex: Rua das Flores"
                   value={address}
-                  onChange={(e) => setAddress(e.target.value)}
+                  onChange={(e) => {
+                    setAddress(e.target.value);
+                    setIsPinManuallyAdjusted(false);
+                  }}
+                  onBlur={handleAddressOrNumberBlur}
                   className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium focus:border-amber-500 outline-none"
                 />
               </div>
@@ -501,8 +552,11 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
                   required
                   placeholder="123"
                   value={number}
-                  onChange={(e) => setNumber(e.target.value)}
-                  onBlur={handleNumberBlur}
+                  onChange={(e) => {
+                    setNumber(e.target.value);
+                    setIsPinManuallyAdjusted(false);
+                  }}
+                  onBlur={handleAddressOrNumberBlur}
                   className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium focus:border-amber-500 outline-none"
                 />
               </div>
@@ -512,11 +566,13 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
               <AddressPinMap
                 latitude={lat}
                 longitude={lng}
+                geoLatitude={geoLat ?? lat}
+                geoLongitude={geoLng ?? lng}
                 precisao={geoPrecisao}
                 onChange={(newLat, newLng) => {
                   setLat(newLat);
                   setLng(newLng);
-                  setGeoPrecisao('exata');
+                  setIsPinManuallyAdjusted(true);
                 }}
               />
             )}
@@ -531,7 +587,10 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
                   required
                   placeholder="Ex: Centro"
                   value={neighborhood}
-                  onChange={(e) => setNeighborhood(e.target.value)}
+                  onChange={(e) => {
+                    setNeighborhood(e.target.value);
+                    setIsPinManuallyAdjusted(false);
+                  }}
                   className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium focus:border-amber-500 outline-none"
                 />
               </div>
@@ -544,7 +603,10 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
                   type="text"
                   placeholder="Ex: São Paulo"
                   value={city}
-                  onChange={(e) => setCity(e.target.value)}
+                  onChange={(e) => {
+                    setCity(e.target.value);
+                    setIsPinManuallyAdjusted(false);
+                  }}
                   className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium focus:border-amber-500 outline-none"
                 />
               </div>
@@ -558,7 +620,10 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
                   maxLength={2}
                   placeholder="SP"
                   value={state}
-                  onChange={(e) => setState(e.target.value.toUpperCase())}
+                  onChange={(e) => {
+                    setState(e.target.value.toUpperCase());
+                    setIsPinManuallyAdjusted(false);
+                  }}
                   className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium uppercase font-mono focus:border-amber-500 outline-none"
                 />
               </div>
@@ -606,8 +671,8 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
 
             <button
               type="submit"
-              disabled={isSubmitting}
-              className="px-6 py-2.5 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black rounded-xl shadow-md transition-all flex items-center gap-1.5 cursor-pointer"
+              disabled={isSubmitting || isPinTooFar}
+              className="px-6 py-2.5 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed text-neutral-950 font-black rounded-xl shadow-md transition-all flex items-center gap-1.5 cursor-pointer"
             >
               {isSubmitting ? (
                 <Loader2 className="w-4 h-4 animate-spin" />

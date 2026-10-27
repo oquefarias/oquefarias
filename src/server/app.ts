@@ -10,11 +10,21 @@ import {
 import {
   Product,
   Order,
+  OrderItem,
+  PaymentMethod,
   StoreSettings,
   DeliveryArea,
   CustomerProfile,
   OrderStatus,
   Coupon,
+  DiningTable,
+  TableTab,
+  TableTabItem,
+  TableWithTab,
+  TabDetail,
+  TabStatus,
+  LinkedTable,
+  GeoPrecision,
 } from '../types/index.js';
 
 dotenv.config();
@@ -82,6 +92,18 @@ export function haversineKm(lat1: number, lon1: number, lat2: number, lon2: numb
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return Math.round(R * c * 100) / 100;
+}
+
+export function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const R = 6371000; // Raio da Terra em metros
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c);
 }
 
 async function fetchNominatimStructured(
@@ -208,6 +230,356 @@ async function computeCustomerServerMetrics(
   };
 }
 
+export interface ServerGeoResolveResult {
+  latitude: number;
+  longitude: number;
+  precisao: GeoPrecision;
+  displayName: string;
+}
+
+async function resolveAddressGeocodeServer(
+  supabase: SupabaseClient | null,
+  params: {
+    rua?: string;
+    numero?: string;
+    bairro?: string;
+    cidade?: string;
+    uf?: string;
+    cep?: string;
+    query?: string;
+    contactEmail?: string;
+  }
+): Promise<ServerGeoResolveResult | null> {
+  let contactEmail = params.contactEmail || process.env.CONTACT_EMAIL || 'contato@depositoexpress.com.br';
+  if (!params.contactEmail && supabase) {
+    try {
+      const { data: settingsRow, error: sErr } = await supabase
+        .from('store_settings')
+        .select('data')
+        .eq('id', 'default')
+        .maybeSingle();
+      if (!sErr && settingsRow?.data) {
+        const sData = settingsRow.data;
+        if (sData.email && typeof sData.email === 'string' && sData.email.includes('@')) {
+          contactEmail = sData.email.trim();
+        } else if (sData.pixKey && typeof sData.pixKey === 'string' && sData.pixKey.includes('@')) {
+          contactEmail = sData.pixKey.trim();
+        }
+      }
+    } catch {
+      // ignore fallback email lookup errors
+    }
+  }
+
+  const userAgent = `DepositoExpress/1.0 (${contactEmail})`;
+
+  let rua = String(params.rua || '').trim();
+  const numero = String(params.numero || '').trim();
+  let bairro = String(params.bairro || '').trim();
+  let cidade = String(params.cidade || '').trim();
+  let uf = String(params.uf || '').trim();
+  const rawCep = String(params.cep || '').replace(/\D/g, '');
+  const freeQuery = String(params.query || '').trim();
+
+  let brasilApiData: Awaited<ReturnType<typeof fetchBrasilApiCepServer>> = null;
+  if (rawCep.length === 8 && (!rua || !cidade)) {
+    brasilApiData = await fetchBrasilApiCepServer(rawCep);
+    if (brasilApiData) {
+      if (!rua && brasilApiData.street) rua = brasilApiData.street;
+      if (!bairro && brasilApiData.neighborhood) bairro = brasilApiData.neighborhood;
+      if (!cidade && brasilApiData.city) cidade = brasilApiData.city;
+      if (!uf && brasilApiData.state) uf = brasilApiData.state;
+    }
+  }
+
+  const formattedPostal =
+    rawCep.length === 8 ? `${rawCep.slice(0, 5)}-${rawCep.slice(5)}` : rawCep;
+
+  // (a) 1. Structured search with street=[número rua], city, state, postalcode
+  if (rua && numero) {
+    const params1: Record<string, string> = {
+      street: `${numero} ${rua}`,
+    };
+    if (cidade) params1.city = cidade;
+    if (uf) params1.state = uf;
+    if (formattedPostal) params1.postalcode = formattedPostal;
+
+    const hit1 = await fetchNominatimStructured(params1, userAgent);
+    if (hit1) {
+      return {
+        latitude: hit1.lat,
+        longitude: hit1.lon,
+        precisao: 'exata',
+        displayName: hit1.displayName,
+      };
+    }
+  }
+
+  // (a) 2. Retry without number: street=[rua], city, state, postalcode
+  if (rua) {
+    const params2: Record<string, string> = {
+      street: rua,
+    };
+    if (cidade) params2.city = cidade;
+    if (uf) params2.state = uf;
+    if (formattedPostal) params2.postalcode = formattedPostal;
+
+    const hit2 = await fetchNominatimStructured(params2, userAgent);
+    if (hit2) {
+      return {
+        latitude: hit2.lat,
+        longitude: hit2.lon,
+        precisao: 'rua',
+        displayName: hit2.displayName,
+      };
+    }
+  }
+
+  // (a) 3. Retry with only street + city (first with number if available, then street only)
+  if (rua && cidade) {
+    if (numero) {
+      const hit3WithNum = await fetchNominatimStructured(
+        { street: `${numero} ${rua}`, city: cidade },
+        userAgent
+      );
+      if (hit3WithNum) {
+        return {
+          latitude: hit3WithNum.lat,
+          longitude: hit3WithNum.lon,
+          precisao: 'exata',
+          displayName: hit3WithNum.displayName,
+        };
+      }
+    }
+
+    const hit3 = await fetchNominatimStructured(
+      { street: rua, city: cidade },
+      userAgent
+    );
+    if (hit3) {
+      return {
+        latitude: hit3.lat,
+        longitude: hit3.lon,
+        precisao: 'rua',
+        displayName: hit3.displayName,
+      };
+    }
+  }
+
+  // Additional structured fallback when city was not typed: try street + neighborhood or street free-form
+  if (rua && !cidade) {
+    const queryParts = [numero ? `${rua}, ${numero}` : rua, bairro, uf, 'Brasil'].filter(Boolean).join(', ');
+    const hitStreet = await fetchNominatimStructured({ q: queryParts }, userAgent);
+    if (hitStreet) {
+      return {
+        latitude: hitStreet.lat,
+        longitude: hitStreet.lon,
+        precisao: numero ? 'exata' : 'rua',
+        displayName: hitStreet.displayName,
+      };
+    }
+  }
+
+  // Free-form query fallback if caller passed a raw query (e.g. store settings search)
+  if (freeQuery && !rua && !rawCep) {
+    const hitFree = await fetchNominatimStructured({ q: freeQuery }, userAgent);
+    if (hitFree) {
+      return {
+        latitude: hitFree.lat,
+        longitude: hitFree.lon,
+        precisao: 'rua',
+        displayName: hitFree.displayName,
+      };
+    }
+  }
+
+  // (b) Fallback: BrasilAPI coordinates and mark precisao as 'aproximada'
+  if (rawCep.length === 8) {
+    if (!brasilApiData) {
+      brasilApiData = await fetchBrasilApiCepServer(rawCep);
+    }
+    if (brasilApiData && brasilApiData.lat !== undefined && brasilApiData.lng !== undefined) {
+      return {
+        latitude: brasilApiData.lat,
+        longitude: brasilApiData.lng,
+        precisao: 'aproximada',
+        displayName: [
+          brasilApiData.street || rua,
+          brasilApiData.neighborhood || bairro,
+          brasilApiData.city || cidade,
+          brasilApiData.state || uf,
+        ]
+          .filter(Boolean)
+          .join(', '),
+      };
+    }
+  }
+
+  return null;
+}
+
+interface ValidatedCustomerGeoFields {
+  error?: string;
+  latitude?: number;
+  longitude?: number;
+  geoLatitude?: number;
+  geoLongitude?: number;
+  geoPrecision?: GeoPrecision;
+  pinOffsetM?: number;
+  locationVerified: boolean;
+  distanceKm?: number;
+  isWithinDeliveryRadius?: boolean;
+}
+
+async function resolveAndValidateCustomerAddress(
+  supabase: SupabaseClient,
+  input: {
+    address?: string;
+    number?: string;
+    neighborhood?: string;
+    city?: string;
+    state?: string;
+    cep?: string;
+    pinLatitude?: number;
+    pinLongitude?: number;
+  }
+): Promise<ValidatedCustomerGeoFields> {
+  const rua = String(input.address || '').trim();
+  const numero = String(input.number || '').trim();
+  const bairro = String(input.neighborhood || '').trim();
+  const cidade = String(input.city || '').trim();
+  const uf = String(input.state || '').trim();
+  const cep = String(input.cep || '').trim();
+
+  const hasAddressFields = Boolean(rua || cep.replace(/\D/g, '').length === 8);
+  const resolved = hasAddressFields
+    ? await resolveAddressGeocodeServer(supabase, {
+        rua,
+        numero,
+        bairro,
+        cidade,
+        uf,
+        cep,
+      })
+    : null;
+
+  const hasBrowserPin =
+    input.pinLatitude !== undefined &&
+    input.pinLatitude !== null &&
+    !Number.isNaN(Number(input.pinLatitude)) &&
+    input.pinLongitude !== undefined &&
+    input.pinLongitude !== null &&
+    !Number.isNaN(Number(input.pinLongitude));
+
+  if (!resolved) {
+    // Endereço não pôde ser geocodificado pelo servidor: nunca confiar no navegador como endereço verificado
+    const fallbackLat = hasBrowserPin ? Number(input.pinLatitude) : undefined;
+    const fallbackLng = hasBrowserPin ? Number(input.pinLongitude) : undefined;
+    const metrics = await computeCustomerServerMetrics(supabase, fallbackLat, fallbackLng);
+    return {
+      latitude: fallbackLat,
+      longitude: fallbackLng,
+      geoLatitude: undefined,
+      geoLongitude: undefined,
+      geoPrecision: undefined,
+      pinOffsetM: undefined,
+      locationVerified: false,
+      distanceKm: metrics.distanceKm,
+      isWithinDeliveryRadius: metrics.isWithinDeliveryRadius,
+    };
+  }
+
+  const geoLatitude = resolved.latitude;
+  const geoLongitude = resolved.longitude;
+  const geoPrecision = resolved.precisao;
+
+  let finalLat = geoLatitude;
+  let finalLng = geoLongitude;
+  let pinOffsetM = 0;
+  let locationVerified = geoPrecision !== 'aproximada';
+
+  if (hasBrowserPin) {
+    const pinLat = Number(input.pinLatitude);
+    const pinLng = Number(input.pinLongitude);
+    pinOffsetM = haversineMeters(geoLatitude, geoLongitude, pinLat, pinLng);
+
+    if (
+      (geoPrecision === 'exata' && pinOffsetM > 300) ||
+      (geoPrecision === 'rua' && pinOffsetM > 800)
+    ) {
+      return {
+        error: `O alfinete está longe do endereço que você digitou (${pinOffsetM} m). Confira a rua e o número ou coloque o alfinete na sua casa.`,
+        locationVerified: false,
+      };
+    }
+
+    finalLat = pinLat;
+    finalLng = pinLng;
+    locationVerified = geoPrecision !== 'aproximada';
+  }
+
+  const metrics = await computeCustomerServerMetrics(supabase, finalLat, finalLng);
+
+  return {
+    latitude: finalLat,
+    longitude: finalLng,
+    geoLatitude,
+    geoLongitude,
+    geoPrecision,
+    pinOffsetM,
+    locationVerified,
+    distanceKm: metrics.distanceKm,
+    isWithinDeliveryRadius: metrics.isWithinDeliveryRadius,
+  };
+}
+
+
+
+function parseProductCaseFields(body: any): { error?: string; caseSize: number | null; casePrice: number | null } {
+  const rawSize = body?.caseSize !== undefined ? body.caseSize : body?.case_size;
+  const rawPrice = body?.casePrice !== undefined ? body.casePrice : body?.case_price;
+
+  const hasSize = rawSize !== undefined && rawSize !== null && String(rawSize).trim() !== '' && Number(rawSize) !== 0;
+  const hasPrice = rawPrice !== undefined && rawPrice !== null && String(rawPrice).trim() !== '' && Number(rawPrice) !== 0;
+
+  if (!hasSize && !hasPrice) {
+    return { caseSize: null, casePrice: null };
+  }
+
+  const sizeNum = Number(rawSize);
+  const priceNum = Number(rawPrice);
+
+  if (!Number.isInteger(sizeNum) || sizeNum < 2 || sizeNum > 100) {
+    return {
+      error: 'Unidades por caixa deve ser um número inteiro entre 2 e 100.',
+      caseSize: null,
+      casePrice: null,
+    };
+  }
+
+  if (Number.isNaN(priceNum) || priceNum <= 0) {
+    return {
+      error: 'O preço da caixa fechada deve ser maior que zero.',
+      caseSize: null,
+      casePrice: null,
+    };
+  }
+
+  return {
+    caseSize: sizeNum,
+    casePrice: Math.round(priceNum * 100) / 100,
+  };
+}
+
+function parseValidItemQuantity(raw: unknown): number | null {
+  if (raw === null || raw === undefined || typeof raw === 'boolean') return null;
+  if (typeof raw === 'string' && raw.trim() === '') return null;
+  const num = Number(raw);
+  if (!Number.isInteger(num) || num < 1 || num > 999) {
+    return null;
+  }
+  return num;
+}
 
 function productToDB(p: Product) {
   const promoPriceVal =
@@ -215,6 +587,7 @@ function productToDB(p: Product) {
       ? Number(p.promoPrice)
       : null;
   const promoEndsAtVal = p.promoEndsAt ? String(p.promoEndsAt) : null;
+  const parsedCase = parseProductCaseFields(p);
 
   return {
     id: p.id,
@@ -224,6 +597,8 @@ function productToDB(p: Product) {
     price: Number(p.price) || 0,
     promo_price: promoPriceVal,
     promo_ends_at: promoEndsAtVal,
+    case_size: parsedCase.caseSize,
+    case_price: parsedCase.casePrice,
     cost_price: Number(p.costPrice) || 0,
     stock: Number(p.stock) || 0,
     min_stock: Number(p.minStock ?? 10),
@@ -237,6 +612,16 @@ function productToDB(p: Product) {
 }
 
 function productFromDB(row: any): Product {
+  const rawCaseSize = row.case_size !== null && row.case_size !== undefined ? Number(row.case_size) : null;
+  const rawCasePrice = row.case_price !== null && row.case_price !== undefined ? Number(row.case_price) : null;
+  const hasValidCase =
+    rawCaseSize !== null &&
+    Number.isInteger(rawCaseSize) &&
+    rawCaseSize >= 2 &&
+    rawCaseSize <= 100 &&
+    rawCasePrice !== null &&
+    rawCasePrice > 0;
+
   return {
     id: String(row.id),
     name: String(row.name || ''),
@@ -248,6 +633,8 @@ function productFromDB(row: any): Product {
         ? Number(row.promo_price)
         : null,
     promoEndsAt: row.promo_ends_at ? String(row.promo_ends_at) : null,
+    caseSize: hasValidCase ? rawCaseSize : null,
+    casePrice: hasValidCase ? rawCasePrice : null,
     costPrice: Number(row.cost_price || 0),
     stock: Number(row.stock || 0),
     minStock: row.min_stock !== null && row.min_stock !== undefined ? Number(row.min_stock) : 10,
@@ -259,12 +646,15 @@ function productFromDB(row: any): Product {
   };
 }
 
-function sanitizePublicProduct(p: Product): Product {
+function sanitizePublicProduct(p: Product): Omit<Product, 'costPrice' | 'minStock'> {
   const activePromo = isPromoActive(p);
+  const { costPrice: _costPrice, minStock: _minStock, ...rest } = p;
   return {
-    ...p,
+    ...rest,
     promoPrice: activePromo ? (p.promoPrice ?? null) : null,
     promoEndsAt: activePromo ? (p.promoEndsAt ?? null) : null,
+    caseSize: p.caseSize ?? null,
+    casePrice: p.casePrice ?? null,
   };
 }
 
@@ -290,6 +680,12 @@ function deliveryAreaFromDB(row: any): DeliveryArea {
 }
 
 function customerToDB(c: CustomerProfile, passwordHash?: string) {
+  const rawGeoLat = c.geoLatitude !== undefined ? c.geoLatitude : c.geo_latitude;
+  const rawGeoLng = c.geoLongitude !== undefined ? c.geoLongitude : c.geo_longitude;
+  const rawGeoPrec = c.geoPrecision !== undefined ? c.geoPrecision : c.geo_precision;
+  const rawPinOffset = c.pinOffsetM !== undefined ? c.pinOffsetM : c.pin_offset_m;
+  const rawLocVerified = c.locationVerified !== undefined ? c.locationVerified : c.location_verified;
+
   const dbObj: any = {
     id: c.id,
     name: c.name,
@@ -305,6 +701,14 @@ function customerToDB(c: CustomerProfile, passwordHash?: string) {
     state: c.state || null,
     latitude: c.latitude !== undefined && c.latitude !== null ? Number(c.latitude) : null,
     longitude: c.longitude !== undefined && c.longitude !== null ? Number(c.longitude) : null,
+    geo_latitude: rawGeoLat !== undefined && rawGeoLat !== null ? Number(rawGeoLat) : null,
+    geo_longitude: rawGeoLng !== undefined && rawGeoLng !== null ? Number(rawGeoLng) : null,
+    geo_precision: rawGeoPrec || null,
+    pin_offset_m:
+      rawPinOffset !== undefined && rawPinOffset !== null && !Number.isNaN(Number(rawPinOffset))
+        ? Math.round(Number(rawPinOffset))
+        : null,
+    location_verified: Boolean(rawLocVerified && rawGeoLat !== undefined && rawGeoLat !== null),
     distance_km: c.distanceKm !== undefined && c.distanceKm !== null ? Number(c.distanceKm) : null,
     is_within_delivery_radius:
       c.isWithinDeliveryRadius !== undefined && c.isWithinDeliveryRadius !== null
@@ -324,6 +728,22 @@ function customerToDB(c: CustomerProfile, passwordHash?: string) {
 }
 
 function customerFromDB(row: any): CustomerProfile {
+  const hasGeoLat = row.geo_latitude !== null && row.geo_latitude !== undefined;
+  const geoLat = hasGeoLat ? Number(row.geo_latitude) : undefined;
+  const geoLng =
+    row.geo_longitude !== null && row.geo_longitude !== undefined
+      ? Number(row.geo_longitude)
+      : undefined;
+  const geoPrec: GeoPrecision | undefined =
+    row.geo_precision === 'exata' || row.geo_precision === 'rua' || row.geo_precision === 'aproximada'
+      ? row.geo_precision
+      : undefined;
+  const pinOffset =
+    row.pin_offset_m !== null && row.pin_offset_m !== undefined
+      ? Number(row.pin_offset_m)
+      : undefined;
+  const locVerified = hasGeoLat ? Boolean(row.location_verified) : false;
+
   return {
     id: String(row.id),
     name: String(row.name || ''),
@@ -339,6 +759,16 @@ function customerFromDB(row: any): CustomerProfile {
     state: row.state || undefined,
     latitude: row.latitude !== null && row.latitude !== undefined ? Number(row.latitude) : undefined,
     longitude: row.longitude !== null && row.longitude !== undefined ? Number(row.longitude) : undefined,
+    geoLatitude: geoLat,
+    geoLongitude: geoLng,
+    geoPrecision: geoPrec,
+    pinOffsetM: pinOffset,
+    locationVerified: locVerified,
+    geo_latitude: geoLat ?? null,
+    geo_longitude: geoLng ?? null,
+    geo_precision: geoPrec ?? null,
+    pin_offset_m: pinOffset ?? null,
+    location_verified: locVerified,
     distanceKm: row.distance_km !== null && row.distance_km !== undefined ? Number(row.distance_km) : undefined,
     isWithinDeliveryRadius:
       row.is_within_delivery_radius !== null && row.is_within_delivery_radius !== undefined
@@ -349,6 +779,155 @@ function customerFromDB(row: any): CustomerProfile {
     lastOrderAt: row.last_order_at || undefined,
     createdAt: row.created_at || new Date().toISOString(),
   };
+}
+
+async function ensureLegacyCustomerGeocoded(
+  supabase: SupabaseClient,
+  custRow: any
+): Promise<{ customer: CustomerProfile; pinRejectedError?: string }> {
+  if (custRow.geo_latitude !== null && custRow.geo_latitude !== undefined) {
+    return { customer: customerFromDB(custRow) };
+  }
+
+  const hasAddress = Boolean(
+    (custRow.address && String(custRow.address).trim()) ||
+      (custRow.cep && String(custRow.cep).replace(/\D/g, '').length === 8)
+  );
+  if (!hasAddress) {
+    return { customer: customerFromDB(custRow) };
+  }
+
+  const existingPinLat =
+    custRow.latitude !== null && custRow.latitude !== undefined && !Number.isNaN(Number(custRow.latitude))
+      ? Number(custRow.latitude)
+      : undefined;
+  const existingPinLng =
+    custRow.longitude !== null && custRow.longitude !== undefined && !Number.isNaN(Number(custRow.longitude))
+      ? Number(custRow.longitude)
+      : undefined;
+
+  const validated = await resolveAndValidateCustomerAddress(supabase, {
+    address: custRow.address,
+    number: custRow.number,
+    neighborhood: custRow.neighborhood,
+    city: custRow.city,
+    state: custRow.state,
+    cep: custRow.cep,
+    pinLatitude: existingPinLat,
+    pinLongitude: existingPinLng,
+  });
+
+  if (validated.error) {
+    // Legacy customer had a pin far from their typed address: reset their coordinates to the geocoded address and mark location_verified = false
+    const fallbackGeo = await resolveAndValidateCustomerAddress(supabase, {
+      address: custRow.address,
+      number: custRow.number,
+      neighborhood: custRow.neighborhood,
+      city: custRow.city,
+      state: custRow.state,
+      cep: custRow.cep,
+    });
+
+    if (fallbackGeo.geoLatitude !== undefined && fallbackGeo.geoLongitude !== undefined) {
+      const { data: updatedRow, error: updErr } = await supabase
+        .from('customers')
+        .update({
+          latitude: fallbackGeo.latitude ?? null,
+          longitude: fallbackGeo.longitude ?? null,
+          geo_latitude: fallbackGeo.geoLatitude,
+          geo_longitude: fallbackGeo.geoLongitude,
+          geo_precision: fallbackGeo.geoPrecision ?? null,
+          pin_offset_m: 0,
+          location_verified: false,
+          distance_km: fallbackGeo.distanceKm ?? null,
+          is_within_delivery_radius: fallbackGeo.isWithinDeliveryRadius ?? null,
+        })
+        .eq('id', custRow.id)
+        .select('*')
+        .maybeSingle();
+
+      if (!updErr && updatedRow) {
+        return {
+          customer: customerFromDB(updatedRow),
+          pinRejectedError: validated.error,
+        };
+      }
+    }
+
+    return {
+      customer: customerFromDB({ ...custRow, location_verified: false }),
+      pinRejectedError: validated.error,
+    };
+  }
+
+  if (validated.geoLatitude !== undefined && validated.geoLongitude !== undefined) {
+    const { data: updatedRow, error: updErr } = await supabase
+      .from('customers')
+      .update({
+        latitude: validated.latitude ?? null,
+        longitude: validated.longitude ?? null,
+        geo_latitude: validated.geoLatitude,
+        geo_longitude: validated.geoLongitude,
+        geo_precision: validated.geoPrecision ?? null,
+        pin_offset_m: validated.pinOffsetM ?? 0,
+        location_verified: validated.locationVerified,
+        distance_km: validated.distanceKm ?? null,
+        is_within_delivery_radius: validated.isWithinDeliveryRadius ?? null,
+      })
+      .eq('id', custRow.id)
+      .select('*')
+      .maybeSingle();
+
+    if (!updErr && updatedRow) {
+      return { customer: customerFromDB(updatedRow) };
+    }
+  }
+
+  return { customer: customerFromDB(custRow) };
+}
+
+function normalizeCouponExpiresAt(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  // Date-only or midnight UTC strings ("YYYY-MM-DD" or "YYYY-MM-DDT00:00:00...")
+  const dateOnlyMatch = trimmed.match(/^(\d{4}-\d{2}-\d{2})(?:T00:00:00(?:\.000)?(?:Z|[+-]00:00)?)?$/);
+  if (dateOnlyMatch) {
+    return `${dateOnlyMatch[1]}T23:59:59-03:00`;
+  }
+
+  // Already has explicit -03:00 end of day
+  const brEndMatch = trimmed.match(/^(\d{4}-\d{2}-\d{2})T23:59:59(?:\.\d+)?-03:00$/);
+  if (brEndMatch) {
+    return `${brEndMatch[1]}T23:59:59-03:00`;
+  }
+
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  // Extract YYYY-MM-DD in America/Sao_Paulo timezone
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(parsed);
+  const year = parts.find((p) => p.type === 'year')?.value;
+  const month = parts.find((p) => p.type === 'month')?.value;
+  const day = parts.find((p) => p.type === 'day')?.value;
+  if (year && month && day) {
+    return `${year}-${month}-${day}T23:59:59-03:00`;
+  }
+
+  return `${trimmed.slice(0, 10)}T23:59:59-03:00`;
+}
+
+function getCouponExpirationMs(expiresAt: string | null | undefined): number | null {
+  const normalized = normalizeCouponExpiresAt(expiresAt);
+  if (!normalized) return null;
+  const ms = new Date(normalized).getTime();
+  return Number.isNaN(ms) ? null : ms;
 }
 
 function couponToDB(c: Coupon) {
@@ -362,7 +941,7 @@ function couponToDB(c: Coupon) {
         ? Number(c.maxDiscount)
         : null,
     active: c.active !== false,
-    expires_at: c.expiresAt || null,
+    expires_at: normalizeCouponExpiresAt(c.expiresAt),
     max_uses: c.maxUses ? Number(c.maxUses) : null,
     used_count: Number(c.usedCount) || 0,
   };
@@ -376,7 +955,7 @@ function couponFromDB(row: any): Coupon {
     minOrder: row.min_order !== null && row.min_order !== undefined ? Number(row.min_order) : undefined,
     maxDiscount: row.max_discount !== null && row.max_discount !== undefined ? Number(row.max_discount) : undefined,
     active: row.active ?? true,
-    expiresAt: row.expires_at || null,
+    expiresAt: normalizeCouponExpiresAt(row.expires_at),
     maxUses: row.max_uses !== null && row.max_uses !== undefined ? Number(row.max_uses) : null,
     usedCount: Number(row.used_count || 0),
   };
@@ -412,8 +991,12 @@ function orderToDB(o: Order) {
     delivery_fee: Number(o.deliveryFee) || 0,
     total: Number(o.total) || 0,
     payment_method: o.paymentMethod || 'pix',
-    cash_change_for: o.cashChangeFor !== undefined && o.cashChangeFor !== null ? Number(o.cashChangeFor) : null,
+    cash_change_for:
+      o.paymentMethod === 'dinheiro' && o.cashChangeFor !== undefined && o.cashChangeFor !== null
+        ? Number(o.cashChangeFor)
+        : null,
     notes: o.notes || null,
+    client_request_id: o.clientRequestId ? String(o.clientRequestId).trim().slice(0, 64) : null,
     created_at: o.createdAt || new Date().toISOString(),
     updated_at: o.updatedAt || new Date().toISOString(),
   };
@@ -439,8 +1022,16 @@ function orderFromDB(row: any): Order {
         ? Number(row.cash_change_for)
         : undefined,
     notes: row.notes || undefined,
+    clientRequestId: row.client_request_id || undefined,
     createdAt: row.created_at || new Date().toISOString(),
     updatedAt: row.updated_at || new Date().toISOString(),
+  };
+}
+
+function sanitizeCustomerOrder(o: Order): Order {
+  return {
+    ...o,
+    items: (o.items || []).map(({ costPrice: _costPrice, ...itemRest }) => itemRest),
   };
 }
 
@@ -451,6 +1042,71 @@ function sanitizePublicSettings(settings: StoreSettings): StoreSettings {
   delete (clean as any).supabaseAnonKey;
   delete (clean as any).supabaseSecretKey;
   return clean;
+}
+
+function diningTableFromDB(row: any): DiningTable {
+  return {
+    id: String(row.id),
+    number: Number(row.number),
+    label: row.label || null,
+    seats: row.seats !== null && row.seats !== undefined ? Number(row.seats) : null,
+    active: row.active ?? true,
+    createdAt: row.created_at || undefined,
+  };
+}
+
+function tableTabFromDB(row: any): TableTab {
+  return {
+    id: String(row.id),
+    tableId: String(row.table_id),
+    status: (row.status as TabStatus) || 'open',
+    customerName: row.customer_name || null,
+    peopleCount: row.people_count !== null && row.people_count !== undefined ? Number(row.people_count) : 1,
+    notes: row.notes || null,
+    mergedInto: row.merged_into || null,
+    orderId: row.order_id || null,
+    openedAt: row.opened_at || new Date().toISOString(),
+    closedAt: row.closed_at || null,
+    updatedAt: row.updated_at || new Date().toISOString(),
+  };
+}
+
+function tableTabItemFromDB(row: any): TableTabItem {
+  const saleUnit = row.sale_unit === 'case' ? 'case' : 'unit';
+  const unitsPerSale =
+    row.units_per_sale !== null && row.units_per_sale !== undefined && Number(row.units_per_sale) > 0
+      ? Number(row.units_per_sale)
+      : 1;
+  return {
+    id: String(row.id),
+    tabId: String(row.tab_id),
+    productId: String(row.product_id),
+    productName: String(row.product_name),
+    unitPrice: Number(row.unit_price || 0),
+    quantity: Number(row.quantity || 1),
+    saleUnit,
+    unitsPerSale,
+    notes: row.notes || null,
+    status: (row.status as 'active' | 'cancelled') || 'active',
+    addedAt: row.added_at || new Date().toISOString(),
+    cancelledAt: row.cancelled_at || null,
+  };
+}
+
+function translateTabRpcError(message: string): string {
+  if (!message) return 'Erro ao processar operação da comanda.';
+  if (message.includes('QUANTIDADE_INVALIDA')) return 'Quantidade inválida.';
+  if (message.includes('COMANDA_NAO_ABERTA')) return 'A comanda não está aberta.';
+  if (message.includes('ESTOQUE_INSUFICIENTE')) return 'Estoque insuficiente para este produto.';
+  if (message.includes('ITEM_INVALIDO')) return 'Item não encontrado ou já cancelado.';
+  if (message.includes('MESMA_COMANDA')) return 'Não é possível transferir ou juntar para a mesma comanda.';
+  if (message.includes('COMANDA_NAO_ESTA_FECHANDO')) return 'Esta conta não está em fechamento.';
+  if (message.includes('MESMA_MESA')) return 'Escolha uma mesa diferente.';
+  if (message.includes('MESA_INVALIDA')) return 'Mesa não encontrada ou inativa.';
+  if (message.includes('MESA_JA_JUNTADA')) return 'Essa mesa já está juntada com outra conta.';
+  if (message.includes('MESA_NAO_JUNTADA')) return 'Essa mesa não está juntada a esta conta.';
+  if (message.includes('UNIDADE_INVALIDA')) return 'Este produto não é vendido em caixa fechada.';
+  return message;
 }
 
 // -----------------------------------------------------------------------------
@@ -505,7 +1161,7 @@ function createAdminSignedToken(): { token: string; expiresAt: string } {
     throw new Error('ADMIN_SESSION_SECRET não está configurado no servidor.');
   }
 
-  const exp = Date.now() + 12 * 60 * 60 * 1000; // 12 hours
+  const exp = Date.now() + 16 * 60 * 60 * 1000; // 16 hours
   const payload: TokenPayload = {
     role: 'admin',
     exp,
@@ -630,9 +1286,18 @@ function requireCustomer(req: express.Request, res: express.Response, next: expr
 // -----------------------------------------------------------------------------
 export function createApp(): express.Express {
   const app = express();
+  app.set('etag', false);
   app.use(express.json());
 
   const router = express.Router();
+
+  // Middleware: desabilitar cache em todas as rotas da API
+  router.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    next();
+  });
 
   // ---------------------------------------------------------------------------
   // AUTH: VERIFY ADMIN PIN (Rate-limited via admin_login_attempts table)
@@ -707,6 +1372,20 @@ export function createApp(): express.Express {
     }
   });
 
+  router.post('/admin/refresh', requireAdmin, (_req, res) => {
+    try {
+      const { token, expiresAt } = createAdminSignedToken();
+      return res.json({
+        success: true,
+        token,
+        expiresAt,
+      });
+    } catch (err: any) {
+      console.error('[Auth Error] Erro ao renovar token assinado:', err);
+      return res.status(500).json({ error: err.message || 'Erro ao renovar token de sessão.' });
+    }
+  });
+
   // ---------------------------------------------------------------------------
   // GEOCODING RESOLVE ON SERVER: POST /geo/resolve
   // Rate-limited to 20 calls/min per IP using admin_login_attempts with 'geo:' prefix
@@ -757,135 +1436,21 @@ export function createApp(): express.Express {
       }
     }
 
-    const userAgent = `DepositoExpress/1.0 (${contactEmail})`;
     const body = req.body || {};
 
-    let rua = String(body.rua || body.street || body.address || body.logradouro || '').trim();
-    const numero = String(body.numero || body.number || '').trim();
-    let bairro = String(body.bairro || body.neighborhood || '').trim();
-    let cidade = String(body.cidade || body.city || body.localidade || '').trim();
-    let uf = String(body.uf || body.state || '').trim();
-    const rawCep = String(body.cep || body.postalcode || '').replace(/\D/g, '');
-    const freeQuery = String(body.query || '').trim();
+    const resolved = await resolveAddressGeocodeServer(supabase, {
+      rua: String(body.rua || body.street || body.address || body.logradouro || '').trim(),
+      numero: String(body.numero || body.number || '').trim(),
+      bairro: String(body.bairro || body.neighborhood || '').trim(),
+      cidade: String(body.cidade || body.city || body.localidade || '').trim(),
+      uf: String(body.uf || body.state || '').trim(),
+      cep: String(body.cep || body.postalcode || '').replace(/\D/g, ''),
+      query: String(body.query || '').trim(),
+      contactEmail,
+    });
 
-    let brasilApiData: Awaited<ReturnType<typeof fetchBrasilApiCepServer>> = null;
-    if (rawCep.length === 8 && (!rua || !cidade)) {
-      brasilApiData = await fetchBrasilApiCepServer(rawCep);
-      if (brasilApiData) {
-        if (!rua && brasilApiData.street) rua = brasilApiData.street;
-        if (!bairro && brasilApiData.neighborhood) bairro = brasilApiData.neighborhood;
-        if (!cidade && brasilApiData.city) cidade = brasilApiData.city;
-        if (!uf && brasilApiData.state) uf = brasilApiData.state;
-      }
-    }
-
-    const formattedPostal =
-      rawCep.length === 8 ? `${rawCep.slice(0, 5)}-${rawCep.slice(5)}` : rawCep;
-
-    // (a) 1. Structured search with street=[número rua], city, state, postalcode
-    if (rua && numero) {
-      const params1: Record<string, string> = {
-        street: `${numero} ${rua}`,
-      };
-      if (cidade) params1.city = cidade;
-      if (uf) params1.state = uf;
-      if (formattedPostal) params1.postalcode = formattedPostal;
-
-      const hit1 = await fetchNominatimStructured(params1, userAgent);
-      if (hit1) {
-        return res.json({
-          latitude: hit1.lat,
-          longitude: hit1.lon,
-          precisao: 'exata',
-          displayName: hit1.displayName,
-        });
-      }
-    }
-
-    // (a) 2. Retry without number: street=[rua], city, state, postalcode
-    if (rua) {
-      const params2: Record<string, string> = {
-        street: rua,
-      };
-      if (cidade) params2.city = cidade;
-      if (uf) params2.state = uf;
-      if (formattedPostal) params2.postalcode = formattedPostal;
-
-      const hit2 = await fetchNominatimStructured(params2, userAgent);
-      if (hit2) {
-        return res.json({
-          latitude: hit2.lat,
-          longitude: hit2.lon,
-          precisao: 'rua',
-          displayName: hit2.displayName,
-        });
-      }
-    }
-
-    // (a) 3. Retry with only street + city (first with number if available, then street only)
-    if (rua && cidade) {
-      if (numero) {
-        const hit3WithNum = await fetchNominatimStructured(
-          { street: `${numero} ${rua}`, city: cidade },
-          userAgent
-        );
-        if (hit3WithNum) {
-          return res.json({
-            latitude: hit3WithNum.lat,
-            longitude: hit3WithNum.lon,
-            precisao: 'exata',
-            displayName: hit3WithNum.displayName,
-          });
-        }
-      }
-
-      const hit3 = await fetchNominatimStructured(
-        { street: rua, city: cidade },
-        userAgent
-      );
-      if (hit3) {
-        return res.json({
-          latitude: hit3.lat,
-          longitude: hit3.lon,
-          precisao: 'rua',
-          displayName: hit3.displayName,
-        });
-      }
-    }
-
-    // Free-form query fallback if caller passed a raw query (e.g. store settings search)
-    if (freeQuery && !rua && !rawCep) {
-      const hitFree = await fetchNominatimStructured({ q: freeQuery }, userAgent);
-      if (hitFree) {
-        return res.json({
-          latitude: hitFree.lat,
-          longitude: hitFree.lon,
-          precisao: 'rua',
-          displayName: hitFree.displayName,
-        });
-      }
-    }
-
-    // (b) Fallback: BrasilAPI coordinates and mark precisao as 'aproximada'
-    if (rawCep.length === 8) {
-      if (!brasilApiData) {
-        brasilApiData = await fetchBrasilApiCepServer(rawCep);
-      }
-      if (brasilApiData && brasilApiData.lat !== undefined && brasilApiData.lng !== undefined) {
-        return res.json({
-          latitude: brasilApiData.lat,
-          longitude: brasilApiData.lng,
-          precisao: 'aproximada',
-          displayName: [
-            brasilApiData.street || rua,
-            brasilApiData.neighborhood || bairro,
-            brasilApiData.city || cidade,
-            brasilApiData.state || uf,
-          ]
-            .filter(Boolean)
-            .join(', '),
-        });
-      }
+    if (resolved) {
+      return res.json(resolved);
     }
 
     return res.status(404).json({
@@ -964,8 +1529,20 @@ export function createApp(): express.Express {
           ? Number(longitude)
           : undefined;
 
-      // Always calculate distance_km and is_within_delivery_radius on the server; ignore browser values
-      const serverMetrics = await computeCustomerServerMetrics(supabase, parsedLat, parsedLng);
+      const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
+        address,
+        number,
+        neighborhood,
+        city,
+        state,
+        cep,
+        pinLatitude: parsedLat,
+        pinLongitude: parsedLng,
+      });
+
+      if (geoValidation.error) {
+        return res.status(400).json({ error: geoValidation.error });
+      }
 
       const newCustProfile: CustomerProfile = {
         id: customerId,
@@ -980,18 +1557,25 @@ export function createApp(): express.Express {
         cep: cep ? cep.trim() : undefined,
         city: city ? city.trim() : undefined,
         state: state ? state.trim() : undefined,
-        latitude: parsedLat,
-        longitude: parsedLng,
-        distanceKm: serverMetrics.distanceKm,
-        isWithinDeliveryRadius: serverMetrics.isWithinDeliveryRadius,
+        latitude: geoValidation.latitude,
+        longitude: geoValidation.longitude,
+        geoLatitude: geoValidation.geoLatitude,
+        geoLongitude: geoValidation.geoLongitude,
+        geoPrecision: geoValidation.geoPrecision,
+        pinOffsetM: geoValidation.pinOffsetM,
+        locationVerified: geoValidation.locationVerified,
+        distanceKm: geoValidation.distanceKm,
+        isWithinDeliveryRadius: geoValidation.isWithinDeliveryRadius,
         createdAt: new Date().toISOString(),
         totalOrdersCount: 0,
         totalSpent: 0,
       };
 
-      const { error: insertErr } = await supabase
+      const { data: insertedRow, error: insertErr } = await supabase
         .from('customers')
-        .insert(customerToDB(newCustProfile, passwordHash));
+        .insert(customerToDB(newCustProfile, passwordHash))
+        .select('*')
+        .single();
 
       if (insertErr) {
         console.error('[Supabase Error] customer register insert:', insertErr.message);
@@ -1004,7 +1588,7 @@ export function createApp(): express.Express {
         success: true,
         token,
         expiresAt,
-        customer: newCustProfile,
+        customer: insertedRow ? customerFromDB(insertedRow) : newCustProfile,
       });
     } catch (err: any) {
       console.error('[Auth Error] customer registration error:', err);
@@ -1076,7 +1660,7 @@ export function createApp(): express.Express {
     }
 
     const { token, expiresAt } = createCustomerSignedToken(customerRow.id);
-    const customer = customerFromDB(customerRow);
+    const { customer } = await ensureLegacyCustomerGeocoded(supabase, customerRow);
 
     return res.json({
       success: true,
@@ -1101,7 +1685,8 @@ export function createApp(): express.Express {
       return res.status(404).json({ error: 'Cadastro do cliente não encontrado.' });
     }
 
-    res.json(customerFromDB(data));
+    const { customer } = await ensureLegacyCustomerGeocoded(supabase, data);
+    res.json(customer);
   });
 
   router.put('/customer/me', requireCustomer, async (req, res) => {
@@ -1128,38 +1713,76 @@ export function createApp(): express.Express {
       newPasswordHash = await hashPassword(body.password);
     }
 
-    const nextLat =
-      body.latitude !== undefined && body.latitude !== null && !Number.isNaN(Number(body.latitude))
-        ? Number(body.latitude)
-        : existing.latitude !== null && existing.latitude !== undefined
-        ? Number(existing.latitude)
-        : undefined;
-    const nextLng =
-      body.longitude !== undefined && body.longitude !== null && !Number.isNaN(Number(body.longitude))
-        ? Number(body.longitude)
-        : existing.longitude !== null && existing.longitude !== undefined
-        ? Number(existing.longitude)
-        : undefined;
+    const nextAddress = body.address !== undefined ? String(body.address).trim() : (existing.address || '');
+    const nextNumber = body.number !== undefined ? String(body.number).trim() : (existing.number || '');
+    const nextNeighborhood = body.neighborhood !== undefined ? String(body.neighborhood).trim() : (existing.neighborhood || '');
+    const nextCep = body.cep !== undefined ? String(body.cep).trim() : (existing.cep || '');
+    const nextCity = body.city !== undefined ? String(body.city).trim() : (existing.city || '');
+    const nextState = body.state !== undefined ? String(body.state).trim() : (existing.state || '');
 
-    // Always calculate distance_km and is_within_delivery_radius on the server; ignore browser values
-    const serverMetrics = await computeCustomerServerMetrics(supabase, nextLat, nextLng);
+    const hasIncomingPin =
+      body.latitude !== undefined &&
+      body.latitude !== null &&
+      !Number.isNaN(Number(body.latitude)) &&
+      body.longitude !== undefined &&
+      body.longitude !== null &&
+      !Number.isNaN(Number(body.longitude));
+
+    const addressTextChanged =
+      nextAddress !== (existing.address || '') ||
+      nextNumber !== (existing.number || '') ||
+      nextNeighborhood !== (existing.neighborhood || '') ||
+      nextCep.replace(/\D/g, '') !== String(existing.cep || '').replace(/\D/g, '') ||
+      nextCity !== (existing.city || '') ||
+      nextState !== (existing.state || '');
+
+    const pinLat = hasIncomingPin
+      ? Number(body.latitude)
+      : !addressTextChanged && existing.latitude !== null && existing.latitude !== undefined
+      ? Number(existing.latitude)
+      : undefined;
+    const pinLng = hasIncomingPin
+      ? Number(body.longitude)
+      : !addressTextChanged && existing.longitude !== null && existing.longitude !== undefined
+      ? Number(existing.longitude)
+      : undefined;
+
+    const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
+      address: nextAddress,
+      number: nextNumber,
+      neighborhood: nextNeighborhood,
+      city: nextCity,
+      state: nextState,
+      cep: nextCep,
+      pinLatitude: pinLat,
+      pinLongitude: pinLng,
+    });
+
+    if (geoValidation.error) {
+      return res.status(400).json({ error: geoValidation.error });
+    }
 
     const updatedProfile: CustomerProfile = {
       ...customerFromDB(existing),
       name: body.name !== undefined ? body.name : existing.name,
       phone: body.phone !== undefined ? body.phone : existing.phone,
-      address: body.address !== undefined ? body.address : existing.address,
-      number: body.number !== undefined ? body.number : existing.number,
-      neighborhood: body.neighborhood !== undefined ? body.neighborhood : existing.neighborhood,
+      address: nextAddress,
+      number: nextNumber,
+      neighborhood: nextNeighborhood,
       complement: body.complement !== undefined ? body.complement : existing.complement,
       reference: body.reference !== undefined ? body.reference : existing.reference,
-      cep: body.cep !== undefined ? body.cep : existing.cep,
-      city: body.city !== undefined ? body.city : existing.city,
-      state: body.state !== undefined ? body.state : existing.state,
-      latitude: nextLat,
-      longitude: nextLng,
-      distanceKm: serverMetrics.distanceKm,
-      isWithinDeliveryRadius: serverMetrics.isWithinDeliveryRadius,
+      cep: nextCep,
+      city: nextCity,
+      state: nextState,
+      latitude: geoValidation.latitude,
+      longitude: geoValidation.longitude,
+      geoLatitude: geoValidation.geoLatitude,
+      geoLongitude: geoValidation.geoLongitude,
+      geoPrecision: geoValidation.geoPrecision,
+      pinOffsetM: geoValidation.pinOffsetM,
+      locationVerified: geoValidation.locationVerified,
+      distanceKm: geoValidation.distanceKm,
+      isWithinDeliveryRadius: geoValidation.isWithinDeliveryRadius,
     };
 
     const updateDBData = customerToDB(updatedProfile, newPasswordHash);
@@ -1197,7 +1820,7 @@ export function createApp(): express.Express {
       return res.status(404).json({ error: 'Cliente não encontrado.' });
     }
 
-    const dbCustomer = customerFromDB(custRes.data);
+    const { customer: dbCustomer } = await ensureLegacyCustomerGeocoded(supabase, custRes.data);
     const dbAreas = (areasRes.data || []).map(deliveryAreaFromDB);
     const dbSettings: StoreSettings = settingsRes.data?.data
       ? sanitizePublicSettings(settingsRes.data.data)
@@ -1298,7 +1921,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
-    return res.json((data || []).map(orderFromDB));
+    return res.json((data || []).map(orderFromDB).map(sanitizeCustomerOrder));
   });
 
   router.get('/customer/orders/:id', requireCustomer, async (req, res) => {
@@ -1323,7 +1946,7 @@ export function createApp(): express.Express {
       return res.status(404).json({ error: 'Pedido não encontrado.' });
     }
 
-    return res.json(orderFromDB(data));
+    return res.json(sanitizeCustomerOrder(orderFromDB(data)));
   });
 
   // ---------------------------------------------------------------------------
@@ -1355,7 +1978,8 @@ export function createApp(): express.Express {
       return res.status(400).json({ error: 'Este cupom não está ativo no momento.' });
     }
 
-    if (coupon.expiresAt && new Date(coupon.expiresAt).getTime() < Date.now()) {
+    const expMs = getCouponExpirationMs(coupon.expiresAt);
+    if (expMs !== null && expMs < Date.now()) {
       return res.status(400).json({ error: 'Este cupom já expirou.' });
     }
 
@@ -1373,7 +1997,9 @@ export function createApp(): express.Express {
           const sp = dbProds.find((p) => p.id === (it.productId || it.id));
           if (sp && sp.active) {
             const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
-            calculatedSub += getEffectivePrice(sp) * qty;
+            const isCase = it.saleUnit === 'case' && sp.caseSize && sp.caseSize >= 2 && sp.casePrice && sp.casePrice > 0;
+            const unitPrice = isCase ? Number(sp.casePrice) : getEffectivePrice(sp);
+            calculatedSub += unitPrice * qty;
           }
         }
         if (calculatedSub > 0) {
@@ -1430,7 +2056,7 @@ export function createApp(): express.Express {
           ? Number(maxDiscount)
           : undefined,
       active: active !== false,
-      expiresAt: expiresAt || null,
+      expiresAt: normalizeCouponExpiresAt(expiresAt),
       maxUses: maxUses ? Number(maxUses) : null,
       usedCount: 0,
     };
@@ -1462,7 +2088,7 @@ export function createApp(): express.Express {
       updateData.max_discount = maxDiscount && Number(maxDiscount) > 0 ? Number(maxDiscount) : null;
     }
     if (active !== undefined) updateData.active = Boolean(active);
-    if (expiresAt !== undefined) updateData.expires_at = expiresAt || null;
+    if (expiresAt !== undefined) updateData.expires_at = normalizeCouponExpiresAt(expiresAt);
     if (maxUses !== undefined) updateData.max_uses = maxUses ? Number(maxUses) : null;
 
     const { data, error } = await supabase
@@ -1622,7 +2248,7 @@ export function createApp(): express.Express {
     const isAdmin = signed?.role === 'admin';
 
     const mapped = (data || []).map(productFromDB);
-    res.json(isAdmin ? mapped : mapped.map(sanitizePublicProduct));
+    res.json(isAdmin ? mapped : mapped.filter((p) => p.active).map(sanitizePublicProduct));
   });
 
   router.post('/products', requireAdmin, async (req, res) => {
@@ -1631,16 +2257,31 @@ export function createApp(): express.Express {
       return res.status(400).json({ error: 'Dados do produto inválidos.' });
     }
 
+    const parsedCase = parseProductCaseFields(product);
+    if (parsedCase.error) {
+      return res.status(400).json({ error: parsedCase.error });
+    }
+
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
-    const { error } = await supabase.from('products').upsert(productToDB(product));
+    const normalizedProduct: Product = {
+      ...product,
+      caseSize: parsedCase.caseSize,
+      casePrice: parsedCase.casePrice,
+    };
+
+    const { data, error } = await supabase
+      .from('products')
+      .upsert(productToDB(normalizedProduct))
+      .select('*')
+      .single();
     if (error) {
       console.error('[Supabase Error] products upsert:', error.message);
       return res.status(500).json({ error: error.message });
     }
 
-    res.status(201).json(product);
+    res.status(201).json(data ? productFromDB(data) : normalizedProduct);
   });
 
   // Requirement: Em PUT /api/products/:id NUNCA altere a coluna stock (ignore stock do corpo)
@@ -1651,11 +2292,18 @@ export function createApp(): express.Express {
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
     const body = req.body || {};
+    const parsedCase = parseProductCaseFields(body);
+    if (parsedCase.error) {
+      return res.status(400).json({ error: parsedCase.error });
+    }
+
     const updateData: Record<string, any> = {
       name: body.name,
       category: body.category,
       volume: body.volume || null,
       price: Number(body.price) || 0,
+      case_size: parsedCase.caseSize,
+      case_price: parsedCase.casePrice,
       cost_price: Number(body.costPrice) || 0,
       min_stock: Number(body.minStock ?? 10),
       is_cold: body.isCold !== false,
@@ -1766,20 +2414,39 @@ export function createApp(): express.Express {
   });
 
   // Requirement: Alteração de estoque manual via POST /api/products/:id/stock (decrement_stock para delta negativo e restore_stock para positivo)
+  // Aceita unit: 'unit' | 'case'. Em caixas, o servidor multiplica delta × case_size.
   router.post('/products/:id/stock', requireAdmin, async (req, res) => {
     const { id } = req.params;
-    const delta = Number(req.body?.delta) || 0;
+    const rawDelta = Math.trunc(Number(req.body?.delta) || 0);
+    const unit = req.body?.unit === 'case' ? 'case' : 'unit';
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
-    if (delta === 0) {
-      const { data: row } = await supabase.from('products').select('*').eq('id', id).maybeSingle();
-      return res.json(row ? productFromDB(row) : null);
+    const { data: existingRow, error: prodErr } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (prodErr) return res.status(500).json({ error: prodErr.message });
+    if (!existingRow) return res.status(404).json({ error: 'Produto não encontrado.' });
+
+    if (rawDelta === 0) {
+      return res.json(productFromDB(existingRow));
     }
 
-    if (delta > 0) {
+    let effectiveDelta = rawDelta;
+    if (unit === 'case') {
+      const caseSize = existingRow.case_size !== null && existingRow.case_size !== undefined ? Number(existingRow.case_size) : 0;
+      if (!Number.isInteger(caseSize) || caseSize < 2) {
+        return res.status(400).json({ error: 'Este produto não é vendido em caixa fechada.' });
+      }
+      effectiveDelta = rawDelta * caseSize;
+    }
+
+    if (effectiveDelta > 0) {
       const { error: rpcErr } = await supabase.rpc('restore_stock', {
-        p_items: [{ id, qty: delta }],
+        p_items: [{ id, qty: effectiveDelta }],
       });
       if (rpcErr) {
         console.error('[RPC Error] restore_stock:', rpcErr.message);
@@ -1787,7 +2454,7 @@ export function createApp(): express.Express {
       }
     } else {
       const { error: rpcErr } = await supabase.rpc('decrement_stock', {
-        p_items: [{ id, qty: Math.abs(delta) }],
+        p_items: [{ id, qty: Math.abs(effectiveDelta) }],
       });
       if (rpcErr) {
         if (rpcErr.message?.includes('ESTOQUE_INSUFICIENTE')) {
@@ -1908,27 +2575,49 @@ export function createApp(): express.Express {
         ? Number(cust.longitude)
         : undefined;
 
-    const serverMetrics = await computeCustomerServerMetrics(supabase, parsedLat, parsedLng);
+    const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
+      address: cust.address,
+      number: cust.number,
+      neighborhood: cust.neighborhood,
+      city: cust.city,
+      state: cust.state,
+      cep: cust.cep,
+      pinLatitude: parsedLat,
+      pinLongitude: parsedLng,
+    });
+
+    if (geoValidation.error) {
+      return res.status(400).json({ error: geoValidation.error });
+    }
 
     const newCust: CustomerProfile = {
       ...cust,
       id: cust.id || `cust-${Date.now()}`,
-      latitude: parsedLat,
-      longitude: parsedLng,
-      distanceKm: serverMetrics.distanceKm,
-      isWithinDeliveryRadius: serverMetrics.isWithinDeliveryRadius,
+      latitude: geoValidation.latitude,
+      longitude: geoValidation.longitude,
+      geoLatitude: geoValidation.geoLatitude,
+      geoLongitude: geoValidation.geoLongitude,
+      geoPrecision: geoValidation.geoPrecision,
+      pinOffsetM: geoValidation.pinOffsetM,
+      locationVerified: geoValidation.locationVerified,
+      distanceKm: geoValidation.distanceKm,
+      isWithinDeliveryRadius: geoValidation.isWithinDeliveryRadius,
       createdAt: new Date().toISOString(),
       totalOrdersCount: 0,
       totalSpent: 0,
     };
 
-    const { error } = await supabase.from('customers').insert(customerToDB(newCust));
+    const { data: insertedRow, error } = await supabase
+      .from('customers')
+      .insert(customerToDB(newCust))
+      .select('*')
+      .single();
     if (error) {
       console.error('[Supabase Error] customers insert:', error.message);
       return res.status(500).json({ error: error.message });
     }
 
-    res.status(201).json(newCust);
+    res.status(201).json(insertedRow ? customerFromDB(insertedRow) : newCust);
   });
 
   router.put('/customers/:id', requireAdmin, async (req, res) => {
@@ -1942,25 +2631,76 @@ export function createApp(): express.Express {
     }
 
     const existingMapped = customerFromDB(existing);
-    const nextLat =
-      req.body?.latitude !== undefined && req.body?.latitude !== null && !Number.isNaN(Number(req.body.latitude))
-        ? Number(req.body.latitude)
-        : existingMapped.latitude;
-    const nextLng =
-      req.body?.longitude !== undefined && req.body?.longitude !== null && !Number.isNaN(Number(req.body.longitude))
-        ? Number(req.body.longitude)
-        : existingMapped.longitude;
+    const body = req.body || {};
 
-    const serverMetrics = await computeCustomerServerMetrics(supabase, nextLat, nextLng);
+    const nextAddress = body.address !== undefined ? String(body.address).trim() : existingMapped.address;
+    const nextNumber = body.number !== undefined ? String(body.number).trim() : existingMapped.number;
+    const nextNeighborhood = body.neighborhood !== undefined ? String(body.neighborhood).trim() : existingMapped.neighborhood;
+    const nextCep = body.cep !== undefined ? String(body.cep).trim() : (existingMapped.cep || '');
+    const nextCity = body.city !== undefined ? String(body.city).trim() : (existingMapped.city || '');
+    const nextState = body.state !== undefined ? String(body.state).trim() : (existingMapped.state || '');
+
+    const hasIncomingPin =
+      body.latitude !== undefined &&
+      body.latitude !== null &&
+      !Number.isNaN(Number(body.latitude)) &&
+      body.longitude !== undefined &&
+      body.longitude !== null &&
+      !Number.isNaN(Number(body.longitude));
+
+    const addressTextChanged =
+      nextAddress !== existingMapped.address ||
+      nextNumber !== existingMapped.number ||
+      nextNeighborhood !== existingMapped.neighborhood ||
+      nextCep.replace(/\D/g, '') !== String(existingMapped.cep || '').replace(/\D/g, '') ||
+      nextCity !== (existingMapped.city || '') ||
+      nextState !== (existingMapped.state || '');
+
+    const pinLat = hasIncomingPin
+      ? Number(body.latitude)
+      : !addressTextChanged && existingMapped.latitude !== undefined
+      ? existingMapped.latitude
+      : undefined;
+    const pinLng = hasIncomingPin
+      ? Number(body.longitude)
+      : !addressTextChanged && existingMapped.longitude !== undefined
+      ? existingMapped.longitude
+      : undefined;
+
+    const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
+      address: nextAddress,
+      number: nextNumber,
+      neighborhood: nextNeighborhood,
+      city: nextCity,
+      state: nextState,
+      cep: nextCep,
+      pinLatitude: pinLat,
+      pinLongitude: pinLng,
+    });
+
+    if (geoValidation.error) {
+      return res.status(400).json({ error: geoValidation.error });
+    }
 
     const updated: CustomerProfile = {
       ...existingMapped,
-      ...req.body,
+      ...body,
       id,
-      latitude: nextLat,
-      longitude: nextLng,
-      distanceKm: serverMetrics.distanceKm,
-      isWithinDeliveryRadius: serverMetrics.isWithinDeliveryRadius,
+      address: nextAddress,
+      number: nextNumber,
+      neighborhood: nextNeighborhood,
+      cep: nextCep || undefined,
+      city: nextCity || undefined,
+      state: nextState || undefined,
+      latitude: geoValidation.latitude,
+      longitude: geoValidation.longitude,
+      geoLatitude: geoValidation.geoLatitude,
+      geoLongitude: geoValidation.geoLongitude,
+      geoPrecision: geoValidation.geoPrecision,
+      pinOffsetM: geoValidation.pinOffsetM,
+      locationVerified: geoValidation.locationVerified,
+      distanceKm: geoValidation.distanceKm,
+      isWithinDeliveryRadius: geoValidation.isWithinDeliveryRadius,
     };
     const { data: saved, error } = await supabase
       .from('customers')
@@ -2013,6 +2753,35 @@ export function createApp(): express.Express {
 
     const isAdmin = signed?.role === 'admin';
     const isCustomer = signed?.role === 'customer' && Boolean(signed.customerId);
+    const effectiveSource: 'balcao' | 'online' =
+      isAdmin && rawOrder.source === 'balcao' ? 'balcao' : 'online';
+
+    const rawClientRequestId =
+      typeof rawOrder.clientRequestId === 'string' &&
+      rawOrder.clientRequestId.trim().length > 0 &&
+      rawOrder.clientRequestId.trim().length <= 64
+        ? rawOrder.clientRequestId.trim()
+        : undefined;
+
+    if (rawClientRequestId) {
+      const { data: existingIdempRow, error: existingIdempErr } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('client_request_id', rawClientRequestId)
+        .maybeSingle();
+
+      if (existingIdempErr) {
+        return res.status(500).json({ error: existingIdempErr.message });
+      }
+      if (existingIdempRow) {
+        if (isAdmin) {
+          return res.status(200).json(orderFromDB(existingIdempRow));
+        }
+        if (isCustomer && existingIdempRow.customer_id === signed?.customerId) {
+          return res.status(200).json(sanitizeCustomerOrder(orderFromDB(existingIdempRow)));
+        }
+      }
+    }
 
     // 1. Fetch current products, delivery areas, settings directly from Supabase
     const [prodRes, areasRes, settingsRes] = await Promise.all([
@@ -2032,7 +2801,7 @@ export function createApp(): express.Express {
     let serverDistanceKm: number | undefined = undefined;
     let serverIsWithinRadius: boolean | undefined = undefined;
 
-    if (rawOrder.source === 'balcao' && isAdmin) {
+    if (effectiveSource === 'balcao') {
       // Admin POS sale
       customerData = {
         name: rawOrder.customer?.name ? String(rawOrder.customer.name).trim() : 'Cliente Balcão',
@@ -2063,7 +2832,14 @@ export function createApp(): express.Express {
         return res.status(401).json({ error: 'Cliente não encontrado. Faça login novamente.' });
       }
 
-      const dbCustomer = customerFromDB(custRow);
+      let dbCustomer = customerFromDB(custRow);
+      if (rawOrder.deliveryType !== 'retirada' && (custRow.geo_latitude === null || custRow.geo_latitude === undefined)) {
+        const legacyResult = await ensureLegacyCustomerGeocoded(supabase, custRow);
+        dbCustomer = legacyResult.customer;
+        if (legacyResult.pinRejectedError) {
+          return res.status(400).json({ error: legacyResult.pinRejectedError });
+        }
+      }
 
       // Calculate distance strictly from the customer's saved DB coordinates (never from req.body)
       if (
@@ -2085,14 +2861,17 @@ export function createApp(): express.Express {
         serverIsWithinRadius = serverDistanceKm <= maxRadiusKm;
       }
 
+      const isDeliveryOrder = rawOrder.deliveryType !== 'retirada';
+      const verifiedFlag = isDeliveryOrder ? Boolean(dbCustomer.locationVerified) : true;
+
       // Use customer data directly from the database by the token's id
       customerData = {
         name: dbCustomer.name,
         phone: dbCustomer.phone,
         email: dbCustomer.email || undefined,
-        address: rawOrder.deliveryType === 'delivery' ? (dbCustomer.address || rawOrder.customer?.address || '') : 'Retirada no Depósito',
-        number: rawOrder.deliveryType === 'delivery' ? (dbCustomer.number || rawOrder.customer?.number || '') : 'S/N',
-        neighborhood: rawOrder.deliveryType === 'delivery' ? (dbCustomer.neighborhood || rawOrder.customer?.neighborhood || '') : 'Depósito',
+        address: isDeliveryOrder ? (dbCustomer.address || rawOrder.customer?.address || '') : 'Retirada no Depósito',
+        number: isDeliveryOrder ? (dbCustomer.number || rawOrder.customer?.number || '') : 'S/N',
+        neighborhood: isDeliveryOrder ? (dbCustomer.neighborhood || rawOrder.customer?.neighborhood || '') : 'Depósito',
         complement: dbCustomer.complement || rawOrder.customer?.complement || undefined,
         reference: dbCustomer.reference || rawOrder.customer?.reference || undefined,
         cep: dbCustomer.cep || rawOrder.customer?.cep || undefined,
@@ -2100,6 +2879,16 @@ export function createApp(): express.Express {
         state: dbCustomer.state || rawOrder.customer?.state || undefined,
         latitude: dbCustomer.latitude,
         longitude: dbCustomer.longitude,
+        geoLatitude: dbCustomer.geoLatitude,
+        geoLongitude: dbCustomer.geoLongitude,
+        geoPrecision: dbCustomer.geoPrecision,
+        pinOffsetM: dbCustomer.pinOffsetM,
+        locationVerified: verifiedFlag,
+        geo_latitude: dbCustomer.geoLatitude ?? null,
+        geo_longitude: dbCustomer.geoLongitude ?? null,
+        geo_precision: dbCustomer.geoPrecision ?? null,
+        pin_offset_m: dbCustomer.pinOffsetM ?? null,
+        location_verified: verifiedFlag,
         distanceKm: serverDistanceKm,
         isWithinDeliveryRadius: serverIsWithinRadius,
       };
@@ -2107,8 +2896,8 @@ export function createApp(): express.Express {
 
     // 2. Validate items and recalculate subtotal
     let recalculatedSubtotal = 0;
-    const validatedItems: any[] = [];
-    const stockPayload: { id: string; qty: number }[] = [];
+    const validatedItems: OrderItem[] = [];
+    const unitsByProductId = new Map<string, number>();
 
     for (const item of rawOrder.items) {
       const serverProduct = dbProducts.find((p) => p.id === item.productId);
@@ -2118,14 +2907,49 @@ export function createApp(): express.Express {
         });
       }
 
-      const requestedQty = Math.max(1, parseInt(item.quantity, 10) || 1);
-      if (serverProduct.stock < requestedQty) {
+      const requestedQty = parseValidItemQuantity(item.quantity);
+      if (requestedQty === null) {
+        return res.status(400).json({ error: 'Quantidade inválida.' });
+      }
+      const saleUnit = item.saleUnit === 'case' ? 'case' : 'unit';
+
+      let unitsPerSale = 1;
+      let effectivePrice = getEffectivePrice(serverProduct);
+      let originalPrice = serverProduct.price;
+
+      if (saleUnit === 'case') {
+        const hasCase =
+          serverProduct.caseSize !== null &&
+          serverProduct.caseSize !== undefined &&
+          Number.isInteger(Number(serverProduct.caseSize)) &&
+          Number(serverProduct.caseSize) >= 2 &&
+          Number(serverProduct.caseSize) <= 100 &&
+          serverProduct.casePrice !== null &&
+          serverProduct.casePrice !== undefined &&
+          Number(serverProduct.casePrice) > 0;
+
+        if (!hasCase) {
+          return res.status(400).json({
+            error: 'Este produto não é vendido em caixa fechada.',
+          });
+        }
+
+        unitsPerSale = Number(serverProduct.caseSize);
+        effectivePrice = Number(serverProduct.casePrice);
+        originalPrice = Number(serverProduct.casePrice);
+      }
+
+      const unitsForThisLine = requestedQty * unitsPerSale;
+      const totalUnitsForProduct = (unitsByProductId.get(serverProduct.id) || 0) + unitsForThisLine;
+
+      if (serverProduct.stock < totalUnitsForProduct) {
         return res.status(409).json({
           error: `Estoque insuficiente para "${serverProduct.name}". Disponível em estoque: ${serverProduct.stock} un.`,
         });
       }
 
-      const effectivePrice = getEffectivePrice(serverProduct);
+      unitsByProductId.set(serverProduct.id, totalUnitsForProduct);
+
       const itemTotal = effectivePrice * requestedQty;
       recalculatedSubtotal += itemTotal;
 
@@ -2134,17 +2958,18 @@ export function createApp(): express.Express {
         name: serverProduct.name,
         volume: serverProduct.volume,
         price: effectivePrice,
-        originalPrice: serverProduct.price,
-        costPrice: serverProduct.costPrice,
+        originalPrice,
+        costPrice: (Number(serverProduct.costPrice) || 0) * unitsPerSale,
         quantity: requestedQty,
+        saleUnit,
+        unitsPerSale,
         isCold: serverProduct.isCold,
       });
-
-      stockPayload.push({
-        id: serverProduct.id,
-        qty: requestedQty,
-      });
     }
+
+    const stockPayload: { id: string; qty: number }[] = Array.from(unitsByProductId.entries()).map(
+      ([id, qty]) => ({ id, qty })
+    );
 
     // 3. Recalculate Delivery Fee & Enforce Delivery Radius on Server
     const deliveryType = rawOrder.deliveryType === 'retirada' ? 'retirada' : 'delivery';
@@ -2152,12 +2977,12 @@ export function createApp(): express.Express {
 
     if (deliveryType === 'delivery') {
       // Entrega exige localização confirmada (sem coordenada não dá para checar o raio)
-      if (rawOrder.source !== 'balcao' && serverDistanceKm === undefined) {
+      if (effectiveSource !== 'balcao' && serverDistanceKm === undefined) {
         return res.status(400).json({
           error: 'Confirme sua localização no mapa (Meus dados > Endereço) antes de pedir entrega, ou escolha Retirar no Depósito.',
         });
       }
-      if (rawOrder.source !== 'balcao' && serverDistanceKm !== undefined && serverDistanceKm > maxRadiusKm) {
+      if (effectiveSource !== 'balcao' && serverDistanceKm !== undefined && serverDistanceKm > maxRadiusKm) {
         return res.status(400).json({
           error: `Endereço fora do raio de entrega de ${maxRadiusKm} km. Escolha Retirar no Depósito.`,
         });
@@ -2204,7 +3029,8 @@ export function createApp(): express.Express {
         return res.status(400).json({ error: 'O cupom inserido está desativado.' });
       }
 
-      if (coupon.expiresAt && new Date(coupon.expiresAt).getTime() < Date.now()) {
+      const couponExpMs = getCouponExpirationMs(coupon.expiresAt);
+      if (couponExpMs !== null && couponExpMs < Date.now()) {
         return res.status(400).json({ error: 'O cupom inserido já expirou.' });
       }
 
@@ -2222,7 +3048,23 @@ export function createApp(): express.Express {
       validCouponCode = coupon.code;
     }
 
-    const calculatedTotal = Math.max(0, recalculatedSubtotal - discount + deliveryFee);
+    const calculatedTotal = Math.max(0, Math.round((recalculatedSubtotal - discount + deliveryFee) * 100) / 100);
+
+    const paymentMethod: PaymentMethod = rawOrder.paymentMethod || 'pix';
+    let validatedCashChangeFor: number | undefined = undefined;
+    if (paymentMethod === 'dinheiro') {
+      if (
+        rawOrder.cashChangeFor !== undefined &&
+        rawOrder.cashChangeFor !== null &&
+        String(rawOrder.cashChangeFor).trim() !== ''
+      ) {
+        const parsedCash = Number(rawOrder.cashChangeFor);
+        if (Number.isNaN(parsedCash) || Math.round(parsedCash * 100) < Math.round(calculatedTotal * 100)) {
+          return res.status(400).json({ error: 'Valor recebido menor que o total da conta.' });
+        }
+        validatedCashChangeFor = Math.round(parsedCash * 100) / 100;
+      }
+    }
 
     // 5. Decrement Stock via RPC decrement_stock(p_items jsonb)
     const { error: decStockErr } = await supabase.rpc('decrement_stock', {
@@ -2260,7 +3102,7 @@ export function createApp(): express.Express {
 
     const newOrder: Order = {
       id: orderId,
-      source: rawOrder.source === 'balcao' ? 'balcao' : 'online',
+      source: effectiveSource,
       status: 'pendente', // Force pending
       customer: customerData,
       customerId,
@@ -2270,19 +3112,37 @@ export function createApp(): express.Express {
       items: validatedItems,
       subtotal: Math.round(recalculatedSubtotal * 100) / 100,
       deliveryFee: Math.round(deliveryFee * 100) / 100,
-      total: Math.round(calculatedTotal * 100) / 100,
-      paymentMethod: rawOrder.paymentMethod || 'pix',
-      cashChangeFor: rawOrder.cashChangeFor !== undefined && rawOrder.cashChangeFor !== null ? Number(rawOrder.cashChangeFor) : undefined,
+      total: calculatedTotal,
+      paymentMethod,
+      cashChangeFor: validatedCashChangeFor,
       notes: rawOrder.notes || undefined,
+      clientRequestId: rawClientRequestId,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
 
     const { error: orderErr } = await supabase.from('orders').insert(orderToDB(newOrder));
     if (orderErr) {
-      console.error('[Supabase Error] orders upsert:', orderErr.message);
+      console.error('[Supabase Error] orders insert:', orderErr.message);
       // Rollback stock decrement!
       await supabase.rpc('restore_stock', { p_items: stockPayload });
+
+      if (orderErr.code === '23505' && rawClientRequestId) {
+        const { data: dupRow, error: dupErr } = await supabase
+          .from('orders')
+          .select('*')
+          .eq('client_request_id', rawClientRequestId)
+          .maybeSingle();
+
+        if (!dupErr && dupRow) {
+          const dupOrder = orderFromDB(dupRow);
+          if (isAdmin) return res.status(200).json(dupOrder);
+          if (isCustomer && dupRow.customer_id === signed?.customerId) {
+            return res.status(200).json(sanitizeCustomerOrder(dupOrder));
+          }
+        }
+      }
+
       return res.status(500).json({ error: orderErr.message });
     }
 
@@ -2303,7 +3163,7 @@ export function createApp(): express.Express {
       }
     }
 
-    return res.status(201).json(newOrder);
+    return res.status(201).json(isAdmin ? newOrder : sanitizeCustomerOrder(newOrder));
   });
 
   router.get('/orders/:id', async (req, res) => {
@@ -2330,7 +3190,12 @@ export function createApp(): express.Express {
   // Requirement: Ao mudar o status de um pedido para cancelado, devolva o estoque com restore_stock; se sair de cancelado para outro status, baixe de novo com decrement_stock.
   router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
     const { id } = req.params;
-    const { status: newStatus } = req.body || {};
+    const { status: newStatus, notes: incomingNotes } = req.body || {};
+    const VALID_STATUSES: OrderStatus[] = ['pendente', 'em_separacao', 'em_rota', 'concluido', 'cancelado'];
+    if (!newStatus || !VALID_STATUSES.includes(newStatus)) {
+      return res.status(400).json({ error: 'Status de pedido inválido.' });
+    }
+
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
@@ -2341,60 +3206,146 @@ export function createApp(): express.Express {
       .eq('id', id)
       .maybeSingle();
 
-    if (fetchOrderErr || !existingRow) {
+    if (fetchOrderErr) {
+      return res.status(500).json({ error: fetchOrderErr.message });
+    }
+    if (!existingRow) {
       return res.status(404).json({ error: 'Pedido não encontrado.' });
     }
 
     const existingOrder = orderFromDB(existingRow);
     const oldStatus = existingOrder.status;
 
-    if (newStatus && oldStatus !== newStatus) {
-      const stockItems = (existingOrder.items || []).map((it) => ({
-        id: it.productId,
-        qty: it.quantity,
-      }));
+    let updatedNotes: string | null = existingRow.notes || null;
+    if (incomingNotes !== undefined && incomingNotes !== null && String(incomingNotes).trim() !== '') {
+      updatedNotes = String(incomingNotes).trim();
+    }
 
-      if (stockItems.length > 0) {
-        if (oldStatus !== 'cancelado' && newStatus === 'cancelado') {
-          // Returning stock
-          const { error: restErr } = await supabase.rpc('restore_stock', { p_items: stockItems });
-          if (restErr) {
-            console.error('[RPC Error] restore_stock on cancel:', restErr.message);
-            return res.status(500).json({ error: 'Erro ao devolver estoque: ' + restErr.message });
+    if (oldStatus === newStatus) {
+      if (updatedNotes !== (existingRow.notes || null)) {
+        const { data: sameStatusRow, error: sameStatusErr } = await supabase
+          .from('orders')
+          .update({ notes: updatedNotes, updated_at: new Date().toISOString() })
+          .eq('id', id)
+          .select('*')
+          .maybeSingle();
+        if (sameStatusErr || !sameStatusRow) {
+          return res.status(500).json({ error: sameStatusErr?.message || 'Erro ao atualizar pedido.' });
+        }
+        return res.json(orderFromDB(sameStatusRow));
+      }
+      return res.json(existingOrder);
+    }
+
+    // 1. Atomic conditional status update FIRST to prevent race conditions
+    const { data: updatedRow, error: updateErr } = await supabase
+      .from('orders')
+      .update({
+        status: newStatus,
+        notes: updatedNotes,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .eq('status', oldStatus)
+      .select('*')
+      .maybeSingle();
+
+    if (updateErr) {
+      console.error('[Supabase Error] order status update:', updateErr.message);
+      return res.status(500).json({ error: updateErr.message });
+    }
+    if (!updatedRow) {
+      return res.status(409).json({ error: 'Este pedido já foi alterado por outra pessoa. Atualize a tela.' });
+    }
+
+    // 2. Adjust stock ONLY after conditional status transition succeeded
+    const unitsMap = new Map<string, number>();
+    for (const it of existingOrder.items || []) {
+      const qty = Math.max(1, Number(it.quantity) || 1);
+      const unitsPerSale = it.unitsPerSale && Number(it.unitsPerSale) > 0 ? Number(it.unitsPerSale) : 1;
+      unitsMap.set(it.productId, (unitsMap.get(it.productId) || 0) + qty * unitsPerSale);
+    }
+    const stockItems = Array.from(unitsMap.entries()).map(([prodId, qty]) => ({
+      id: prodId,
+      qty,
+    }));
+
+    if (stockItems.length > 0) {
+      if (oldStatus !== 'cancelado' && newStatus === 'cancelado') {
+        const { error: restErr } = await supabase.rpc('restore_stock', { p_items: stockItems });
+        if (restErr) {
+          console.error('[RPC Error] restore_stock on cancel:', restErr.message);
+          await supabase
+            .from('orders')
+            .update({
+              status: oldStatus,
+              notes: existingRow.notes || null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', id);
+          return res.status(500).json({ error: 'Erro ao devolver estoque: ' + restErr.message });
+        }
+      } else if (oldStatus === 'cancelado' && newStatus !== 'cancelado') {
+        const { error: decErr } = await supabase.rpc('decrement_stock', { p_items: stockItems });
+        if (decErr) {
+          console.error('[RPC Error] decrement_stock on uncancel:', decErr.message);
+          await supabase
+            .from('orders')
+            .update({
+              status: oldStatus,
+              notes: existingRow.notes || null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', id);
+          if (decErr.message?.includes('ESTOQUE_INSUFICIENTE')) {
+            return res.status(409).json({ error: 'Não é possível reativar o pedido: estoque insuficiente de um ou mais itens.' });
           }
-        } else if (oldStatus === 'cancelado' && newStatus !== 'cancelado') {
-          // Decreasing stock again
-          const { error: decErr } = await supabase.rpc('decrement_stock', { p_items: stockItems });
-          if (decErr) {
-            console.error('[RPC Error] decrement_stock on uncancel:', decErr.message);
-            if (decErr.message?.includes('ESTOQUE_INSUFICIENTE')) {
-              return res.status(409).json({ error: 'Não é possível reativar o pedido: estoque insuficiente de um ou mais itens.' });
-            }
-            return res.status(500).json({ error: decErr.message });
-          }
+          return res.status(500).json({ error: decErr.message });
         }
       }
     }
 
-    const { data, error } = await supabase
-      .from('orders')
-      .update({ status: newStatus, updated_at: new Date().toISOString() })
-      .eq('id', id)
-      .select('*')
-      .maybeSingle();
-
-    if (error || !data) {
-      console.error('[Supabase Error] order status update:', error?.message);
-      return res.status(500).json({ error: error?.message || 'Pedido não encontrado.' });
-    }
-
-    res.json(orderFromDB(data));
+    res.json(orderFromDB(updatedRow));
   });
 
   router.delete('/orders/:id', requireAdmin, async (req, res) => {
     const { id } = req.params;
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { data: existingRow, error: fetchErr } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (fetchErr) {
+      console.error('[Supabase Error] orders fetch before delete:', fetchErr.message);
+      return res.status(500).json({ error: fetchErr.message });
+    }
+
+    if (existingRow) {
+      const existingOrder = orderFromDB(existingRow);
+      if (existingOrder.status !== 'cancelado') {
+        const unitsMap = new Map<string, number>();
+        for (const it of existingOrder.items || []) {
+          const qty = Math.max(1, Number(it.quantity) || 1);
+          const unitsPerSale = it.unitsPerSale && Number(it.unitsPerSale) > 0 ? Number(it.unitsPerSale) : 1;
+          unitsMap.set(it.productId, (unitsMap.get(it.productId) || 0) + qty * unitsPerSale);
+        }
+        const stockItems = Array.from(unitsMap.entries()).map(([prodId, qty]) => ({
+          id: prodId,
+          qty,
+        }));
+        if (stockItems.length > 0) {
+          const { error: restErr } = await supabase.rpc('restore_stock', { p_items: stockItems });
+          if (restErr) {
+            console.error('[RPC Error] restore_stock on delete order:', restErr.message);
+            return res.status(500).json({ error: 'Erro ao devolver estoque antes de excluir o pedido: ' + restErr.message });
+          }
+        }
+      }
+    }
 
     const { error } = await supabase.from('orders').delete().eq('id', id);
     if (error) {
@@ -2440,17 +3391,1046 @@ export function createApp(): express.Express {
   });
 
   // ---------------------------------------------------------------------------
-  // CLEAR ALL SIMULATION DATA ROUTE (Admin only)
+  // MESAS & COMANDAS MODULE (Admin only)
   // ---------------------------------------------------------------------------
-  router.post('/clear-all', requireAdmin, async (_req, res) => {
+
+  // 1. List active tables with current open tab (if any) and joined tables
+  router.get('/admin/tables', requireAdmin, async (_req, res) => {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
-    const { error: ordErr } = await supabase.from('orders').delete().neq('id', '___empty___');
-    if (ordErr) return res.status(500).json({ error: ordErr.message });
+    const { data: tablesData, error: tablesErr } = await supabase
+      .from('dining_tables')
+      .select('*')
+      .eq('active', true)
+      .order('number', { ascending: true });
 
-    const { error: custErr } = await supabase.from('customers').delete().neq('id', '___empty___');
-    if (custErr) return res.status(500).json({ error: custErr.message });
+    if (tablesErr) {
+      console.error('[Supabase Error] dining_tables list:', tablesErr.message);
+      return res.status(500).json({ error: tablesErr.message });
+    }
+
+    const tables: DiningTable[] = (tablesData || []).map(diningTableFromDB);
+    const tableLookup = new Map<string, DiningTable>(tables.map((t) => [t.id, t]));
+
+    // Fetch open/closing tabs
+    const { data: tabsData, error: tabsErr } = await supabase
+      .from('table_tabs')
+      .select('*')
+      .in('status', ['open', 'closing']);
+
+    if (tabsErr) {
+      console.error('[Supabase Error] table_tabs list:', tabsErr.message);
+      return res.status(500).json({ error: tabsErr.message });
+    }
+
+    const openTabs = (tabsData || []).map(tableTabFromDB);
+
+    // Fetch table_tab_links
+    const { data: linksData, error: linksErr } = await supabase
+      .from('table_tab_links')
+      .select('*');
+
+    if (linksErr) {
+      console.error('[Supabase Error] table_tab_links list:', linksErr.message);
+      return res.status(500).json({ error: linksErr.message });
+    }
+
+    const links = linksData || [];
+
+    const tabItemsMap = new Map<string, { itemsCount: number; subtotal: number }>();
+
+    if (openTabs.length > 0) {
+      const tabIds = openTabs.map((t) => t.id);
+      const { data: itemsData, error: itemsErr } = await supabase
+        .from('table_tab_items')
+        .select('*')
+        .in('tab_id', tabIds)
+        .eq('status', 'active');
+
+      if (itemsErr) {
+        console.error('[Supabase Error] table_tab_items list:', itemsErr.message);
+        return res.status(500).json({ error: itemsErr.message });
+      }
+
+      const items = (itemsData || []).map(tableTabItemFromDB);
+      for (const item of items) {
+        const current = tabItemsMap.get(item.tabId) || { itemsCount: 0, subtotal: 0 };
+        const unitsPerSale = item.saleUnit === 'case' && item.unitsPerSale && item.unitsPerSale > 1 ? item.unitsPerSale : 1;
+        current.itemsCount += item.quantity * unitsPerSale;
+        current.subtotal += item.unitPrice * item.quantity;
+        tabItemsMap.set(item.tabId, current);
+      }
+    }
+
+    const result: TableWithTab[] = tables.map((tbl) => {
+      // 1. If primary table of an open tab
+      const tab = openTabs.find((t) => t.tableId === tbl.id);
+      if (tab) {
+        const itemStats = tabItemsMap.get(tab.id) || { itemsCount: 0, subtotal: 0 };
+        const tabLinks = links.filter((l: any) => l.tab_id === tab.id);
+        const linkedTables: LinkedTable[] = [];
+        for (const l of tabLinks) {
+          const linkedTbl = tableLookup.get(l.table_id);
+          if (linkedTbl) {
+            linkedTables.push({
+              id: linkedTbl.id,
+              number: linkedTbl.number,
+              label: linkedTbl.label || null,
+            });
+          }
+        }
+        linkedTables.sort((a, b) => a.number - b.number);
+
+        return {
+          ...tbl,
+          currentTab: {
+            ...tab,
+            itemsCount: itemStats.itemsCount,
+            subtotal: Math.round(itemStats.subtotal * 100) / 100,
+          },
+          linkedTables: linkedTables.length > 0 ? linkedTables : undefined,
+        };
+      }
+
+      // 2. If joined to another tab
+      const link = links.find((l: any) => l.table_id === tbl.id);
+      if (link) {
+        const targetTab = openTabs.find((t) => t.id === link.tab_id);
+        const primaryTable = targetTab ? tableLookup.get(targetTab.tableId) : null;
+        return {
+          ...tbl,
+          currentTab: null,
+          joinedToTabId: link.tab_id,
+          joinedToTableNumber: primaryTable?.number,
+        };
+      }
+
+      // 3. Free table
+      return {
+        ...tbl,
+        currentTab: null,
+      };
+    });
+
+    res.json(result);
+  });
+
+  // 2. Create dining table
+  router.post('/admin/tables', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const num = parseInt(req.body.number, 10);
+    if (!num || num <= 0) {
+      return res.status(400).json({ error: 'Número da mesa deve ser um valor inteiro positivo.' });
+    }
+
+    const label = req.body.label ? String(req.body.label).trim() : null;
+    const seats = req.body.seats !== undefined && req.body.seats !== null && Number(req.body.seats) > 0 ? Number(req.body.seats) : null;
+
+    // Check if table with this number already exists
+    const { data: existing, error: checkErr } = await supabase
+      .from('dining_tables')
+      .select('*')
+      .eq('number', num)
+      .maybeSingle();
+
+    if (checkErr) {
+      return res.status(500).json({ error: checkErr.message });
+    }
+
+    if (existing) {
+      if (existing.active) {
+        return res.status(400).json({ error: `Já existe uma mesa ativa com o número ${num}.` });
+      }
+      // Reactivate existing inactive table
+      const { data: reactivated, error: updateErr } = await supabase
+        .from('dining_tables')
+        .update({
+          label,
+          seats,
+          active: true,
+        })
+        .eq('id', existing.id)
+        .select()
+        .single();
+
+      if (updateErr) return res.status(500).json({ error: updateErr.message });
+      return res.status(201).json(diningTableFromDB(reactivated));
+    }
+
+    const newId = crypto.randomUUID();
+    const { data: created, error: insertErr } = await supabase
+      .from('dining_tables')
+      .insert({
+        id: newId,
+        number: num,
+        label,
+        seats,
+        active: true,
+        created_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    if (insertErr) {
+      console.error('[Supabase Error] dining_tables insert:', insertErr.message);
+      return res.status(500).json({ error: insertErr.message });
+    }
+
+    res.status(201).json(diningTableFromDB(created));
+  });
+
+  // 3. Update dining table
+  router.put('/admin/tables/:id', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const num = req.body.number !== undefined ? parseInt(req.body.number, 10) : undefined;
+    if (num !== undefined && (!num || num <= 0)) {
+      return res.status(400).json({ error: 'Número da mesa inválido.' });
+    }
+
+    if (num !== undefined) {
+      const { data: conflict } = await supabase
+        .from('dining_tables')
+        .select('id')
+        .eq('number', num)
+        .neq('id', req.params.id)
+        .maybeSingle();
+      if (conflict) {
+        return res.status(400).json({ error: `Já existe outra mesa com o número ${num}.` });
+      }
+    }
+
+    const updates: any = {};
+    if (num !== undefined) updates.number = num;
+    if (req.body.label !== undefined) updates.label = req.body.label ? String(req.body.label).trim() : null;
+    if (req.body.seats !== undefined) updates.seats = req.body.seats ? Number(req.body.seats) : null;
+    if (req.body.active !== undefined) updates.active = Boolean(req.body.active);
+
+    const { data: updated, error } = await supabase
+      .from('dining_tables')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json(diningTableFromDB(updated));
+  });
+
+  // 4. Soft-delete dining table
+  router.delete('/admin/tables/:id', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    // Check if table has open tab
+    const { data: openTab, error: checkErr } = await supabase
+      .from('table_tabs')
+      .select('id')
+      .eq('table_id', req.params.id)
+      .in('status', ['open', 'closing'])
+      .maybeSingle();
+
+    if (checkErr) return res.status(500).json({ error: checkErr.message });
+    if (openTab) {
+      return res.status(400).json({ error: 'Não é possível remover ou desativar mesa com comanda aberta. Feche ou cancele a comanda primeiro.' });
+    }
+
+    // Check if table is in table_tab_links
+    const { data: linkRow, error: linkErr } = await supabase
+      .from('table_tab_links')
+      .select('table_id')
+      .eq('table_id', req.params.id)
+      .maybeSingle();
+
+    if (linkErr) return res.status(500).json({ error: linkErr.message });
+    if (linkRow) {
+      return res.status(400).json({ error: 'Não é possível desativar uma mesa que está juntada a uma comanda.' });
+    }
+
+    const { error: delErr } = await supabase
+      .from('dining_tables')
+      .update({ active: false })
+      .eq('id', req.params.id);
+
+    if (delErr) return res.status(500).json({ error: delErr.message });
+
+    res.json({ success: true });
+  });
+
+  // 5. Open tab for table
+  router.post('/admin/tables/:id/open', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { data: table, error: tblErr } = await supabase
+      .from('dining_tables')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (tblErr) return res.status(500).json({ error: tblErr.message });
+    if (!table || !table.active) {
+      return res.status(404).json({ error: 'Mesa não encontrada ou inativa.' });
+    }
+
+    // Check if table is joined to another tab in table_tab_links
+    const { data: linkRow, error: linkErr } = await supabase
+      .from('table_tab_links')
+      .select('tab_id')
+      .eq('table_id', req.params.id)
+      .maybeSingle();
+
+    if (linkErr) return res.status(500).json({ error: linkErr.message });
+    if (linkRow) {
+      const { data: linkedTab } = await supabase
+        .from('table_tabs')
+        .select('table_id')
+        .eq('id', linkRow.tab_id)
+        .maybeSingle();
+
+      let primaryNumber = '?';
+      if (linkedTab?.table_id) {
+        const { data: primaryTbl } = await supabase
+          .from('dining_tables')
+          .select('number')
+          .eq('id', linkedTab.table_id)
+          .maybeSingle();
+        if (primaryTbl?.number) primaryNumber = String(primaryTbl.number);
+      }
+      return res.status(400).json({ error: `Esta mesa está juntada com a Mesa ${primaryNumber}.` });
+    }
+
+    const { data: existingTab, error: checkErr } = await supabase
+      .from('table_tabs')
+      .select('id')
+      .eq('table_id', req.params.id)
+      .in('status', ['open', 'closing'])
+      .maybeSingle();
+
+    if (checkErr) return res.status(500).json({ error: checkErr.message });
+    if (existingTab) {
+      return res.status(400).json({ error: 'Esta mesa já possui uma comanda aberta.' });
+    }
+
+    const tabId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const customerName = req.body.customer_name ? String(req.body.customer_name).trim() : null;
+    const peopleCount = req.body.people_count ? Math.max(1, parseInt(req.body.people_count, 10) || 1) : 1;
+    const notes = req.body.notes ? String(req.body.notes).trim() : null;
+
+    const { data: createdTab, error: insertErr } = await supabase
+      .from('table_tabs')
+      .insert({
+        id: tabId,
+        table_id: req.params.id,
+        status: 'open',
+        customer_name: customerName,
+        people_count: peopleCount,
+        notes,
+        opened_at: now,
+        updated_at: now,
+      })
+      .select()
+      .single();
+
+    if (insertErr) {
+      console.error('[Supabase Error] table_tabs open:', insertErr.message);
+      return res.status(500).json({ error: insertErr.message });
+    }
+
+    res.status(201).json(tableTabFromDB(createdTab));
+  });
+
+  // 6. Get tab detail with items and linked tables
+  router.get('/admin/tabs/:id', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { data: tabData, error: tabErr } = await supabase
+      .from('table_tabs')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (tabErr) return res.status(500).json({ error: tabErr.message });
+    if (!tabData) return res.status(404).json({ error: 'Comanda não encontrada.' });
+
+    const { data: tableData } = await supabase
+      .from('dining_tables')
+      .select('number, label')
+      .eq('id', tabData.table_id)
+      .maybeSingle();
+
+    // Fetch linked tables
+    const { data: linksData, error: linksErr } = await supabase
+      .from('table_tab_links')
+      .select('table_id')
+      .eq('tab_id', req.params.id);
+
+    if (linksErr) return res.status(500).json({ error: linksErr.message });
+
+    let linkedTables: LinkedTable[] = [];
+    if (linksData && linksData.length > 0) {
+      const linkedIds = linksData.map((l: any) => l.table_id);
+      const { data: linkedTablesData, error: linkedTablesErr } = await supabase
+        .from('dining_tables')
+        .select('id, number, label')
+        .in('id', linkedIds);
+
+      if (linkedTablesErr) return res.status(500).json({ error: linkedTablesErr.message });
+
+      linkedTables = (linkedTablesData || [])
+        .map((t: any) => ({
+          id: String(t.id),
+          number: Number(t.number),
+          label: t.label || null,
+        }))
+        .sort((a, b) => a.number - b.number);
+    }
+
+    const { data: itemsData, error: itemsErr } = await supabase
+      .from('table_tab_items')
+      .select('*')
+      .eq('tab_id', req.params.id)
+      .order('added_at', { ascending: true });
+
+    if (itemsErr) return res.status(500).json({ error: itemsErr.message });
+
+    const items: TableTabItem[] = (itemsData || []).map(tableTabItemFromDB);
+    const subtotal = items
+      .filter((it) => it.status === 'active')
+      .reduce((sum, it) => sum + it.unitPrice * it.quantity, 0);
+
+    const result: TabDetail = {
+      ...tableTabFromDB(tabData),
+      tableNumber: tableData?.number || 0,
+      tableLabel: tableData?.label || null,
+      items,
+      subtotal: Math.round(subtotal * 100) / 100,
+      linkedTables: linkedTables.length > 0 ? linkedTables : undefined,
+    };
+
+    res.json(result);
+  });
+
+  // 7. Update tab metadata (customerName, peopleCount, notes)
+  router.patch('/admin/tabs/:id', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const updates: any = { updated_at: new Date().toISOString() };
+    if (req.body.customer_name !== undefined) {
+      updates.customer_name = req.body.customer_name ? String(req.body.customer_name).trim() : null;
+    }
+    if (req.body.people_count !== undefined) {
+      updates.people_count = Math.max(1, parseInt(req.body.people_count, 10) || 1);
+    }
+    if (req.body.notes !== undefined) {
+      updates.notes = req.body.notes ? String(req.body.notes).trim() : null;
+    }
+
+    const { data: updated, error } = await supabase
+      .from('table_tabs')
+      .update(updates)
+      .eq('id', req.params.id)
+      .in('status', ['open', 'closing'])
+      .select()
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+    if (!updated) return res.status(404).json({ error: 'Comanda não encontrada ou não está aberta.' });
+
+    res.json(tableTabFromDB(updated));
+  });
+
+  // 8. Add item to tab (decrement stock via RPC add_table_tab_item)
+  router.post('/admin/tabs/:id/items', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { product_id, quantity, notes, sale_unit } = req.body || {};
+    const qty = parseValidItemQuantity(quantity);
+    if (qty === null) {
+      return res.status(400).json({ error: 'Quantidade inválida.' });
+    }
+
+    const saleUnit = sale_unit === 'case' ? 'case' : 'unit';
+
+    // Verify tab is open
+    const { data: tab, error: tabErr } = await supabase
+      .from('table_tabs')
+      .select('id, status')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (tabErr) return res.status(500).json({ error: tabErr.message });
+    if (!tab) return res.status(404).json({ error: 'Comanda não encontrada.' });
+    if (tab.status !== 'open') {
+      return res.status(400).json({ error: 'A comanda não está aberta para novos itens.' });
+    }
+
+    // Fetch product to calculate current effective price
+    const { data: prodData, error: prodErr } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', product_id)
+      .maybeSingle();
+
+    if (prodErr) return res.status(500).json({ error: prodErr.message });
+    if (!prodData || prodData.active === false) {
+      return res.status(404).json({ error: 'Produto não encontrado ou inativo.' });
+    }
+
+    let unitPrice = getEffectivePrice(prodData);
+    let unitsPerSale = 1;
+
+    if (saleUnit === 'case') {
+      const rawCaseSize = prodData.case_size !== null && prodData.case_size !== undefined ? Number(prodData.case_size) : 0;
+      const rawCasePrice = prodData.case_price !== null && prodData.case_price !== undefined ? Number(prodData.case_price) : 0;
+      if (!Number.isInteger(rawCaseSize) || rawCaseSize < 2 || rawCaseSize > 100 || rawCasePrice <= 0) {
+        return res.status(400).json({ error: 'Este produto não é vendido em caixa fechada.' });
+      }
+      unitPrice = rawCasePrice;
+      unitsPerSale = rawCaseSize;
+    }
+
+    const productName = `${prodData.name}${prodData.volume ? ` ${prodData.volume}` : ''}`;
+    const itemNotes = notes ? String(notes).trim() : null;
+
+    // Call Supabase RPC add_table_tab_item
+    const { data: itemId, error: rpcErr } = await supabase.rpc('add_table_tab_item', {
+      p_tab_id: req.params.id,
+      p_product_id: String(prodData.id),
+      p_product_name: productName,
+      p_unit_price: unitPrice,
+      p_qty: qty,
+      p_notes: itemNotes,
+      p_sale_unit: saleUnit,
+      p_units_per_sale: unitsPerSale,
+    });
+
+    if (rpcErr) {
+      console.error('[Supabase RPC Error] add_table_tab_item:', rpcErr.message);
+      return res.status(400).json({ error: translateTabRpcError(rpcErr.message) });
+    }
+
+    res.status(201).json({ success: true, itemId });
+  });
+
+  // 9. Cancel item on tab (restores stock via RPC cancel_table_tab_item)
+  router.delete('/admin/tabs/:id/items/:itemId', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    // Verify tab is open
+    const { data: tab, error: tabErr } = await supabase
+      .from('table_tabs')
+      .select('status')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (tabErr) return res.status(500).json({ error: tabErr.message });
+    if (!tab) return res.status(404).json({ error: 'Comanda não encontrada.' });
+    if (tab.status !== 'open') {
+      return res.status(400).json({ error: 'A comanda não está aberta para cancelamento de itens.' });
+    }
+
+    // Verify item belongs to tab and is active
+    const { data: item, error: itemErr } = await supabase
+      .from('table_tab_items')
+      .select('*')
+      .eq('id', req.params.itemId)
+      .eq('tab_id', req.params.id)
+      .eq('status', 'active')
+      .maybeSingle();
+
+    if (itemErr) return res.status(500).json({ error: itemErr.message });
+    if (!item) {
+      return res.status(404).json({ error: 'Item não encontrado ou já cancelado.' });
+    }
+
+    const { error: rpcErr } = await supabase.rpc('cancel_table_tab_item', {
+      p_item_id: req.params.itemId,
+    });
+
+    if (rpcErr) {
+      console.error('[Supabase RPC Error] cancel_table_tab_item:', rpcErr.message);
+      return res.status(400).json({ error: translateTabRpcError(rpcErr.message) });
+    }
+
+    res.json({ success: true });
+  });
+
+  // 10. Transfer item to another open tab (RPC transfer_table_tab_item)
+  router.post('/admin/tabs/:id/items/:itemId/transfer', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { to_tab_id } = req.body || {};
+    if (!to_tab_id) {
+      return res.status(400).json({ error: 'Comanda de destino não informada.' });
+    }
+
+    const { error: rpcErr } = await supabase.rpc('transfer_table_tab_item', {
+      p_item_id: req.params.itemId,
+      p_from: req.params.id,
+      p_to: to_tab_id,
+    });
+
+    if (rpcErr) {
+      console.error('[Supabase RPC Error] transfer_table_tab_item:', rpcErr.message);
+      return res.status(400).json({ error: translateTabRpcError(rpcErr.message) });
+    }
+
+    res.json({ success: true });
+  });
+
+  // 11. Join another table into tab (RPC join_table_to_tab)
+  router.post('/admin/tabs/:id/join', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { table_id } = req.body || {};
+    if (!table_id) {
+      return res.status(400).json({ error: 'Mesa não informada.' });
+    }
+
+    // Read customer_name from both tabs BEFORE joining
+    const [targetTabRes, sourceTabRes] = await Promise.all([
+      supabase.from('table_tabs').select('customer_name').eq('id', req.params.id).maybeSingle(),
+      supabase
+        .from('table_tabs')
+        .select('customer_name')
+        .eq('table_id', table_id)
+        .eq('status', 'open')
+        .maybeSingle(),
+    ]);
+
+    if (targetTabRes.error) {
+      return res.status(500).json({ error: targetTabRes.error.message });
+    }
+    if (sourceTabRes.error) {
+      return res.status(500).json({ error: sourceTabRes.error.message });
+    }
+
+    const targetName = targetTabRes.data?.customer_name ? String(targetTabRes.data.customer_name).trim() : '';
+    const sourceName = sourceTabRes.data?.customer_name ? String(sourceTabRes.data.customer_name).trim() : '';
+
+    const { error: rpcErr } = await supabase.rpc('join_table_to_tab', {
+      p_tab_id: req.params.id,
+      p_table_id: table_id,
+    });
+
+    if (rpcErr) {
+      console.error('[Supabase RPC Error] join_table_to_tab:', rpcErr.message);
+      return res.status(400).json({ error: translateTabRpcError(rpcErr.message) });
+    }
+
+    const now = new Date().toISOString();
+    const tabUpdatePayload: Record<string, any> = { updated_at: now };
+    if (targetName && sourceName) {
+      tabUpdatePayload.customer_name = `${targetName} + ${sourceName}`;
+    }
+
+    const { error: updErr } = await supabase
+      .from('table_tabs')
+      .update(tabUpdatePayload)
+      .eq('id', req.params.id);
+
+    if (updErr) {
+      console.error('[Supabase Error] table_tabs update after join:', updErr.message);
+      return res.status(500).json({ error: updErr.message });
+    }
+
+    res.json({ success: true });
+  });
+
+  // 12. Unjoin a table from tab (RPC unjoin_table_from_tab)
+  router.post('/admin/tabs/:id/unjoin', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { table_id } = req.body || {};
+    if (!table_id) {
+      return res.status(400).json({ error: 'Mesa não informada.' });
+    }
+
+    const { error: rpcErr } = await supabase.rpc('unjoin_table_from_tab', {
+      p_tab_id: req.params.id,
+      p_table_id: table_id,
+    });
+
+    if (rpcErr) {
+      console.error('[Supabase RPC Error] unjoin_table_from_tab:', rpcErr.message);
+      return res.status(400).json({ error: translateTabRpcError(rpcErr.message) });
+    }
+
+    const now = new Date().toISOString();
+    await supabase.from('table_tabs').update({ updated_at: now }).eq('id', req.params.id);
+
+    res.json({ success: true });
+  });
+
+  // 13. Move tab to another free table
+  router.post('/admin/tabs/:id/move', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { to_table_id } = req.body || {};
+    if (!to_table_id) {
+      return res.status(400).json({ error: 'Mesa de destino não informada.' });
+    }
+
+    // Verify source tab is open
+    const { data: srcTab, error: srcTabErr } = await supabase
+      .from('table_tabs')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (srcTabErr) return res.status(500).json({ error: srcTabErr.message });
+    if (!srcTab) return res.status(404).json({ error: 'Comanda não encontrada.' });
+    if (srcTab.status !== 'open') {
+      return res.status(400).json({ error: 'A comanda não está aberta.' });
+    }
+
+    if (srcTab.table_id === to_table_id) {
+      return res.status(400).json({ error: 'A comanda já está vinculada a esta mesa.' });
+    }
+
+    // Check target table exists and is active
+    const { data: targetTable, error: targetTblErr } = await supabase
+      .from('dining_tables')
+      .select('*')
+      .eq('id', to_table_id)
+      .maybeSingle();
+
+    if (targetTblErr) return res.status(500).json({ error: targetTblErr.message });
+    if (!targetTable || !targetTable.active) {
+      return res.status(400).json({ error: 'Mesa de destino não encontrada ou inativa.' });
+    }
+
+    // Check target table is NOT in table_tab_links
+    const { data: targetLink, error: targetLinkErr } = await supabase
+      .from('table_tab_links')
+      .select('table_id')
+      .eq('table_id', to_table_id)
+      .maybeSingle();
+
+    if (targetLinkErr) return res.status(500).json({ error: targetLinkErr.message });
+    if (targetLink) {
+      return res.status(400).json({ error: 'A mesa de destino está juntada a outra conta.' });
+    }
+
+    // Check target table does NOT have an open/closing tab
+    const { data: occupied, error: occupiedErr } = await supabase
+      .from('table_tabs')
+      .select('id')
+      .eq('table_id', to_table_id)
+      .in('status', ['open', 'closing'])
+      .maybeSingle();
+
+    if (occupiedErr) return res.status(500).json({ error: occupiedErr.message });
+    if (occupied) {
+      return res.status(400).json({ error: 'A mesa de destino já possui uma comanda aberta.' });
+    }
+
+    const { error: moveErr } = await supabase
+      .from('table_tabs')
+      .update({
+        table_id: to_table_id,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', req.params.id)
+      .eq('status', 'open');
+
+    if (moveErr) {
+      return res.status(500).json({ error: moveErr.message });
+    }
+
+    res.json({ success: true });
+  });
+
+  // 14. Close tab: atomic closing lock, calculates service fee & discount, creates order with source='mesa', calls finish_table_tab_close RPC
+  router.post('/admin/tabs/:id/close', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const now = new Date().toISOString();
+
+    // Helper to safely rollback tab to open only if still closing
+    const rollbackTab = async () => {
+      await supabase
+        .from('table_tabs')
+        .update({ status: 'open', updated_at: new Date().toISOString() })
+        .eq('id', req.params.id)
+        .eq('status', 'closing');
+    };
+
+    // 1. Atomic lock: open -> closing
+    const { data: lockedTab, error: lockErr } = await supabase
+      .from('table_tabs')
+      .update({ status: 'closing', updated_at: now })
+      .eq('id', req.params.id)
+      .eq('status', 'open')
+      .select()
+      .maybeSingle();
+
+    if (lockErr || !lockedTab) {
+      return res.status(400).json({ error: 'A comanda não está aberta ou já está em processo de fechamento.' });
+    }
+
+    // 2. Fetch active items
+    const { data: itemsData, error: itemsErr } = await supabase
+      .from('table_tab_items')
+      .select('*')
+      .eq('tab_id', req.params.id)
+      .eq('status', 'active');
+
+    if (itemsErr) {
+      await rollbackTab();
+      return res.status(500).json({ error: itemsErr.message });
+    }
+
+    if (!itemsData || itemsData.length === 0) {
+      await rollbackTab();
+      return res.status(400).json({ error: 'Não é possível fechar uma conta sem itens.' });
+    }
+
+    const activeItems = itemsData.map(tableTabItemFromDB);
+
+    // 3. Validate payment_method against accepted payment methods
+    const VALID_PAYMENT_METHODS: PaymentMethod[] = ['pix', 'cartao_credito', 'cartao_debito', 'dinheiro'];
+    const paymentMethod = req.body?.payment_method as PaymentMethod;
+    if (!paymentMethod || !VALID_PAYMENT_METHODS.includes(paymentMethod)) {
+      await rollbackTab();
+      return res.status(400).json({ error: 'Forma de pagamento inválida.' });
+    }
+
+    // 4. Fetch table info and linked tables
+    const { data: tableData, error: tableErr } = await supabase
+      .from('dining_tables')
+      .select('*')
+      .eq('id', lockedTab.table_id)
+      .maybeSingle();
+
+    if (tableErr) {
+      await rollbackTab();
+      return res.status(500).json({ error: tableErr.message });
+    }
+
+    const { data: tabLinks, error: linksErr } = await supabase
+      .from('table_tab_links')
+      .select('table_id')
+      .eq('tab_id', req.params.id);
+
+    if (linksErr) {
+      await rollbackTab();
+      return res.status(500).json({ error: linksErr.message });
+    }
+
+    let linkedNumbers: number[] = [];
+    if (tabLinks && tabLinks.length > 0) {
+      const linkedIds = tabLinks.map((l: any) => l.table_id);
+      const { data: linkedTablesData, error: linkedTablesErr } = await supabase
+        .from('dining_tables')
+        .select('number')
+        .in('id', linkedIds);
+
+      if (linkedTablesErr) {
+        await rollbackTab();
+        return res.status(500).json({ error: linkedTablesErr.message });
+      }
+      linkedNumbers = (linkedTablesData || []).map((t: any) => Number(t.number));
+    }
+
+    const allTableNumbers = [
+      ...(tableData?.number ? [Number(tableData.number)] : []),
+      ...linkedNumbers,
+    ].sort((a, b) => a - b);
+
+    const tableName = allTableNumbers.length > 0
+      ? `Mesa ${allTableNumbers.join(' + ')}`
+      : `Mesa ${tableData?.number || '?'}${tableData?.label ? ` (${tableData.label})` : ''}`;
+
+    // 5. Fetch products for active items only
+    const productIds = Array.from(new Set(activeItems.map((it) => it.productId)));
+    const { data: prodRows, error: prodErr } = await supabase
+      .from('products')
+      .select('*')
+      .in('id', productIds);
+
+    if (prodErr) {
+      await rollbackTab();
+      return res.status(500).json({ error: prodErr.message });
+    }
+
+    const prodMap = new Map((prodRows || []).map((p: any) => [String(p.id), p]));
+
+    // 6. Round subtotal to cents BEFORE calculating service fee and total
+    const rawSubtotal = activeItems.reduce((acc, it) => acc + it.unitPrice * it.quantity, 0);
+    const subtotal = Math.round(rawSubtotal * 100) / 100;
+    const feePct = Math.max(0, Math.min(20, Number(req.body.service_fee_percent) || 0));
+    const serviceFee = Math.round(subtotal * (feePct / 100) * 100) / 100;
+
+    const rawDiscountInput =
+      req.body.discount !== undefined && req.body.discount !== null && String(req.body.discount).trim() !== ''
+        ? Number(req.body.discount)
+        : 0;
+
+    if (
+      Number.isNaN(rawDiscountInput) ||
+      Math.round(rawDiscountInput * 100) < 0 ||
+      Math.round(rawDiscountInput * 100) > Math.round((subtotal + serviceFee) * 100)
+    ) {
+      await rollbackTab();
+      return res.status(400).json({ error: 'O desconto não pode ser maior que o valor da conta.' });
+    }
+
+    const discountVal = Math.round(rawDiscountInput * 100) / 100;
+    const total = Math.max(0, Math.round((subtotal + serviceFee - discountVal) * 100) / 100);
+
+    if (
+      req.body.expected_subtotal !== undefined &&
+      req.body.expected_subtotal !== null &&
+      String(req.body.expected_subtotal).trim() !== ''
+    ) {
+      const expectedSub = Number(req.body.expected_subtotal);
+      if (!Number.isNaN(expectedSub) && Math.round(expectedSub * 100) !== Math.round(subtotal * 100)) {
+        await rollbackTab();
+        return res.status(409).json({
+          error: `A conta mudou: novo total R$ ${total.toFixed(2).replace('.', ',')}`,
+          newSubtotal: subtotal,
+          newTotal: total,
+        });
+      }
+    }
+
+    let cashChangeFor: number | undefined = undefined;
+    if (paymentMethod === 'dinheiro') {
+      if (
+        req.body.cash_change_for !== undefined &&
+        req.body.cash_change_for !== null &&
+        String(req.body.cash_change_for).trim() !== ''
+      ) {
+        const parsedCash = Number(req.body.cash_change_for);
+        if (Number.isNaN(parsedCash) || Math.round(parsedCash * 100) < Math.round(total * 100)) {
+          await rollbackTab();
+          return res.status(400).json({ error: 'Valor recebido menor que o total da conta.' });
+        }
+        cashChangeFor = Math.round(parsedCash * 100) / 100;
+      }
+    }
+
+    // 7. Map order items (name = product name only without volume, volume goes in volume field)
+    const orderItems: OrderItem[] = activeItems.map((it) => {
+      const p = prodMap.get(it.productId);
+      const saleUnit = it.saleUnit === 'case' ? 'case' : 'unit';
+      const unitsPerSale = it.unitsPerSale && it.unitsPerSale > 0 ? it.unitsPerSale : 1;
+      return {
+        productId: it.productId,
+        name: p?.name || it.productName,
+        volume: p?.volume || '',
+        price: it.unitPrice,
+        originalPrice: saleUnit === 'case' ? it.unitPrice : (p?.price ? Number(p.price) : it.unitPrice),
+        costPrice: (p?.cost_price ? Number(p.cost_price) : 0) * unitsPerSale,
+        quantity: it.quantity,
+        saleUnit,
+        unitsPerSale,
+        isCold: p?.is_cold ?? true,
+      };
+    });
+
+    const customerName = lockedTab.customer_name?.trim() ? `${lockedTab.customer_name} - ${tableName}` : tableName;
+
+    let orderNotes = tableName;
+    if (feePct > 0) {
+      orderNotes += ` | Taxa de serviço (${feePct}%): R$ ${serviceFee.toFixed(2)}`;
+    }
+    if (lockedTab.notes?.trim()) {
+      orderNotes += ` | Obs da mesa: ${lockedTab.notes.trim()}`;
+    }
+    if (req.body.notes && String(req.body.notes).trim()) {
+      orderNotes += ` | ${String(req.body.notes).trim()}`;
+    }
+
+    const orderId = `PED-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+
+    const newOrder: Order = {
+      id: orderId,
+      source: 'mesa',
+      status: 'concluido',
+      customer: {
+        name: customerName,
+        phone: 'Presencial',
+        address: `Consumo no Local - ${tableName}`,
+        number: '',
+        neighborhood: 'Salão',
+      },
+      deliveryType: 'local',
+      items: orderItems,
+      subtotal,
+      deliveryFee: 0,
+      discount: discountVal,
+      total,
+      paymentMethod,
+      cashChangeFor,
+      notes: orderNotes,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    // 8. Atomic close RPC finish_table_tab_close
+    const { error: closeRpcErr } = await supabase.rpc('finish_table_tab_close', {
+      p_tab_id: req.params.id,
+      p_order: orderToDB(newOrder),
+    });
+
+    if (closeRpcErr) {
+      console.error('[Supabase RPC Error] finish_table_tab_close:', closeRpcErr.message);
+      await rollbackTab();
+      return res.status(500).json({ error: translateTabRpcError(closeRpcErr.message) });
+    }
+
+    res.json({ success: true, order: newOrder });
+  });
+
+  // 14. Cancel tab: restores stock of all active items via RPC cancel_table_tab
+  router.post('/admin/tabs/:id/cancel', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { error: rpcErr } = await supabase.rpc('cancel_table_tab', {
+      p_tab_id: req.params.id,
+    });
+
+    if (rpcErr) {
+      console.error('[Supabase RPC Error] cancel_table_tab:', rpcErr.message);
+      return res.status(400).json({ error: translateTabRpcError(rpcErr.message) });
+    }
+
+    if (req.body?.reason) {
+      const { data: currentTab } = await supabase
+        .from('table_tabs')
+        .select('notes')
+        .eq('id', req.params.id)
+        .maybeSingle();
+
+      const noteAdd = `[Cancelada: ${String(req.body.reason).trim()}]`;
+      const updatedNotes = currentTab?.notes ? `${currentTab.notes} ${noteAdd}` : noteAdd;
+
+      await supabase
+        .from('table_tabs')
+        .update({ notes: updatedNotes, updated_at: new Date().toISOString() })
+        .eq('id', req.params.id);
+    }
 
     res.json({ success: true });
   });

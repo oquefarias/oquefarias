@@ -1,4 +1,18 @@
-import { Product, Order, StoreSettings, OrderStatus, DeliveryArea, CustomerProfile, Coupon } from '../types';
+import {
+  Product,
+  Order,
+  StoreSettings,
+  OrderStatus,
+  DeliveryArea,
+  CustomerProfile,
+  Coupon,
+  DiningTable,
+  TableTab,
+  TableTabItem,
+  TableWithTab,
+  TabDetail,
+  PaymentMethod,
+} from '../types';
 import { initialProducts, initialOrders, initialSettings, initialDeliveryAreas, initialCustomers } from '../data/initialData';
 import { soundService } from '../utils/sound';
 
@@ -46,6 +60,9 @@ class ApiService {
   private listeners: Array<() => void> = [];
   private version: number = 0;
   private pollingInterval: any = null;
+  private productPollingInterval: any = null;
+  private tokenRefreshInterval: any = null;
+  private adminSessionExpiredMessage: string = '';
 
   // In-memory state synchronized directly with the server API
   private state: {
@@ -100,13 +117,92 @@ class ApiService {
   }
 
   // ================= ADMIN AUTH & HEADERS =================
+  private getTokenExpirationMs(token: string | null): number | null {
+    if (!token) return null;
+    try {
+      const parts = token.split('.');
+      if (parts.length !== 2) return null;
+      const base64 = parts[0].replace(/-/g, '+').replace(/_/g, '/');
+      const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+      const json = atob(padded);
+      const payload = JSON.parse(json);
+      return typeof payload?.exp === 'number' ? payload.exp : null;
+    } catch {
+      return null;
+    }
+  }
+
   public getAdminToken(): string | null {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem(STORAGE_KEY_ADMIN_TOKEN);
   }
 
   public isAdminAuthenticated(): boolean {
-    return Boolean(this.getAdminToken());
+    const token = this.getAdminToken();
+    if (!token) return false;
+    const expMs = this.getTokenExpirationMs(token);
+    if (expMs !== null && expMs <= Date.now()) {
+      this.handleAdminSessionExpired();
+      return false;
+    }
+    return true;
+  }
+
+  public getAdminSessionExpiredMessage(): string {
+    return this.adminSessionExpiredMessage;
+  }
+
+  public clearAdminSessionExpiredMessage(): void {
+    this.adminSessionExpiredMessage = '';
+  }
+
+  private handleAdminSessionExpired(): void {
+    const expiredMsg = 'Sua sessão expirou. Digite o PIN novamente.';
+    this.adminSessionExpiredMessage = expiredMsg;
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem(STORAGE_KEY_ADMIN_TOKEN);
+      try {
+        window.dispatchEvent(new CustomEvent('deposito_admin_expired', { detail: { message: expiredMsg } }));
+      } catch {}
+    }
+    this.stopOrderPolling();
+    this.state.orders = [];
+    this.state.customers = [];
+    this.state.coupons = [];
+    this.notifyListeners();
+  }
+
+  public async checkAndRefreshAdminToken(): Promise<void> {
+    const token = this.getAdminToken();
+    if (!token) return;
+    const expMs = this.getTokenExpirationMs(token);
+    if (expMs === null) return;
+    const remainingMs = expMs - Date.now();
+    if (remainingMs <= 0) {
+      this.handleAdminSessionExpired();
+      return;
+    }
+    // If less than 2 hours remain, renew via POST /api/admin/refresh
+    if (remainingMs < 2 * 60 * 60 * 1000) {
+      try {
+        const res = await fetch('/api/admin/refresh', {
+          method: 'POST',
+          headers: this.getAdminHeaders(),
+        });
+        if (res.status === 401) {
+          this.handleAdminSessionExpired();
+          return;
+        }
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.token && typeof window !== 'undefined') {
+            localStorage.setItem(STORAGE_KEY_ADMIN_TOKEN, data.token);
+          }
+        }
+      } catch {
+        // Ignore transient network errors during background token renewal
+      }
+    }
   }
 
   public getAdminHeaders(): Record<string, string> {
@@ -270,6 +366,7 @@ class ApiService {
     try {
       const res = await fetch('/api/customer/me', {
         headers: this.getCustomerHeaders(),
+        cache: 'no-store',
       });
       if (res.ok) {
         const cust: CustomerProfile = await res.json();
@@ -310,6 +407,7 @@ class ApiService {
   public async getCustomerOrders(): Promise<Order[]> {
     const res = await fetch('/api/customer/orders', {
       headers: this.getCustomerHeaders(),
+      cache: 'no-store',
     });
 
     if (!res.ok) {
@@ -328,6 +426,7 @@ class ApiService {
   public async getCustomerOrder(orderId: string): Promise<Order> {
     const res = await fetch(`/api/customer/orders/${encodeURIComponent(orderId)}`, {
       headers: this.getCustomerHeaders(),
+      cache: 'no-store',
     });
 
     if (!res.ok) {
@@ -360,6 +459,7 @@ class ApiService {
       const qs = params.toString();
       const res = await fetch(`/api/customer/delivery-quote${qs ? `?${qs}` : ''}`, {
         headers: this.getCustomerHeaders(),
+        cache: 'no-store',
       });
       if (!res.ok) return null;
       return await res.json();
@@ -370,15 +470,12 @@ class ApiService {
   }
 
   // ================= NOTIFICATIONS & ERRORS =================
-  private notifyError(message: string) {
+  public notifyError(message: string) {
     console.error(`[Depósito API Error] ${message}`);
     if (typeof window !== 'undefined') {
       try {
         window.dispatchEvent(new CustomEvent('deposito_db_error', { detail: { message } }));
       } catch {}
-      setTimeout(() => {
-        alert(message);
-      }, 50);
     }
   }
 
@@ -405,21 +502,42 @@ class ApiService {
     return this.version;
   }
 
-  // ================= ORDER & STOCK POLLING (EVERY 10 SECONDS) =================
+  // ================= ORDER & STOCK POLLING =================
   private startOrderPolling() {
     this.stopOrderPolling();
     if (!this.isAdminAuthenticated()) return;
 
     this.pollOrders();
+    this.checkAndRefreshAdminToken();
+
+    // Poll orders every 10s
     this.pollingInterval = setInterval(() => {
       this.pollOrders();
     }, 10000);
+
+    // Poll products/stock every 15s while admin panel is open
+    this.productPollingInterval = setInterval(() => {
+      this.reloadProducts();
+    }, 15000);
+
+    // Check token expiration every 30 minutes and auto-renew if < 2h remaining
+    this.tokenRefreshInterval = setInterval(() => {
+      this.checkAndRefreshAdminToken();
+    }, 30 * 60 * 1000);
   }
 
   private stopOrderPolling() {
     if (this.pollingInterval) {
       clearInterval(this.pollingInterval);
       this.pollingInterval = null;
+    }
+    if (this.productPollingInterval) {
+      clearInterval(this.productPollingInterval);
+      this.productPollingInterval = null;
+    }
+    if (this.tokenRefreshInterval) {
+      clearInterval(this.tokenRefreshInterval);
+      this.tokenRefreshInterval = null;
     }
   }
 
@@ -434,14 +552,16 @@ class ApiService {
       const [ordersRes, prodRes] = await Promise.all([
         fetch('/api/admin/orders', {
           headers: { Authorization: `Bearer ${token}` },
+          cache: 'no-store',
         }),
         fetch('/api/products', {
           headers: { Authorization: `Bearer ${token}` },
+          cache: 'no-store',
         }),
       ]);
 
-      if (ordersRes.status === 401) {
-        this.logoutAdmin();
+      if (ordersRes.status === 401 || prodRes.status === 401) {
+        this.handleAdminSessionExpired();
         return;
       }
 
@@ -450,7 +570,7 @@ class ApiService {
         if (Array.isArray(fetchedOrders)) {
           const existingIds = new Set(this.state.orders.map((o) => o.id));
           const hasNewPendingOrder = fetchedOrders.some(
-            (fo) => !existingIds.has(fo.id) && fo.status === 'pendente'
+            (fo) => !existingIds.has(fo.id) && fo.status === 'pendente' && fo.source !== 'mesa'
           );
 
           if (hasNewPendingOrder) {
@@ -484,6 +604,7 @@ class ApiService {
           headers: {
             Authorization: `Bearer ${token}`,
           },
+          cache: 'no-store',
         });
 
         if (res.ok) {
@@ -502,8 +623,8 @@ class ApiService {
         }
 
         if (res.status === 401) {
-          console.warn('[Admin] Sessão expirada ou inválida. Retornando ao estado público.');
-          this.logoutAdmin();
+          console.warn('[Admin] Sessão expirada ou inválida. Retornando à tela de PIN.');
+          this.handleAdminSessionExpired();
           return;
         }
       } catch (err) {
@@ -514,7 +635,9 @@ class ApiService {
     // Public state for store customer
     try {
       this.stopOrderPolling();
-      const res = await fetch('/api/state');
+      const res = await fetch('/api/state', {
+        cache: 'no-store',
+      });
       if (res.ok) {
         const data = await res.json();
         this.state = {
@@ -560,6 +683,7 @@ class ApiService {
 
       const data = await res.json();
       if (data && data.token) {
+        this.adminSessionExpiredMessage = '';
         localStorage.setItem(STORAGE_KEY_ADMIN_TOKEN, data.token);
         await this.syncWithBackend();
         return { success: true, status: 200 };
@@ -573,6 +697,7 @@ class ApiService {
   }
 
   public logoutAdmin(): void {
+    this.adminSessionExpiredMessage = '';
     if (typeof window !== 'undefined') {
       localStorage.removeItem(STORAGE_KEY_ADMIN_TOKEN);
     }
@@ -592,7 +717,10 @@ class ApiService {
   public async reloadProducts(): Promise<void> {
     try {
       const token = this.getAdminToken();
-      const res = await fetch('/api/products', token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
+      const res = await fetch('/api/products', {
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        cache: 'no-store',
+      });
       if (res.ok) {
         const prods = await res.json();
         if (Array.isArray(prods)) {
@@ -619,6 +747,11 @@ class ApiService {
       }),
     });
 
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
     if (!res.ok) {
       let message = 'Não foi possível salvar a promoção do produto.';
       try {
@@ -638,6 +771,11 @@ class ApiService {
       method: 'DELETE',
       headers: this.getAdminHeaders(),
     });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
 
     if (!res.ok) {
       let message = 'Não foi possível encerrar a promoção do produto.';
@@ -665,6 +803,11 @@ class ApiService {
       body: JSON.stringify(product),
     });
 
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
     if (!res.ok) {
       let message = 'Não foi possível salvar o produto no banco de dados.';
       try {
@@ -678,12 +821,17 @@ class ApiService {
     await this.reloadProducts();
   }
 
-  public async adjustStock(productId: string, delta: number): Promise<void> {
+  public async adjustStock(productId: string, delta: number, unit: 'unit' | 'case' = 'unit'): Promise<void> {
     const res = await fetch(`/api/products/${productId}/stock`, {
       method: 'POST',
       headers: this.getAdminHeaders(),
-      body: JSON.stringify({ delta }),
+      body: JSON.stringify({ delta, unit }),
     });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
 
     if (!res.ok) {
       let message = 'Não foi possível alterar o estoque no banco de dados.';
@@ -703,6 +851,11 @@ class ApiService {
       method: 'DELETE',
       headers: this.getAdminHeaders(),
     });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
 
     if (!res.ok) {
       let message = 'Não foi possível excluir o produto no banco de dados.';
@@ -734,6 +887,11 @@ class ApiService {
       body: JSON.stringify(area),
     });
 
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
     if (!res.ok) {
       let message = 'Não foi possível salvar a taxa de entrega no banco de dados.';
       try {
@@ -759,6 +917,11 @@ class ApiService {
       method: 'DELETE',
       headers: this.getAdminHeaders(),
     });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
 
     if (!res.ok) {
       let message = 'Não foi possível excluir a área de entrega no banco de dados.';
@@ -792,6 +955,11 @@ class ApiService {
       body: JSON.stringify(customer),
     });
 
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
     if (!res.ok) {
       let message = 'Não foi possível salvar o cliente no banco de dados.';
       try {
@@ -818,6 +986,11 @@ class ApiService {
       method: 'DELETE',
       headers: this.getAdminHeaders(),
     });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
 
     if (!res.ok) {
       let message = 'Não foi possível excluir o cliente no banco de dados.';
@@ -861,13 +1034,20 @@ class ApiService {
       body: JSON.stringify(newOrder),
     });
 
+    if (res.status === 401 && newOrder.source === 'balcao') {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
     if (!res.ok) {
       let message = 'Não foi possível realizar o pedido.';
       try {
         const json = await res.json();
         if (json?.error) message = json.error;
       } catch {}
-      this.notifyError(message);
+      if (newOrder.source === 'balcao') {
+        this.notifyError(message);
+      }
       throw new Error(message);
     }
 
@@ -885,12 +1065,21 @@ class ApiService {
     return createdOrder;
   }
 
-  public async updateOrderStatus(orderId: string, status: OrderStatus): Promise<void> {
+  public async updateOrderStatus(orderId: string, status: OrderStatus, notes?: string): Promise<void> {
+    const payload: { status: OrderStatus; notes?: string } = { status };
+    if (notes !== undefined) {
+      payload.notes = notes;
+    }
     const res = await fetch(`/api/orders/${orderId}/status`, {
       method: 'PATCH',
       headers: this.getAdminHeaders(),
-      body: JSON.stringify({ status }),
+      body: JSON.stringify(payload),
     });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
 
     if (!res.ok) {
       let message = 'Não foi possível atualizar o status do pedido no banco de dados.';
@@ -919,6 +1108,11 @@ class ApiService {
       headers: this.getAdminHeaders(),
     });
 
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
     if (!res.ok) {
       let message = 'Não foi possível excluir o pedido no banco de dados.';
       try {
@@ -930,6 +1124,7 @@ class ApiService {
     }
 
     this.state.orders = this.state.orders.filter((o) => o.id !== orderId);
+    await this.reloadProducts();
     this.notifyListeners();
   }
 
@@ -941,7 +1136,7 @@ class ApiService {
   public async validateCoupon(
     code: string,
     subtotal: number,
-    items?: Array<{ productId: string; quantity: number }>
+    items?: Array<{ productId: string; quantity: number; saleUnit?: 'unit' | 'case' }>
   ): Promise<CouponValidationResult> {
     const res = await fetch('/api/coupons/validate', {
       method: 'POST',
@@ -964,7 +1159,13 @@ class ApiService {
   public async getAdminCoupons(): Promise<Coupon[]> {
     const res = await fetch('/api/admin/coupons', {
       headers: this.getAdminHeaders(),
+      cache: 'no-store',
     });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
 
     if (!res.ok) {
       let message = 'Erro ao listar cupons.';
@@ -989,6 +1190,11 @@ class ApiService {
       body: JSON.stringify(data),
     });
 
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
     if (!res.ok) {
       let message = 'Erro ao criar cupom.';
       try {
@@ -1011,6 +1217,11 @@ class ApiService {
       headers: this.getAdminHeaders(),
       body: JSON.stringify(data),
     });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
 
     if (!res.ok) {
       let message = 'Erro ao atualizar cupom.';
@@ -1036,6 +1247,11 @@ class ApiService {
       method: 'DELETE',
       headers: this.getAdminHeaders(),
     });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
 
     if (!res.ok) {
       let message = 'Erro ao excluir cupom.';
@@ -1063,6 +1279,11 @@ class ApiService {
       body: JSON.stringify(settings),
     });
 
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
     if (!res.ok) {
       let message = 'Não foi possível salvar as configurações no banco de dados.';
       try {
@@ -1079,22 +1300,327 @@ class ApiService {
     this.notifyListeners();
   }
 
-  public async clearAllSimulationData(): Promise<void> {
-    const res = await fetch('/api/clear-all', {
-      method: 'POST',
+  // ================= MESAS E COMANDAS =================
+  public async getAdminTables(): Promise<TableWithTab[]> {
+    const res = await fetch('/api/admin/tables', {
       headers: this.getAdminHeaders(),
+      cache: 'no-store',
     });
-
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
     if (!res.ok) {
-      let message = 'Não foi possível zerar os dados de simulação.';
+      let message = 'Erro ao carregar mesas.';
       try {
         const json = await res.json();
-        if (json?.error) message = `Não foi possível salvar no banco: ${json.error}`;
+        if (json?.error) message = json.error;
       } catch {}
-      this.notifyError(message);
       throw new Error(message);
     }
+    return await res.json();
+  }
 
+  public async createAdminTable(data: { number: number; label?: string; seats?: number }): Promise<DiningTable> {
+    const res = await fetch('/api/admin/tables', {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(data),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível cadastrar a mesa.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    return await res.json();
+  }
+
+  public async updateAdminTable(id: string, data: { number?: number; label?: string; seats?: number; active?: boolean }): Promise<DiningTable> {
+    const res = await fetch(`/api/admin/tables/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(data),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível atualizar a mesa.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    return await res.json();
+  }
+
+  public async deleteAdminTable(id: string): Promise<void> {
+    const res = await fetch(`/api/admin/tables/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: this.getAdminHeaders(),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível remover a mesa.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+  }
+
+  public async openTableTab(tableId: string, data: { customer_name?: string; people_count?: number; notes?: string }): Promise<TableTab> {
+    const res = await fetch(`/api/admin/tables/${encodeURIComponent(tableId)}/open`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(data),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível abrir a comanda.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    return await res.json();
+  }
+
+  public async getTabDetail(tabId: string): Promise<TabDetail> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}`, {
+      headers: this.getAdminHeaders(),
+      cache: 'no-store',
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível carregar os detalhes da comanda.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    return await res.json();
+  }
+
+  public async updateTabInfo(tabId: string, data: { customer_name?: string; people_count?: number; notes?: string }): Promise<TableTab> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}`, {
+      method: 'PATCH',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(data),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível atualizar as informações da comanda.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    return await res.json();
+  }
+
+  public async addTabItem(
+    tabId: string,
+    data: { product_id: string; quantity: number; sale_unit?: 'unit' | 'case'; notes?: string }
+  ): Promise<{ itemId: string }> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}/items`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(data),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível adicionar o produto à comanda.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    const json = await res.json();
+    await this.reloadProducts();
+    return json;
+  }
+
+  public async cancelTabItem(tabId: string, itemId: string): Promise<void> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}/items/${encodeURIComponent(itemId)}`, {
+      method: 'DELETE',
+      headers: this.getAdminHeaders(),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível cancelar o item da comanda.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    await this.reloadProducts();
+  }
+
+  public async transferTabItem(tabId: string, itemId: string, toTabId: string): Promise<void> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}/items/${encodeURIComponent(itemId)}/transfer`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ to_tab_id: toTabId }),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível transferir o item.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+  }
+
+  public async joinTableToTab(tabId: string, tableId: string): Promise<void> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}/join`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ table_id: tableId }),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível juntar a mesa à comanda.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+  }
+
+  public async unjoinTableFromTab(tabId: string, tableId: string): Promise<void> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}/unjoin`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ table_id: tableId }),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível separar a mesa da comanda.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+  }
+
+  public async moveTab(tabId: string, toTableId: string): Promise<void> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}/move`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ to_table_id: toTableId }),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível trocar a mesa.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+  }
+
+  public async closeTab(
+    tabId: string,
+    data: {
+      payment_method: PaymentMethod;
+      service_fee_percent?: number;
+      discount?: number;
+      cash_change_for?: number;
+      expected_subtotal?: number;
+      notes?: string;
+    }
+  ): Promise<{ order: Order }> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}/close`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(data),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível fechar a comanda.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    const json = await res.json();
+    await this.syncWithBackend();
+    return json;
+  }
+
+  public async cancelTab(tabId: string, reason?: string): Promise<void> {
+    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}/cancel`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ reason }),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível cancelar a comanda.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
     await this.syncWithBackend();
   }
 }

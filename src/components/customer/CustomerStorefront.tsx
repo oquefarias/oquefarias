@@ -9,9 +9,11 @@ import {
   ProductCategory,
   Product,
   StoreSettings,
+  SaleUnit,
   isProductPromoActive,
   getEffectiveProductPrice,
   getPromoDiscountPercent,
+  hasProductCase,
 } from '../../types';
 import { api, CouponValidationResult, CustomerDeliveryQuoteResult } from '../../services/api';
 import { CustomerAuthModal } from './CustomerAuthModal';
@@ -45,6 +47,7 @@ import {
 } from 'lucide-react';
 import {
   calculateDistanceKm,
+  checkPinOffsetLimit,
   resolveAddressOrCep,
   fetchAddressByCep,
   fetchCoordinatesByCepBrasilApi,
@@ -60,6 +63,7 @@ interface CustomerStorefrontProps {
 interface CartItem {
   product: Product;
   quantity: number;
+  saleUnit: SaleUnit;
 }
 
 export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products, settings, deliveryAreas }) => {
@@ -67,6 +71,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [onlyCold, setOnlyCold] = useState<boolean>(false);
   const [cart, setCart] = useState<CartItem[]>([]);
+  const [selectedUnits, setSelectedUnits] = useState<Record<string, SaleUnit>>({});
   const [isCartOpen, setIsCartOpen] = useState<boolean>(false);
 
   // Customer Account state
@@ -89,6 +94,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [cashChangeFor, setCashChangeFor] = useState<string>('');
   const [orderNotes, setOrderNotes] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [checkoutClientRequestId, setCheckoutClientRequestId] = useState<string>(() => crypto.randomUUID());
   const [placedOrder, setPlacedOrder] = useState<Order | null>(null);
   const [copiedPix, setCopiedPix] = useState<boolean>(false);
   const [checkingDistance, setCheckingDistance] = useState<boolean>(false);
@@ -98,10 +104,18 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [checkoutState, setCheckoutState] = useState<string>(currentCustomer?.state || '');
   const [checkoutLat, setCheckoutLat] = useState<number | undefined>(currentCustomer?.latitude);
   const [checkoutLng, setCheckoutLng] = useState<number | undefined>(currentCustomer?.longitude);
-  const [checkoutPrecisao, setCheckoutPrecisao] = useState<string | null>(null);
+  const [checkoutGeoLat, setCheckoutGeoLat] = useState<number | undefined>(
+    currentCustomer?.geoLatitude ?? currentCustomer?.latitude
+  );
+  const [checkoutGeoLng, setCheckoutGeoLng] = useState<number | undefined>(
+    currentCustomer?.geoLongitude ?? currentCustomer?.longitude
+  );
+  const [checkoutPrecisao, setCheckoutPrecisao] = useState<string | null>(
+    currentCustomer?.geoPrecision || null
+  );
   const [isConfirmingPin, setIsConfirmingPin] = useState<boolean>(false);
   const [isPinConfirmed, setIsPinConfirmed] = useState<boolean>(() =>
-    api.isCustomerPinConfirmed(currentCustomer?.id)
+    Boolean(currentCustomer?.locationVerified || api.isCustomerPinConfirmed(currentCustomer?.id))
   );
 
   // Coupon state
@@ -162,7 +176,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       if (currentCustomer.reference) setReference(currentCustomer.reference);
       setCheckoutLat(currentCustomer.latitude);
       setCheckoutLng(currentCustomer.longitude);
-      setIsPinConfirmed(api.isCustomerPinConfirmed(currentCustomer.id));
+      setCheckoutGeoLat(currentCustomer.geoLatitude ?? currentCustomer.latitude);
+      setCheckoutGeoLng(currentCustomer.geoLongitude ?? currentCustomer.longitude);
+      setCheckoutPrecisao(currentCustomer.geoPrecision || null);
+      setIsPinConfirmed(
+        Boolean(currentCustomer.locationVerified || api.isCustomerPinConfirmed(currentCustomer.id))
+      );
       if (currentCustomer.distanceKm !== undefined && currentCustomer.isWithinDeliveryRadius !== undefined) {
         setCustomerDistance({
           km: currentCustomer.distanceKm,
@@ -173,6 +192,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setDeliveryQuote(null);
       setCheckoutLat(undefined);
       setCheckoutLng(undefined);
+      setCheckoutGeoLat(undefined);
+      setCheckoutGeoLng(undefined);
       setCheckoutPrecisao(null);
       setIsPinConfirmed(false);
     }
@@ -238,6 +259,13 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         longitude: newLng,
       });
       setCurrentCustomer(updated);
+      if (updated.geoLatitude !== undefined && updated.geoLatitude !== null && updated.geoLongitude !== undefined && updated.geoLongitude !== null) {
+        setCheckoutGeoLat(updated.geoLatitude);
+        setCheckoutGeoLng(updated.geoLongitude);
+      }
+      if (updated.geoPrecision) {
+        setCheckoutPrecisao(updated.geoPrecision);
+      }
       if (markConfirmed && updated.id) {
         api.markCustomerPinConfirmed(updated.id);
         setIsPinConfirmed(true);
@@ -245,12 +273,19 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       await refreshServerDeliveryQuote(
         cart.reduce((s, i) => {
           const cp = products.find((p) => p.id === i.product.id) || i.product;
-          return s + getEffectiveProductPrice(cp) * i.quantity;
+          const unitPrice =
+            i.saleUnit === 'case' && hasProductCase(cp)
+              ? Number(cp.casePrice)
+              : getEffectiveProductPrice(cp);
+          return s + unitPrice * i.quantity;
         }, 0),
         extraFields?.neighborhood ?? neighborhood
       );
-    } catch (err) {
+    } catch (err: any) {
       console.warn('Falha ao atualizar coordenadas do cliente:', err);
+      if (err?.message) {
+        setCheckoutError(err.message);
+      }
     } finally {
       setIsConfirmingPin(false);
     }
@@ -296,6 +331,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       if (resolved) {
         setCheckoutLat(resolved.latitude);
         setCheckoutLng(resolved.longitude);
+        setCheckoutGeoLat(resolved.latitude);
+        setCheckoutGeoLng(resolved.longitude);
         setCheckoutPrecisao(resolved.precisao);
 
         await persistCheckoutCoordinates(resolved.latitude, resolved.longitude, false, {
@@ -340,6 +377,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       if (resolved) {
         setCheckoutLat(resolved.latitude);
         setCheckoutLng(resolved.longitude);
+        setCheckoutGeoLat(resolved.latitude);
+        setCheckoutGeoLng(resolved.longitude);
         setCheckoutPrecisao(resolved.precisao);
 
         await persistCheckoutCoordinates(resolved.latitude, resolved.longitude, false, {
@@ -361,12 +400,15 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return activeAreas.find(a => a.name.toLowerCase().trim() === neighborhood.toLowerCase().trim());
   }, [activeAreas, neighborhood]);
 
+  const [checkoutError, setCheckoutError] = useState<string>('');
+
   const handleCheckDistance = async () => {
     if (!address.trim()) {
-      alert('Por favor, digite a rua do seu endereço para verificar.');
+      setCepNotice('Por favor, digite a rua do seu endereço para verificar.');
       return;
     }
     setCheckingDistance(true);
+    setCepNotice('');
     try {
       const resolved = await resolveFullAddressOnServer({
         rua: address.trim(),
@@ -379,6 +421,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       if (resolved) {
         setCheckoutLat(resolved.latitude);
         setCheckoutLng(resolved.longitude);
+        setCheckoutGeoLat(resolved.latitude);
+        setCheckoutGeoLng(resolved.longitude);
         setCheckoutPrecisao(resolved.precisao);
         await persistCheckoutCoordinates(resolved.latitude, resolved.longitude, false);
       } else {
@@ -387,14 +431,16 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         if (res) {
           setCheckoutLat(res.lat);
           setCheckoutLng(res.lng);
+          setCheckoutGeoLat(res.lat);
+          setCheckoutGeoLng(res.lng);
           setCheckoutPrecisao(res.precisao || 'rua');
           await persistCheckoutCoordinates(res.lat, res.lng, false);
         } else {
-          alert('Endereço não localizado com precisão. Verifique a rua, número ou CEP digitados.');
+          setCepNotice('Endereço não localizado com precisão. Verifique a rua, número ou CEP digitados.');
         }
       }
     } catch {
-      alert('Não foi possível verificar a distância no momento.');
+      setCepNotice('Não foi possível verificar a distância no momento.');
     } finally {
       setCheckingDistance(false);
     }
@@ -439,16 +485,40 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     });
   }, [products, selectedCategory, onlyCold, searchQuery]);
 
-  // Cart math (always using effective promotional price when active)
+  const getSelectedUnit = (product: Product): SaleUnit => {
+    if (!hasProductCase(product)) return 'unit';
+    if (product.stock < Number(product.caseSize)) return 'unit';
+    return selectedUnits[product.id] || 'unit';
+  };
+
+  const getCartItemUnitPrice = (product: Product, saleUnit: SaleUnit): number => {
+    if (saleUnit === 'case' && hasProductCase(product)) {
+      return Number(product.casePrice);
+    }
+    return getEffectiveProductPrice(product);
+  };
+
+  const getCartTotalUnitsForProduct = (productId: string, cartList: CartItem[] = cart): number => {
+    return cartList
+      .filter((i) => i.product.id === productId)
+      .reduce((sum, i) => {
+        const cp = products.find((p) => p.id === i.product.id) || i.product;
+        const mult = i.saleUnit === 'case' && hasProductCase(cp) ? Number(cp.caseSize) : 1;
+        return sum + i.quantity * mult;
+      }, 0);
+  };
+
+  // Cart math (using casePrice for 'case' and effective promotional price for 'unit')
   const cartSubtotal = useMemo(() => {
     return cart.reduce((sum, item) => {
       const currentProd = products.find((p) => p.id === item.product.id) || item.product;
-      return sum + getEffectiveProductPrice(currentProd) * item.quantity;
+      return sum + getCartItemUnitPrice(currentProd, item.saleUnit) * item.quantity;
     }, 0);
   }, [cart, products]);
 
   const cartPromoSavings = useMemo(() => {
     return cart.reduce((sum, item) => {
+      if (item.saleUnit === 'case') return sum;
       const currentProd = products.find((p) => p.id === item.product.id) || item.product;
       if (isProductPromoActive(currentProd)) {
         const diff = currentProd.price - getEffectiveProductPrice(currentProd);
@@ -488,6 +558,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         if (resolved) {
           setCheckoutLat(resolved.latitude);
           setCheckoutLng(resolved.longitude);
+          setCheckoutGeoLat(resolved.latitude);
+          setCheckoutGeoLng(resolved.longitude);
           setCheckoutPrecisao(resolved.precisao);
         }
       });
@@ -544,6 +616,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       const itemsPayload = cart.map((i) => ({
         productId: i.product.id,
         quantity: i.quantity,
+        saleUnit: i.saleUnit,
       }));
       const res = await api.validateCoupon(couponInput.trim(), cartSubtotal, itemsPayload);
       setAppliedCoupon(res);
@@ -562,34 +635,48 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     setCouponError('');
   };
 
-  const addToCart = (product: Product) => {
+  const addToCart = (product: Product, unitOverride?: SaleUnit) => {
+    const saleUnit: SaleUnit = unitOverride || getSelectedUnit(product);
+    const isCase = saleUnit === 'case' && hasProductCase(product);
+    const unitsPerSale = isCase ? Number(product.caseSize) : 1;
+
     setCart((prev) => {
-      const existing = prev.find((i) => i.product.id === product.id);
+      const usedUnits = getCartTotalUnitsForProduct(product.id, prev);
+      if (usedUnits + unitsPerSale > product.stock) return prev;
+
+      const existing = prev.find((i) => i.product.id === product.id && i.saleUnit === saleUnit);
       if (existing) {
-        if (existing.quantity >= product.stock) return prev;
         return prev.map((i) =>
-          i.product.id === product.id ? { ...i, quantity: i.quantity + 1 } : i
+          i.product.id === product.id && i.saleUnit === saleUnit
+            ? { ...i, quantity: i.quantity + 1 }
+            : i
         );
       }
-      return [...prev, { product, quantity: 1 }];
+      return [...prev, { product, quantity: 1, saleUnit }];
     });
   };
 
-  const removeFromCart = (productId: string) => {
+  const removeFromCart = (productId: string, saleUnit: SaleUnit = 'unit') => {
     setCart((prev) => {
-      const existing = prev.find((i) => i.product.id === productId);
+      const existing = prev.find((i) => i.product.id === productId && i.saleUnit === saleUnit);
       if (!existing) return prev;
-      if (existing.quantity <= 1) {
-        return prev.filter((i) => i.product.id !== productId);
+      const next =
+        existing.quantity <= 1
+          ? prev.filter((i) => !(i.product.id === productId && i.saleUnit === saleUnit))
+          : prev.map((i) =>
+              i.product.id === productId && i.saleUnit === saleUnit
+                ? { ...i, quantity: i.quantity - 1 }
+                : i
+            );
+      if (next.length === 0) {
+        setCheckoutClientRequestId(crypto.randomUUID());
       }
-      return prev.map((i) =>
-        i.product.id === productId ? { ...i, quantity: i.quantity - 1 } : i
-      );
+      return next;
     });
   };
 
-  const getCartQuantity = (productId: string) => {
-    const item = cart.find((i) => i.product.id === productId);
+  const getCartQuantity = (productId: string, saleUnit: SaleUnit = 'unit') => {
+    const item = cart.find((i) => i.product.id === productId && i.saleUnit === saleUnit);
     return item ? item.quantity : 0;
   };
 
@@ -597,14 +684,32 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return val.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
   };
 
+  const hasCheckoutCashTyped = cashChangeFor.trim() !== '';
+  const checkoutCashNum = hasCheckoutCashTyped ? parseFloat(cashChangeFor) : 0;
+  const isCheckoutCashInvalid =
+    paymentMethod === 'dinheiro' &&
+    hasCheckoutCashTyped &&
+    (Number.isNaN(checkoutCashNum) || Math.round(checkoutCashNum * 100) < Math.round(cartTotal * 100));
+
+  const checkoutPinCheck = checkPinOffsetLimit(
+    checkoutGeoLat ?? checkoutLat,
+    checkoutGeoLng ?? checkoutLng,
+    checkoutLat,
+    checkoutLng,
+    checkoutPrecisao || 'rua'
+  );
+  const isCheckoutPinTooFar = deliveryType === 'delivery' && checkoutPinCheck.isTooFar;
+
   // Submit order to depot
   const handleCheckoutSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
+    setCheckoutError('');
     if (!settings.isOpen) {
-      alert(settings.closedMessage || 'Desculpe, o depósito está fechado no momento para novos pedidos.');
+      setCheckoutError(settings.closedMessage || 'Desculpe, o depósito está fechado no momento para novos pedidos.');
       return;
     }
-    if (cart.length === 0) return;
+    if (cart.length === 0 || isCheckoutCashInvalid || isCheckoutPinTooFar) return;
 
     // Requirement: Mandatory login/registration before completing order
     if (!api.isCustomerAuthenticated() || !currentCustomer) {
@@ -613,13 +718,19 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     }
 
     if (!customerName.trim() || !customerPhone.trim()) {
-      alert('Por favor preencha seu nome e telefone.');
+      setCheckoutError('Por favor preencha seu nome e telefone.');
       return;
     }
 
     if (deliveryType === 'delivery') {
       if (!address.trim() || !addressNumber.trim() || !neighborhood.trim()) {
-        alert('Por favor preencha o endereço completo de entrega.');
+        setCheckoutError('Por favor preencha o endereço completo de entrega.');
+        return;
+      }
+      if (isCheckoutPinTooFar) {
+        setCheckoutError(
+          `O alfinete está longe do endereço que você digitou (${checkoutPinCheck.offsetM} m). Confira a rua e o número ou coloque o alfinete na sua casa.`
+        );
         return;
       }
       const radiusCheckFailed =
@@ -627,17 +738,17 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         (customerDistance && !customerDistance.inside);
       if (radiusCheckFailed) {
         const maxRad = deliveryQuote?.deliveryRadiusKm || settings.deliveryRadiusKm || 5;
-        alert(`Endereço fora do raio de entrega de ${maxRad} km. Escolha Retirar no Depósito.`);
+        setCheckoutError(`Endereço fora do raio de entrega de ${maxRad} km. Escolha Retirar no Depósito.`);
         return;
       }
       if (!isAreaCovered) {
-        alert(`Desculpe! O bairro "${neighborhood}" não está na nossa área de entrega atendida.`);
+        setCheckoutError(`Desculpe! O bairro "${neighborhood}" não está na nossa área de entrega atendida.`);
         return;
       }
     }
 
     if (cartSubtotal < settings.minOrderValue) {
-      alert(`O pedido mínimo para entrega é de ${formatCurrency(settings.minOrderValue)}`);
+      setCheckoutError(`O pedido mínimo para entrega é de ${formatCurrency(settings.minOrderValue)}`);
       return;
     }
 
@@ -658,6 +769,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
       const order = await api.createOrder({
         source: 'online',
+        clientRequestId: checkoutClientRequestId,
         couponCode: appliedCoupon?.code,
         customer: {
           name: customerName,
@@ -672,15 +784,19 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         deliveryType,
         items: cart.map((i) => {
           const currentProd = products.find((p) => p.id === i.product.id) || i.product;
-          const effPrice = getEffectiveProductPrice(currentProd);
+          const isCase = i.saleUnit === 'case' && hasProductCase(currentProd);
+          const effPrice = isCase ? Number(currentProd.casePrice) : getEffectiveProductPrice(currentProd);
+          const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
           return {
             productId: currentProd.id,
             name: currentProd.name,
             volume: currentProd.volume,
             price: effPrice,
-            originalPrice: currentProd.price,
+            originalPrice: isCase ? Number(currentProd.casePrice) : currentProd.price,
             costPrice: currentProd.costPrice,
             quantity: i.quantity,
+            saleUnit: isCase ? 'case' : 'unit',
+            unitsPerSale,
             isCold: currentProd.isCold,
           };
         }),
@@ -688,7 +804,10 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         deliveryFee,
         total: cartTotal,
         paymentMethod,
-        cashChangeFor: paymentMethod === 'dinheiro' && cashChangeFor ? parseFloat(cashChangeFor) : undefined,
+        cashChangeFor:
+          paymentMethod === 'dinheiro' && hasCheckoutCashTyped && !Number.isNaN(checkoutCashNum)
+            ? Math.round(checkoutCashNum * 100) / 100
+            : undefined,
         notes: orderNotes,
       });
 
@@ -700,13 +819,70 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
       setPlacedOrder(order);
       setCart([]);
+      setCheckoutClientRequestId(crypto.randomUUID());
       setAppliedCoupon(null);
       setCouponInput('');
       setCouponError('');
+      setCheckoutError('');
       setIsCartOpen(false);
     } catch (err: any) {
       console.error('Falha ao processar pedido:', err);
-      alert(err.message || 'Não foi possível finalizar o pedido. Verifique o estoque dos itens.');
+      const rawMessage: string = err.message || 'Não foi possível finalizar o pedido. Verifique o estoque dos itens.';
+      const lowerMsg = rawMessage.toLowerCase();
+      if (
+        lowerMsg.includes('estoque') ||
+        lowerMsg.includes('indisponível') ||
+        lowerMsg.includes('indisponivel') ||
+        lowerMsg.includes('não encontrado')
+      ) {
+        await api.reloadProducts();
+        const freshProducts = api.getProducts();
+        const freshMap = new Map(freshProducts.map((p) => [p.id, p]));
+        const stockWarnings: string[] = [];
+
+        setCart((prevCart) => {
+          const nextCart: CartItem[] = [];
+          const remainingByProd = new Map<string, number>();
+
+          for (const item of prevCart) {
+            const fp = freshMap.get(item.product.id);
+            if (!fp || !fp.active || fp.stock <= 0) {
+              stockWarnings.push(`Só restam 0 unidades de ${fp?.name || item.product.name}`);
+              continue;
+            }
+            const avail = remainingByProd.has(fp.id) ? remainingByProd.get(fp.id)! : fp.stock;
+            const isCase = item.saleUnit === 'case' && hasProductCase(fp);
+            const mult = isCase ? Number(fp.caseSize) : 1;
+            const requestedUnits = item.quantity * mult;
+
+            if (requestedUnits <= avail) {
+              remainingByProd.set(fp.id, avail - requestedUnits);
+              nextCart.push({ ...item, product: fp });
+            } else {
+              const maxQty = Math.floor(avail / mult);
+              if (maxQty > 0) {
+                remainingByProd.set(fp.id, avail - maxQty * mult);
+                nextCart.push({ ...item, product: fp, quantity: maxQty });
+              } else if (isCase && avail > 0) {
+                // Convert to available loose units if a full case is no longer available
+                remainingByProd.set(fp.id, 0);
+                nextCart.push({ product: fp, quantity: avail, saleUnit: 'unit' });
+              }
+              stockWarnings.push(`Só restam ${fp.stock} unidades de ${fp.name}`);
+            }
+          }
+          return nextCart;
+        });
+
+        const uniqueWarnings = Array.from(new Set(stockWarnings));
+        if (uniqueWarnings.length > 0) {
+          setCheckoutError(uniqueWarnings.join(' • '));
+        } else {
+          setCheckoutError(rawMessage);
+        }
+      } else {
+        setCheckoutError(rawMessage);
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -730,7 +906,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     { id: 'petiscos', label: 'Petiscos & Copos', icon: Package },
   ];
 
-  const getStatusBadgeInfo = (status: OrderStatus, delivType: 'delivery' | 'retirada') => {
+  const getStatusBadgeInfo = (status: OrderStatus, delivType: 'delivery' | 'retirada' | 'local') => {
     switch (status) {
       case 'pendente':
         return { label: 'Recebido', className: 'bg-amber-100 text-amber-800 border-amber-300' };
@@ -738,7 +914,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         return { label: 'Em preparo', className: 'bg-blue-100 text-blue-800 border-blue-300' };
       case 'em_rota':
         return {
-          label: delivType === 'retirada' ? 'Pronto para retirada' : 'Saiu para entrega',
+          label: delivType === 'delivery' ? 'Saiu para entrega' : 'Pronto para retirada',
           className: 'bg-purple-100 text-purple-800 border-purple-300',
         };
       case 'concluido':
@@ -751,7 +927,9 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   };
 
   const buildOrderWhatsAppUrl = (order: Order) => {
-    const phoneDigits = (settings.whatsapp || '').replace(/\D/g, '');
+    const rawDigits = (settings.whatsapp || '').replace(/\D/g, '');
+    const phoneDigits =
+      rawDigits.length === 10 || rawDigits.length === 11 ? `55${rawDigits}` : rawDigits;
     const host = typeof window !== 'undefined' ? window.location.host : '';
     const orderNumber = String(order.id).replace(/^#/, '');
     const customerEmail = order.customer.email || currentCustomer?.email || '';
@@ -767,7 +945,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     lines.push('🛍️ Itens do Pedido:');
     for (const it of order.items) {
       const itemTotal = (Number(it.price) * Number(it.quantity)).toFixed(2);
-      lines.push(`- ${it.quantity}x ${it.name} ${it.volume} - R$ ${itemTotal}`);
+      const isCase = it.saleUnit === 'case' && (it.unitsPerSale || 1) > 1;
+      const label = isCase
+        ? `${it.quantity} cx ${it.name}${it.volume ? ` ${it.volume}` : ''} (c/${it.unitsPerSale})`
+        : `${it.quantity}x ${it.name}${it.volume ? ` ${it.volume}` : ''}`;
+      lines.push(`- ${label} - R$ ${itemTotal}`);
     }
     lines.push('');
     lines.push(`🛒 Valor dos itens: R$ ${Number(order.subtotal).toFixed(2)}`);
@@ -943,12 +1125,18 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
               <h4 className="font-bold text-neutral-900 text-sm mb-3">Itens do Pedido</h4>
               <div className="space-y-2 text-xs">
                 {placedOrder.items.map((it, idx) => {
-                  const wasPromo = it.originalPrice !== undefined && it.originalPrice > it.price;
+                  const isCase = it.saleUnit === 'case' && (it.unitsPerSale || 1) > 1;
+                  const wasPromo = !isCase && it.originalPrice !== undefined && it.originalPrice > it.price;
                   return (
                     <div key={idx} className="flex justify-between items-center py-1 border-b border-neutral-100 last:border-0">
                       <div>
-                        <span className="font-bold text-neutral-800">{it.quantity}x </span>
-                        <span className="text-neutral-700">{it.name}</span>
+                        <span className="font-bold text-neutral-800">
+                          {isCase ? `${it.quantity} cx ` : `${it.quantity}x `}
+                        </span>
+                        <span className="text-neutral-700">
+                          {it.name}
+                          {isCase ? ` (c/${it.unitsPerSale})` : ''}
+                        </span>
                         {wasPromo && (
                           <span className="ml-1.5 px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-black rounded uppercase">
                             PROMO
@@ -992,6 +1180,21 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   <span>Total:</span>
                   <span className="text-amber-600">{formatCurrency(placedOrder.total)}</span>
                 </div>
+                <div className="flex justify-between text-neutral-600 pt-1 border-t border-neutral-200/70">
+                  <span>Forma de Pagamento:</span>
+                  <span className="font-bold text-neutral-900">
+                    {placedOrder.paymentMethod === 'pix' && 'PIX'}
+                    {placedOrder.paymentMethod === 'cartao_credito' && 'Cartão de Crédito'}
+                    {placedOrder.paymentMethod === 'cartao_debito' && 'Cartão de Débito'}
+                    {placedOrder.paymentMethod === 'dinheiro' && 'Dinheiro'}
+                  </span>
+                </div>
+                {placedOrder.cashChangeFor !== undefined && placedOrder.cashChangeFor !== null && (
+                  <div className="flex justify-between text-amber-800 font-semibold">
+                    <span>Troco:</span>
+                    <span>Troco para {formatCurrency(placedOrder.cashChangeFor)}</span>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1192,10 +1395,18 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
           <div className="flex gap-4 sm:gap-5 overflow-x-auto pb-2 snap-x snap-mandatory">
             {promoProducts.map((product) => {
-              const qty = getCartQuantity(product.id);
+              const hasCase = hasProductCase(product);
+              const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
+              const activeUnit = getSelectedUnit(product);
+              const isCaseSelected = activeUnit === 'case' && hasCase;
+              const unitsPerSale = isCaseSelected ? Number(product.caseSize) : 1;
+              const qty = getCartQuantity(product.id, activeUnit);
+              const usedUnits = getCartTotalUnitsForProduct(product.id);
+              const canAddMore = usedUnits + unitsPerSale <= product.stock;
               const isOutOfStock = product.stock <= 0;
               const discountPct = getPromoDiscountPercent(product);
-              const effPrice = getEffectiveProductPrice(product);
+              const unitEffPrice = getEffectiveProductPrice(product);
+              const displayPrice = isCaseSelected ? Number(product.casePrice) : unitEffPrice;
               const formattedEndDate = product.promoEndsAt
                 ? new Date(product.promoEndsAt).toLocaleString('pt-BR', {
                     day: '2-digit',
@@ -1250,53 +1461,114 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                           Termina em {formattedEndDate}
                         </p>
                       )}
+
+                      {hasCase && (
+                        <div className="mt-2.5 space-y-1">
+                          <div className="grid grid-cols-2 gap-1 p-1 bg-neutral-100 rounded-xl border border-neutral-200">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSelectedUnits((prev) => ({ ...prev, [product.id]: 'unit' }))
+                              }
+                              className={`py-1.5 px-2 rounded-lg text-[10px] font-bold transition-all leading-tight text-center cursor-pointer ${
+                                !isCaseSelected
+                                  ? 'bg-white text-neutral-900 shadow-2xs'
+                                  : 'text-neutral-600 hover:text-neutral-900'
+                              }`}
+                            >
+                              <span className="block">Unidade</span>
+                              <span className="text-[10px] font-black text-red-600">
+                                {formatCurrency(unitEffPrice)}
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={caseUnavailable}
+                              onClick={() =>
+                                setSelectedUnits((prev) => ({ ...prev, [product.id]: 'case' }))
+                              }
+                              className={`py-1.5 px-2 rounded-lg text-[10px] font-bold transition-all leading-tight text-center ${
+                                caseUnavailable
+                                  ? 'opacity-40 cursor-not-allowed text-neutral-400'
+                                  : isCaseSelected
+                                  ? 'bg-amber-500 text-neutral-950 shadow-2xs cursor-pointer'
+                                  : 'text-neutral-600 hover:text-neutral-900 cursor-pointer'
+                              }`}
+                            >
+                              <span className="block">Caixa c/{product.caseSize}</span>
+                              <span className="text-[10px] font-black">
+                                {formatCurrency(Number(product.casePrice))}
+                              </span>
+                            </button>
+                          </div>
+                          {caseUnavailable && !isOutOfStock && (
+                            <p className="text-[10px] text-neutral-400 font-semibold text-center">
+                              sem caixa fechada no estoque
+                            </p>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
 
-                  <div className="p-4 pt-2 border-t border-neutral-100 flex items-end justify-between gap-2">
+                  <div className="p-3 sm:p-4 pt-2.5 border-t border-neutral-100 flex flex-col gap-2.5">
                     <div>
-                      <span className="text-xs text-neutral-400 line-through block font-semibold">
-                        De {formatCurrency(product.price)}
-                      </span>
-                      <span className="text-lg sm:text-xl font-black text-red-600 block leading-tight">
-                        Por {formatCurrency(effPrice)}
-                      </span>
+                      {!isCaseSelected ? (
+                        <>
+                          <span className="text-xs text-neutral-400 line-through block font-semibold">
+                            De {formatCurrency(product.price)}
+                          </span>
+                          <span className="text-base sm:text-xl font-black text-red-600 block leading-tight">
+                            Por {formatCurrency(displayPrice)}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <span className="text-[10px] text-amber-700 font-bold block">
+                            Caixa c/{product.caseSize} un.
+                          </span>
+                          <span className="text-base sm:text-xl font-black text-neutral-900 block leading-tight">
+                            {formatCurrency(displayPrice)}
+                          </span>
+                        </>
+                      )}
                     </div>
 
                     {isOutOfStock ? (
                       <button
                         type="button"
                         disabled
-                        className="px-3.5 py-2 bg-neutral-200 text-neutral-500 text-xs font-bold rounded-xl cursor-not-allowed"
+                        className="w-full py-2 px-3 bg-neutral-200 text-neutral-500 text-xs font-bold rounded-xl cursor-not-allowed text-center"
                       >
                         Esgotado
                       </button>
                     ) : qty === 0 ? (
                       <button
                         type="button"
-                        onClick={() => addToCart(product)}
-                        className="flex items-center gap-1 px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white text-xs font-black rounded-xl transition-all shadow-sm active:scale-95 cursor-pointer"
+                        disabled={!canAddMore}
+                        onClick={() => addToCart(product, activeUnit)}
+                        className="w-full flex items-center justify-center gap-1.5 px-3 py-2.5 bg-red-600 hover:bg-red-700 disabled:bg-neutral-300 text-white text-xs font-black rounded-xl transition-all shadow-sm active:scale-95 cursor-pointer"
                       >
-                        <Plus className="w-4 h-4" />
+                        <Plus className="w-4 h-4 shrink-0" />
                         <span>Adicionar</span>
                       </button>
                     ) : (
-                      <div className="flex items-center gap-1.5 bg-neutral-100 p-1 rounded-xl">
+                      <div className="w-full flex items-center justify-between gap-1.5 bg-neutral-100 p-1 rounded-xl">
                         <button
                           type="button"
-                          onClick={() => removeFromCart(product.id)}
-                          className="w-7 h-7 bg-white hover:bg-neutral-200 text-neutral-800 rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
+                          onClick={() => removeFromCart(product.id, activeUnit)}
+                          className="w-8 h-8 shrink-0 bg-white hover:bg-neutral-200 text-neutral-800 rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
                         >
-                          <Minus className="w-3 h-3" />
+                          <Minus className="w-3.5 h-3.5" />
                         </button>
-                        <span className="w-6 text-center font-black text-xs text-neutral-900">{qty}</span>
+                        <span className="flex-1 text-center font-black text-xs text-neutral-900">{qty}</span>
                         <button
                           type="button"
-                          onClick={() => addToCart(product)}
-                          disabled={qty >= product.stock}
-                          className="w-7 h-7 bg-red-600 hover:bg-red-700 disabled:bg-neutral-300 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
+                          onClick={() => addToCart(product, activeUnit)}
+                          disabled={!canAddMore}
+                          className="w-8 h-8 shrink-0 bg-red-600 hover:bg-red-700 disabled:bg-neutral-300 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
                         >
-                          <Plus className="w-3 h-3" />
+                          <Plus className="w-3.5 h-3.5" />
                         </button>
                       </div>
                     )}
@@ -1382,13 +1654,21 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
           <p className="text-xs text-neutral-500 mt-1">Tente buscar por outro termo ou limpar os filtros.</p>
         </div>
       ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4 sm:gap-6">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-6">
           {filteredProducts.map((product) => {
-            const qty = getCartQuantity(product.id);
+            const hasCase = hasProductCase(product);
+            const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
+            const activeUnit = getSelectedUnit(product);
+            const isCaseSelected = activeUnit === 'case' && hasCase;
+            const unitsPerSale = isCaseSelected ? Number(product.caseSize) : 1;
+            const qty = getCartQuantity(product.id, activeUnit);
+            const usedUnits = getCartTotalUnitsForProduct(product.id);
+            const canAddMore = usedUnits + unitsPerSale <= product.stock;
             const isOutOfStock = product.stock <= 0;
             const promoActive = isProductPromoActive(product);
             const discountPct = promoActive ? getPromoDiscountPercent(product) : 0;
             const effPrice = getEffectiveProductPrice(product);
+            const displayPrice = isCaseSelected ? Number(product.casePrice) : effPrice;
 
             return (
               <div
@@ -1424,7 +1704,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   )}
                 </div>
 
-                <div className="p-4 flex-1 flex flex-col justify-between">
+                <div className="p-3 sm:p-4 flex-1 flex flex-col justify-between">
                   <div>
                     <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
                       {product.volume}
@@ -1435,23 +1715,79 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                     <p className="text-xs text-neutral-500 line-clamp-1 mt-1">
                       {product.description}
                     </p>
+
+                    {hasCase && (
+                      <div className="mt-2.5 space-y-1">
+                        <div className="grid grid-cols-2 gap-1 p-1 bg-neutral-100 rounded-xl border border-neutral-200">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSelectedUnits((prev) => ({ ...prev, [product.id]: 'unit' }))
+                            }
+                            className={`py-1.5 px-1 rounded-lg text-[10px] font-bold transition-all leading-tight text-center cursor-pointer ${
+                              !isCaseSelected
+                                ? 'bg-white text-neutral-900 shadow-2xs'
+                                : 'text-neutral-600 hover:text-neutral-900'
+                            }`}
+                          >
+                            <span className="block">Unidade</span>
+                            <span className={`text-[10px] font-black ${promoActive ? 'text-red-600' : 'text-neutral-900'}`}>
+                              {formatCurrency(effPrice)}
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={caseUnavailable}
+                            onClick={() =>
+                              setSelectedUnits((prev) => ({ ...prev, [product.id]: 'case' }))
+                            }
+                            className={`py-1.5 px-1 rounded-lg text-[10px] font-bold transition-all leading-tight text-center ${
+                              caseUnavailable
+                                ? 'opacity-40 cursor-not-allowed text-neutral-400'
+                                : isCaseSelected
+                                ? 'bg-amber-500 text-neutral-950 shadow-2xs cursor-pointer'
+                                : 'text-neutral-600 hover:text-neutral-900 cursor-pointer'
+                            }`}
+                          >
+                            <span className="block">Caixa c/{product.caseSize}</span>
+                            <span className="text-[10px] font-black">
+                              {formatCurrency(Number(product.casePrice))}
+                            </span>
+                          </button>
+                        </div>
+                        {caseUnavailable && !isOutOfStock && (
+                          <p className="text-[10px] text-neutral-400 font-semibold text-center">
+                            sem caixa fechada no estoque
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
 
-                  <div className="mt-4 pt-3 border-t border-neutral-100 flex items-center justify-between">
+                  <div className="mt-3 pt-2.5 border-t border-neutral-100 flex flex-col gap-2">
                     <div>
-                      {promoActive ? (
+                      {isCaseSelected ? (
+                        <>
+                          <span className="text-[10px] text-amber-700 block font-bold">
+                            Caixa c/{product.caseSize} un.
+                          </span>
+                          <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
+                            {formatCurrency(displayPrice)}
+                          </span>
+                        </>
+                      ) : promoActive ? (
                         <>
                           <span className="text-[11px] text-neutral-400 line-through block font-medium">
                             De {formatCurrency(product.price)}
                           </span>
-                          <span className="text-base sm:text-lg font-black text-red-600">
+                          <span className="text-base sm:text-lg font-black text-red-600 block leading-tight">
                             Por {formatCurrency(effPrice)}
                           </span>
                         </>
                       ) : (
                         <>
                           <span className="text-[10px] text-neutral-400 block font-medium">Preço</span>
-                          <span className="text-base sm:text-lg font-black text-neutral-900">
+                          <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
                             {formatCurrency(product.price)}
                           </span>
                         </>
@@ -1462,33 +1798,37 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       <button
                         type="button"
                         disabled
-                        className="px-3 py-1.5 bg-neutral-200 text-neutral-500 text-xs font-bold rounded-xl cursor-not-allowed"
+                        className="w-full py-2 px-3 bg-neutral-200 text-neutral-500 text-xs font-bold rounded-xl cursor-not-allowed text-center"
                       >
                         Esgotado
                       </button>
                     ) : qty === 0 ? (
                       <button
-                        onClick={() => addToCart(product)}
-                        className="flex items-center gap-1 px-3.5 py-2 bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold rounded-xl transition-all shadow-sm shadow-amber-500/20 active:scale-95 cursor-pointer"
+                        type="button"
+                        disabled={!canAddMore}
+                        onClick={() => addToCart(product, activeUnit)}
+                        className="w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-white text-xs font-bold rounded-xl transition-all shadow-sm shadow-amber-500/20 active:scale-95 cursor-pointer"
                       >
-                        <Plus className="w-3.5 h-3.5" />
+                        <Plus className="w-3.5 h-3.5 shrink-0" />
                         <span>Adicionar</span>
                       </button>
                     ) : (
-                      <div className="flex items-center gap-1.5 bg-neutral-100 p-1 rounded-xl">
+                      <div className="w-full flex items-center justify-between gap-1.5 bg-neutral-100 p-1 rounded-xl">
                         <button
-                          onClick={() => removeFromCart(product.id)}
-                          className="w-7 h-7 bg-white hover:bg-neutral-200 text-neutral-800 rounded-lg flex items-center justify-center font-bold text-sm shadow-xs"
+                          type="button"
+                          onClick={() => removeFromCart(product.id, activeUnit)}
+                          className="w-8 h-8 shrink-0 bg-white hover:bg-neutral-200 text-neutral-800 rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
                         >
-                          <Minus className="w-3 h-3" />
+                          <Minus className="w-3.5 h-3.5" />
                         </button>
-                        <span className="w-6 text-center font-black text-xs text-neutral-900">{qty}</span>
+                        <span className="flex-1 text-center font-black text-xs text-neutral-900">{qty}</span>
                         <button
-                          onClick={() => addToCart(product)}
-                          disabled={qty >= product.stock}
-                          className="w-7 h-7 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-xs"
+                          type="button"
+                          onClick={() => addToCart(product, activeUnit)}
+                          disabled={!canAddMore}
+                          className="w-8 h-8 shrink-0 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
                         >
-                          <Plus className="w-3 h-3" />
+                          <Plus className="w-3.5 h-3.5" />
                         </button>
                       </div>
                     )}
@@ -1562,26 +1902,37 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 </h4>
                 {cart.map((item) => {
                   const currentProd = products.find((p) => p.id === item.product.id) || item.product;
-                  const promoActive = isProductPromoActive(currentProd);
-                  const effPrice = getEffectiveProductPrice(currentProd);
+                  const isCase = item.saleUnit === 'case' && hasProductCase(currentProd);
+                  const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
+                  const promoActive = !isCase && isProductPromoActive(currentProd);
+                  const effPrice = getCartItemUnitPrice(currentProd, item.saleUnit);
+                  const usedUnits = getCartTotalUnitsForProduct(currentProd.id);
+                  const canAddMore = usedUnits + unitsPerSale <= currentProd.stock;
 
                   return (
-                    <div key={item.product.id} className="flex items-center justify-between gap-3 p-3 bg-neutral-50 rounded-2xl border border-neutral-200">
+                    <div
+                      key={`${item.product.id}-${item.saleUnit}`}
+                      className="flex items-center justify-between gap-2.5 p-3 bg-neutral-50 rounded-2xl border border-neutral-200"
+                    >
                       <img
                         src={currentProd.image}
                         alt={currentProd.name}
-                        className="w-12 h-12 rounded-xl object-cover"
+                        className="w-11 h-11 rounded-xl object-cover shrink-0"
                       />
                       <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          <h5 className="font-bold text-xs text-neutral-900 truncate">{currentProd.name}</h5>
+                        <div className="flex items-start gap-1.5">
+                          <h5 className="font-bold text-xs text-neutral-900 line-clamp-2 break-words leading-snug">
+                            {isCase
+                              ? `${currentProd.name} — Caixa c/${currentProd.caseSize}`
+                              : currentProd.name}
+                          </h5>
                           {promoActive && (
                             <span className="px-1.5 py-0.5 bg-red-600 text-white text-[9px] font-black rounded uppercase shrink-0">
                               -{getPromoDiscountPercent(currentProd)}%
                             </span>
                           )}
                         </div>
-                        <span className="text-[11px] text-neutral-500 block">
+                        <span className="text-[11px] text-neutral-500 block mt-0.5">
                           {currentProd.volume} •{' '}
                           {promoActive ? (
                             <>
@@ -1594,10 +1945,10 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                         </span>
                       </div>
 
-                      <div className="flex items-center gap-1.5 bg-white p-1 rounded-xl border border-neutral-200">
+                      <div className="flex items-center gap-1 bg-white p-1 rounded-xl border border-neutral-200 shrink-0">
                         <button
                           type="button"
-                          onClick={() => removeFromCart(currentProd.id)}
+                          onClick={() => removeFromCart(currentProd.id, item.saleUnit)}
                           className="w-6 h-6 flex items-center justify-center text-neutral-600 hover:bg-neutral-100 rounded-lg"
                         >
                           <Minus className="w-3 h-3" />
@@ -1605,15 +1956,15 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                         <span className="w-5 text-center font-black text-xs text-neutral-900">{item.quantity}</span>
                         <button
                           type="button"
-                          onClick={() => addToCart(currentProd)}
-                          disabled={item.quantity >= currentProd.stock}
+                          onClick={() => addToCart(currentProd, item.saleUnit)}
+                          disabled={!canAddMore}
                           className="w-6 h-6 flex items-center justify-center text-neutral-600 hover:bg-neutral-100 rounded-lg disabled:opacity-30"
                         >
                           <Plus className="w-3 h-3" />
                         </button>
                       </div>
 
-                      <span className="font-bold text-xs text-neutral-900 w-16 text-right">
+                      <span className="font-bold text-xs text-neutral-900 shrink-0 text-right min-w-[3.75rem]">
                         {formatCurrency(effPrice * item.quantity)}
                       </span>
                     </div>
@@ -1888,17 +2239,41 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                         <AddressPinMap
                           latitude={checkoutLat}
                           longitude={checkoutLng}
+                          geoLatitude={checkoutGeoLat ?? checkoutLat}
+                          geoLongitude={checkoutGeoLng ?? checkoutLng}
                           precisao={checkoutPrecisao}
                           showConfirmButton={Boolean(currentCustomer && !isPinConfirmed)}
                           isConfirmingPin={isConfirmingPin}
                           pinConfirmed={isPinConfirmed}
                           onConfirmPin={(confirmedLat, confirmedLng) => {
-                            setCheckoutPrecisao('exata');
-                            persistCheckoutCoordinates(confirmedLat, confirmedLng, true);
+                            const check = checkPinOffsetLimit(
+                              checkoutGeoLat ?? confirmedLat,
+                              checkoutGeoLng ?? confirmedLng,
+                              confirmedLat,
+                              confirmedLng,
+                              checkoutPrecisao || 'rua'
+                            );
+                            setCheckoutLat(confirmedLat);
+                            setCheckoutLng(confirmedLng);
+                            if (!check.isTooFar) {
+                              setCheckoutError('');
+                              persistCheckoutCoordinates(confirmedLat, confirmedLng, true);
+                            }
                           }}
                           onChange={(newLat, newLng) => {
-                            setCheckoutPrecisao('exata');
-                            persistCheckoutCoordinates(newLat, newLng, true);
+                            const check = checkPinOffsetLimit(
+                              checkoutGeoLat ?? newLat,
+                              checkoutGeoLng ?? newLng,
+                              newLat,
+                              newLng,
+                              checkoutPrecisao || 'rua'
+                            );
+                            setCheckoutLat(newLat);
+                            setCheckoutLng(newLng);
+                            if (!check.isTooFar) {
+                              setCheckoutError('');
+                              persistCheckoutCoordinates(newLat, newLng, true);
+                            }
                           }}
                         />
                       </div>
@@ -1943,7 +2318,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       paymentMethod === 'pix' ? 'border-amber-500 bg-amber-50 text-amber-900' : 'border-neutral-200 text-neutral-700'
                     }`}
                   >
-                    ⚡ PIX (Instantâneo)
+                    PIX (pagar agora)
                   </button>
                   <button
                     type="button"
@@ -1952,7 +2327,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       paymentMethod === 'cartao_credito' ? 'border-amber-500 bg-amber-50 text-amber-900' : 'border-neutral-200 text-neutral-700'
                     }`}
                   >
-                    💳 Cartão de Crédito
+                    {deliveryType === 'retirada' ? 'Cartão de crédito (na retirada)' : 'Cartão de crédito (na entrega)'}
                   </button>
                   <button
                     type="button"
@@ -1961,7 +2336,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       paymentMethod === 'cartao_debito' ? 'border-amber-500 bg-amber-50 text-amber-900' : 'border-neutral-200 text-neutral-700'
                     }`}
                   >
-                    💳 Cartão de Débito
+                    {deliveryType === 'retirada' ? 'Cartão de débito (na retirada)' : 'Cartão de débito (na entrega)'}
                   </button>
                   <button
                     type="button"
@@ -1970,23 +2345,31 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       paymentMethod === 'dinheiro' ? 'border-amber-500 bg-amber-50 text-amber-900' : 'border-neutral-200 text-neutral-700'
                     }`}
                   >
-                    💵 Dinheiro
+                    {deliveryType === 'retirada' ? 'Dinheiro (na retirada)' : 'Dinheiro (na entrega)'}
                   </button>
                 </div>
 
                 {paymentMethod === 'dinheiro' && (
-                  <div className="mt-2 bg-neutral-50 p-3 rounded-xl border border-neutral-200">
-                    <label className="text-[11px] font-semibold text-neutral-700 block mb-1">
+                  <div className="mt-2 bg-neutral-50 p-3 rounded-xl border border-neutral-200 space-y-1">
+                    <label className="text-[11px] font-semibold text-neutral-700 block">
                       Precisa de troco para quanto?
                     </label>
                     <input
                       type="number"
-                      step="any"
+                      step="0.01"
+                      min="0"
                       placeholder="Ex: 50 ou 100"
                       value={cashChangeFor}
                       onChange={(e) => setCashChangeFor(e.target.value)}
-                      className="w-full px-3 py-2 bg-white border border-neutral-300 rounded-lg text-xs"
+                      className={`w-full px-3 py-2 bg-white border rounded-lg text-xs ${
+                        isCheckoutCashInvalid ? 'border-red-400' : 'border-neutral-300'
+                      }`}
                     />
+                    {isCheckoutCashInvalid && (
+                      <p className="text-[11px] font-bold text-red-600">
+                        O valor do troco precisa ser maior que o total do pedido
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
@@ -2104,9 +2487,16 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 )}
               </div>
 
+              {checkoutError && (
+                <div className="p-3.5 bg-red-50 border border-red-200 rounded-2xl text-red-700 text-xs font-bold flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+                  <span>{checkoutError}</span>
+                </div>
+              )}
+
               <button
                 type="submit"
-                disabled={isSubmitting || cart.length === 0 || !isAreaCovered || !settings.isOpen}
+                disabled={isSubmitting || cart.length === 0 || !isAreaCovered || !settings.isOpen || isCheckoutCashInvalid || isCheckoutPinTooFar}
                 className="w-full py-4 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 disabled:cursor-not-allowed text-white font-black text-base rounded-2xl shadow-xl shadow-amber-500/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
                 {!settings.isOpen ? (
@@ -2178,7 +2568,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                           </span>
                         </div>
                         <p className="text-xs text-neutral-500">
-                          {new Date(ord.createdAt).toLocaleString('pt-BR')} • {ord.items.reduce((s, i) => s + i.quantity, 0)} un.
+                          {new Date(ord.createdAt).toLocaleString('pt-BR')} •{' '}
+                          {ord.items
+                            .map((i) =>
+                              i.saleUnit === 'case' && (i.unitsPerSale || 1) > 1
+                                ? `${i.quantity} cx ${i.name} (c/${i.unitsPerSale})`
+                                : `${i.quantity}x ${i.name}`
+                            )
+                            .join(', ')}
                         </p>
                       </div>
                       <div className="text-right shrink-0">

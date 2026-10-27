@@ -1,10 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import { MapPin, Navigation, AlertTriangle, CheckCircle2, Loader2 } from 'lucide-react';
+import { checkPinOffsetLimit } from '../utils/geo';
 
 interface AddressPinMapProps {
   latitude: number;
   longitude: number;
+  geoLatitude?: number | null;
+  geoLongitude?: number | null;
   precisao?: 'exata' | 'rua' | 'aproximada' | string | null;
   onChange: (lat: number, lng: number) => void;
   showConfirmButton?: boolean;
@@ -16,6 +19,8 @@ interface AddressPinMapProps {
 export const AddressPinMap: React.FC<AddressPinMapProps> = ({
   latitude,
   longitude,
+  geoLatitude,
+  geoLongitude,
   precisao,
   onChange,
   showConfirmButton = false,
@@ -26,9 +31,35 @@ export const AddressPinMap: React.FC<AddressPinMapProps> = ({
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markerRef = useRef<L.Marker | null>(null);
+  const fallbackAnchorRef = useRef<{ lat: number; lng: number }>({ lat: latitude, lng: longitude });
 
   const [isLocatingGps, setIsLocatingGps] = useState<boolean>(false);
   const [gpsError, setGpsError] = useState<string>('');
+
+  useEffect(() => {
+    if (
+      geoLatitude !== undefined &&
+      geoLatitude !== null &&
+      geoLongitude !== undefined &&
+      geoLongitude !== null
+    ) {
+      fallbackAnchorRef.current = { lat: geoLatitude, lng: geoLongitude };
+    }
+  }, [geoLatitude, geoLongitude]);
+
+  const anchorLat =
+    geoLatitude !== undefined && geoLatitude !== null ? geoLatitude : fallbackAnchorRef.current.lat;
+  const anchorLng =
+    geoLongitude !== undefined && geoLongitude !== null ? geoLongitude : fallbackAnchorRef.current.lng;
+
+  const effectivePrecision = precisao || 'rua';
+  const { offsetM, maxOffsetM, isTooFar } = checkPinOffsetLimit(
+    anchorLat,
+    anchorLng,
+    latitude,
+    longitude,
+    effectivePrecision
+  );
 
   // Keep latest callback ref so Leaflet event listeners always invoke current handler
   const onChangeRef = useRef(onChange);
@@ -174,7 +205,7 @@ export const AddressPinMap: React.FC<AddressPinMapProps> = ({
       </div>
 
       <p className="text-[11px] text-neutral-700 font-semibold leading-snug">
-        Confira se o alfinete está na sua casa. Se não estiver, arraste até o lugar certo.
+        Ajuste o alfinete só se ele não estiver exatamente na sua casa. Para outro endereço, altere a rua e o número.
       </p>
 
       {precisao === 'aproximada' && (
@@ -182,6 +213,32 @@ export const AddressPinMap: React.FC<AddressPinMapProps> = ({
           <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
           <span>
             Atenção: A localização encontrada pelo CEP é aproximada. Por favor, ajuste o alfinete no mapa até a posição exata da sua casa ou clique em &ldquo;Usar minha localização atual&rdquo;.
+          </span>
+        </div>
+      )}
+
+      {offsetM !== null && (
+        <div
+          className={`p-2 rounded-xl text-[11px] font-bold flex items-center justify-between gap-2 border ${
+            isTooFar
+              ? 'bg-red-50 text-red-800 border-red-300'
+              : 'bg-neutral-50 text-neutral-700 border-neutral-200'
+          }`}
+        >
+          <span className="flex items-center gap-1.5">
+            {isTooFar ? (
+              <AlertTriangle className="w-3.5 h-3.5 text-red-600 shrink-0" />
+            ) : (
+              <MapPin className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+            )}
+            <span>
+              {isTooFar
+                ? 'Alfinete muito longe do endereço digitado'
+                : 'Distância até o endereço digitado:'}
+            </span>
+          </span>
+          <span className="font-mono font-black shrink-0">
+            {offsetM} m{maxOffsetM ? ` / máx ${maxOffsetM} m` : ''}
           </span>
         </div>
       )}
@@ -206,8 +263,8 @@ export const AddressPinMap: React.FC<AddressPinMapProps> = ({
           <button
             type="button"
             onClick={() => onConfirmPin(latitude, longitude)}
-            disabled={isConfirmingPin}
-            className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-black rounded-xl text-[11px] flex items-center gap-1 shrink-0 cursor-pointer shadow-2xs"
+            disabled={isConfirmingPin || isTooFar}
+            className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black rounded-xl text-[11px] flex items-center gap-1 shrink-0 cursor-pointer shadow-2xs"
           >
             {isConfirmingPin ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />

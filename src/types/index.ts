@@ -6,6 +6,8 @@ export type ProductCategory =
   | 'gelo_carvao'
   | 'petiscos';
 
+export type SaleUnit = 'unit' | 'case';
+
 export interface Product {
   id: string;
   name: string;
@@ -14,6 +16,8 @@ export interface Product {
   price: number;
   promoPrice?: number | null;
   promoEndsAt?: string | null;
+  caseSize?: number | null;
+  casePrice?: number | null;
   costPrice: number;
   stock: number;
   minStock: number;
@@ -22,6 +26,24 @@ export interface Product {
   sku: string;
   active: boolean;
   description: string;
+}
+
+export function hasProductCase(product?: Pick<Product, 'caseSize' | 'casePrice'> | null): boolean {
+  if (!product) return false;
+  const size = Number(product.caseSize) || 0;
+  const price = Number(product.casePrice) || 0;
+  return Number.isInteger(size) && size >= 2 && size <= 100 && price > 0;
+}
+
+export function formatStockWithCases(stock: number, caseSize?: number | null): string {
+  const s = Math.max(0, Math.floor(Number(stock) || 0));
+  const size = Number(caseSize) || 0;
+  if (size >= 2) {
+    const cases = Math.floor(s / size);
+    const loose = s % size;
+    return `${s} un (${cases} cx + ${loose} ${loose === 1 ? 'avulsa' : 'avulsas'})`;
+  }
+  return `${s} un`;
 }
 
 export function isProductPromoActive(product: Pick<Product, 'price' | 'promoPrice' | 'promoEndsAt'>): boolean {
@@ -71,8 +93,12 @@ export interface OrderItem {
   originalPrice?: number;
   costPrice?: number;
   quantity: number;
+  saleUnit?: SaleUnit;
+  unitsPerSale?: number;
   isCold?: boolean;
 }
+
+export type GeoPrecision = 'exata' | 'rua' | 'aproximada';
 
 export interface CustomerInfo {
   name: string;
@@ -88,6 +114,16 @@ export interface CustomerInfo {
   state?: string;
   latitude?: number;
   longitude?: number;
+  geoLatitude?: number | null;
+  geoLongitude?: number | null;
+  geoPrecision?: GeoPrecision | null;
+  pinOffsetM?: number | null;
+  locationVerified?: boolean;
+  geo_latitude?: number | null;
+  geo_longitude?: number | null;
+  geo_precision?: GeoPrecision | null;
+  pin_offset_m?: number | null;
+  location_verified?: boolean;
   distanceKm?: number;
   isWithinDeliveryRadius?: boolean;
 }
@@ -124,12 +160,13 @@ export interface Coupon {
 export interface Order {
   id: string;
   createdAt: string;
-  source: 'online' | 'balcao';
+  source: 'online' | 'balcao' | 'mesa';
   customer: CustomerInfo;
   customerId?: string;
+  clientRequestId?: string;
   couponCode?: string;
   discount?: number;
-  deliveryType: 'delivery' | 'retirada';
+  deliveryType: 'delivery' | 'retirada' | 'local';
   items: OrderItem[];
   subtotal: number;
   deliveryFee: number;
@@ -139,6 +176,70 @@ export interface Order {
   status: OrderStatus;
   notes?: string;
   updatedAt: string;
+}
+
+export interface DiningTable {
+  id: string;
+  number: number;
+  label?: string | null;
+  seats?: number | null;
+  active: boolean;
+  createdAt?: string;
+}
+
+export type TabStatus = 'open' | 'closing' | 'closed' | 'merged' | 'cancelled';
+
+export interface TableTab {
+  id: string;
+  tableId: string;
+  status: TabStatus;
+  customerName?: string | null;
+  peopleCount?: number | null;
+  notes?: string | null;
+  mergedInto?: string | null;
+  orderId?: string | null;
+  openedAt: string;
+  closedAt?: string | null;
+  updatedAt: string;
+}
+
+export interface TableTabItem {
+  id: string;
+  tabId: string;
+  productId: string;
+  productName: string;
+  unitPrice: number;
+  quantity: number;
+  saleUnit?: SaleUnit;
+  unitsPerSale?: number;
+  notes?: string | null;
+  status: 'active' | 'cancelled';
+  addedAt: string;
+  cancelledAt?: string | null;
+}
+
+export interface LinkedTable {
+  id: string;
+  number: number;
+  label?: string | null;
+}
+
+export interface TableWithTab extends DiningTable {
+  currentTab?: (TableTab & {
+    itemsCount: number;
+    subtotal: number;
+  }) | null;
+  linkedTables?: LinkedTable[];
+  joinedToTabId?: string;
+  joinedToTableNumber?: number;
+}
+
+export interface TabDetail extends TableTab {
+  tableNumber: number;
+  tableLabel?: string | null;
+  items: TableTabItem[];
+  subtotal: number;
+  linkedTables?: LinkedTable[];
 }
 
 export interface StoreSettings {

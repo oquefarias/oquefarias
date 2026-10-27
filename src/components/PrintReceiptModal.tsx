@@ -99,20 +99,63 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
               <span>TOTAL</span>
             </div>
             <div className="space-y-2">
-              {order.items.map((item, idx) => (
-                <div key={idx} className="flex justify-between items-start text-xs">
-                  <div className="pr-2">
-                    <span className="font-bold text-neutral-900">{item.quantity}x </span>
-                    <span className="font-semibold">{item.name}</span>
-                    <span className="block text-[11px] text-neutral-500">
-                      {item.volume} {item.isCold ? '• Gelada ❄️' : ''} ({formatCurrency(item.price)} un)
-                    </span>
-                  </div>
-                  <span className="font-bold text-neutral-900 whitespace-nowrap">
-                    {formatCurrency(item.price * item.quantity)}
-                  </span>
-                </div>
-              ))}
+              {(() => {
+                const map = new Map<
+                  string,
+                  {
+                    key: string;
+                    name: string;
+                    volume: string;
+                    price: number;
+                    quantity: number;
+                    isCold?: boolean;
+                    saleUnit?: 'unit' | 'case';
+                    unitsPerSale?: number;
+                  }
+                >();
+                for (const item of order.items) {
+                  const saleUnit = item.saleUnit === 'case' ? 'case' : 'unit';
+                  const unitsPerSale = item.unitsPerSale && item.unitsPerSale > 1 ? item.unitsPerSale : 1;
+                  const key = `${item.productId || item.name}::${saleUnit}::${Number(item.price).toFixed(2)}`;
+                  const existing = map.get(key);
+                  if (existing) {
+                    existing.quantity += item.quantity;
+                  } else {
+                    map.set(key, {
+                      key,
+                      name: item.name,
+                      volume: item.volume,
+                      price: item.price,
+                      quantity: item.quantity,
+                      isCold: item.isCold,
+                      saleUnit,
+                      unitsPerSale,
+                    });
+                  }
+                }
+                return Array.from(map.values()).map((item) => {
+                  const isCase = item.saleUnit === 'case' && (item.unitsPerSale || 1) > 1;
+                  return (
+                    <div key={item.key} className="flex justify-between items-start text-xs">
+                      <div className="pr-2">
+                        <span className="font-bold text-neutral-900">
+                          {isCase ? `${item.quantity} cx ` : `${item.quantity}x `}
+                        </span>
+                        <span className="font-semibold">
+                          {item.name}
+                          {isCase ? ` (c/${item.unitsPerSale})` : ''}
+                        </span>
+                        <span className="block text-[11px] text-neutral-500">
+                          {item.volume} {item.isCold ? '• Gelada ❄️' : ''} ({formatCurrency(item.price)} {isCase ? 'cx' : 'un'})
+                        </span>
+                      </div>
+                      <span className="font-bold text-neutral-900 whitespace-nowrap">
+                        {formatCurrency(item.price * item.quantity)}
+                      </span>
+                    </div>
+                  );
+                });
+              })()}
             </div>
           </div>
 
@@ -143,11 +186,17 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
                 {order.paymentMethod === 'dinheiro' && 'Dinheiro'}
               </span>
             </div>
-            {order.paymentMethod === 'dinheiro' && order.cashChangeFor && (
-              <div className="flex justify-between text-neutral-700 font-semibold text-amber-800">
-                <span>Levar troco para:</span>
-                <span>{formatCurrency(order.cashChangeFor)} (Troco: {formatCurrency(order.cashChangeFor - order.total)})</span>
-              </div>
+            {order.paymentMethod === 'dinheiro' && order.cashChangeFor !== undefined && order.cashChangeFor !== null && (
+              <>
+                <div className="flex justify-between text-neutral-700 font-semibold">
+                  <span>Recebido:</span>
+                  <span>{formatCurrency(order.cashChangeFor)}</span>
+                </div>
+                <div className="flex justify-between text-amber-800 font-bold">
+                  <span>Troco:</span>
+                  <span>{formatCurrency(Math.max(0, order.cashChangeFor - order.total))}</span>
+                </div>
+              </>
             )}
             {order.paymentMethod === 'pix' && (
               <p className="text-[11px] text-neutral-600">Chave Pix: {settings.pixKey}</p>

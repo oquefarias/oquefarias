@@ -698,6 +698,7 @@ const GoogleDeliveryRadiusMapInner: React.FC<GoogleDeliveryRadiusMapInnerProps> 
     settings.deliveryModel || 'both'
   );
   const [saveSuccessMessage, setSaveSuccessMessage] = useState<boolean>(false);
+  const [gpsError, setGpsError] = useState<string>('');
 
   // Handle location update from search bar (Google Maps or CEP)
   const handleSelectLocation = (info: { address: string; lat: number; lng: number }) => {
@@ -707,8 +708,9 @@ const GoogleDeliveryRadiusMapInner: React.FC<GoogleDeliveryRadiusMapInnerProps> 
 
   // Use current GPS location from device
   const handleUseCurrentGPS = () => {
+    setGpsError('');
     if (!navigator.geolocation) {
-      alert('Geolocalização não suportada no seu navegador.');
+      setGpsError('Geolocalização não suportada no seu navegador.');
       return;
     }
     navigator.geolocation.getCurrentPosition(
@@ -727,7 +729,7 @@ const GoogleDeliveryRadiusMapInner: React.FC<GoogleDeliveryRadiusMapInnerProps> 
         }
       },
       () => {
-        alert('Não foi possível obter a sua localização GPS atual. Permita o acesso à localização.');
+        setGpsError('Não foi possível obter a sua localização GPS atual. Permita o acesso à localização.');
       }
     );
   };
@@ -755,6 +757,18 @@ const GoogleDeliveryRadiusMapInner: React.FC<GoogleDeliveryRadiusMapInnerProps> 
         <div className="p-4 bg-emerald-500 text-white rounded-2xl font-bold text-sm shadow-md flex items-center gap-2">
           <CheckCircle2 className="w-5 h-5 shrink-0" />
           <span>Configurações do raio de entrega salvas com sucesso!</span>
+        </div>
+      )}
+      {gpsError && (
+        <div className="p-4 bg-red-50 border border-red-200 text-red-700 rounded-2xl font-bold text-xs flex items-center justify-between gap-2">
+          <span>{gpsError}</span>
+          <button
+            type="button"
+            onClick={() => setGpsError('')}
+            className="text-red-500 hover:text-red-700 font-black px-2 py-0.5 rounded-lg"
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -910,7 +924,7 @@ const GoogleDeliveryRadiusMapInner: React.FC<GoogleDeliveryRadiusMapInnerProps> 
                 </label>
                 <input
                   type="number"
-                  step="0.5"
+                  step="0.01"
                   min="0"
                   value={deliveryFee}
                   onChange={(e) => setDeliveryFee(parseFloat(e.target.value) || 0)}
@@ -924,7 +938,7 @@ const GoogleDeliveryRadiusMapInner: React.FC<GoogleDeliveryRadiusMapInnerProps> 
                 </label>
                 <input
                   type="number"
-                  step="0.5"
+                  step="0.01"
                   min="0"
                   value={pricePerKm}
                   onChange={(e) => setPricePerKm(parseFloat(e.target.value) || 0)}
