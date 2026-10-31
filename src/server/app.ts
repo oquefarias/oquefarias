@@ -472,7 +472,7 @@ async function resolveAndValidateCustomerAddress(
     !Number.isNaN(Number(input.pinLongitude));
 
   if (!resolved) {
-    // Endereço não pôde ser geocodificado pelo servidor: nunca confiar no navegador como endereço verificado
+    // Endereço não pôde ser geocodificado pelo servidor: aceite com location_verified = false e não trave o cadastro
     const fallbackLat = hasBrowserPin ? Number(input.pinLatitude) : undefined;
     const fallbackLng = hasBrowserPin ? Number(input.pinLongitude) : undefined;
     const metrics = await computeCustomerServerMetrics(supabase, fallbackLat, fallbackLng);
@@ -485,13 +485,27 @@ async function resolveAndValidateCustomerAddress(
       pinOffsetM: undefined,
       locationVerified: false,
       distanceKm: metrics.distanceKm,
-      isWithinDeliveryRadius: metrics.isWithinDeliveryRadius,
+      isWithinDeliveryRadius: metrics.isWithinDeliveryRadius ?? true,
     };
   }
 
   const geoLatitude = resolved.latitude;
   const geoLongitude = resolved.longitude;
   const geoPrecision = resolved.precisao;
+
+  // Quem decide se o endereço está dentro da área de entrega é o ENDEREÇO DIGITADO (posição encontrada pelo servidor)
+  const geoMetrics = await computeCustomerServerMetrics(supabase, geoLatitude, geoLongitude);
+
+  // Se o endereço digitado estiver fora da área de entrega, recuse como hoje (mesmo que o alfinete esteja dentro)
+  if (geoMetrics.isWithinDeliveryRadius === false) {
+    const distLabel = geoMetrics.distanceKm !== undefined ? ` (${geoMetrics.distanceKm} km do depósito)` : '';
+    return {
+      error: `Endereço fora da área de entrega${distLabel}.`,
+      locationVerified: false,
+      distanceKm: geoMetrics.distanceKm,
+      isWithinDeliveryRadius: false,
+    };
+  }
 
   let finalLat = geoLatitude;
   let finalLng = geoLongitude;
@@ -503,22 +517,17 @@ async function resolveAndValidateCustomerAddress(
     const pinLng = Number(input.pinLongitude);
     pinOffsetM = haversineMeters(geoLatitude, geoLongitude, pinLat, pinLng);
 
-    if (
-      (geoPrecision === 'exata' && pinOffsetM > 300) ||
-      (geoPrecision === 'rua' && pinOffsetM > 800)
-    ) {
-      return {
-        error: `O alfinete está longe do endereço que você digitou (${pinOffsetM} m). Confira a rua e o número ou coloque o alfinete na sua casa.`,
-        locationVerified: false,
-      };
-    }
-
     finalLat = pinLat;
     finalLng = pinLng;
-    locationVerified = geoPrecision !== 'aproximada';
-  }
 
-  const metrics = await computeCustomerServerMetrics(supabase, finalLat, finalLng);
+    const isPinTooFar =
+      (geoPrecision === 'exata' && pinOffsetM > 300) ||
+      (geoPrecision === 'rua' && pinOffsetM > 800);
+
+    // Se o alfinete vier longe do endereço digitado (>300 m exata ou >800 m rua),
+    // aceite o cadastro/alteração, grave as coordenadas do alfinete, mas marque location_verified = false
+    locationVerified = isPinTooFar ? false : geoPrecision !== 'aproximada';
+  }
 
   return {
     latitude: finalLat,
@@ -528,8 +537,8 @@ async function resolveAndValidateCustomerAddress(
     geoPrecision,
     pinOffsetM,
     locationVerified,
-    distanceKm: metrics.distanceKm,
-    isWithinDeliveryRadius: metrics.isWithinDeliveryRadius,
+    distanceKm: geoMetrics.distanceKm,
+    isWithinDeliveryRadius: geoMetrics.isWithinDeliveryRadius,
   };
 }
 
@@ -1499,6 +1508,7 @@ export function createApp(): express.Express {
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
     const cleanEmail = email.toLowerCase().trim();
+    const cleanPhoneDigits = phone.replace(/\D/g, '');
 
     // Check email uniqueness
     const { data: existingUser, error: checkErr } = await supabase
@@ -1513,7 +1523,33 @@ export function createApp(): express.Express {
     }
 
     if (existingUser) {
-      return res.status(409).json({ error: 'Este e-mail já está cadastrado. Faça login com seu e-mail e senha.' });
+      return res.status(409).json({
+        error: 'Este e-mail já está cadastrado. Faça login com seu e-mail e senha.',
+        field: 'email',
+      });
+    }
+
+    // Check phone uniqueness when customer has password_hash
+    if (cleanPhoneDigits.length >= 10) {
+      const { data: phoneRows, error: phoneCheckErr } = await supabase
+        .from('customers')
+        .select('id, phone, email')
+        .not('email', 'is', null);
+
+      if (phoneCheckErr) {
+        console.error('[Supabase Error] check customer phone:', phoneCheckErr.message);
+        return res.status(500).json({ error: phoneCheckErr.message });
+      }
+
+      const duplicatePhone = (phoneRows || []).find(
+        (r: any) => String(r.phone || '').replace(/\D/g, '') === cleanPhoneDigits
+      );
+      if (duplicatePhone) {
+        return res.status(409).json({
+          error: 'Este telefone/WhatsApp já está cadastrado em uma conta.',
+          field: 'phone',
+        });
+      }
     }
 
     try {
@@ -1830,11 +1866,14 @@ export function createApp(): express.Express {
     let distanceKm: number | null = null;
     let isWithinDeliveryRadius = true;
 
+    const quoteRefLat = dbCustomer.geoLatitude ?? dbCustomer.latitude;
+    const quoteRefLng = dbCustomer.geoLongitude ?? dbCustomer.longitude;
+
     if (
-      dbCustomer.latitude !== undefined &&
-      dbCustomer.latitude !== null &&
-      dbCustomer.longitude !== undefined &&
-      dbCustomer.longitude !== null &&
+      quoteRefLat !== undefined &&
+      quoteRefLat !== null &&
+      quoteRefLng !== undefined &&
+      quoteRefLng !== null &&
       dbSettings.storeLatitude !== undefined &&
       dbSettings.storeLatitude !== null &&
       dbSettings.storeLongitude !== undefined &&
@@ -1843,8 +1882,8 @@ export function createApp(): express.Express {
       distanceKm = haversineKm(
         Number(dbSettings.storeLatitude),
         Number(dbSettings.storeLongitude),
-        Number(dbCustomer.latitude),
-        Number(dbCustomer.longitude)
+        Number(quoteRefLat),
+        Number(quoteRefLng)
       );
       isWithinDeliveryRadius = distanceKm <= maxRadiusKm;
 
@@ -2487,6 +2526,253 @@ export function createApp(): express.Express {
   });
 
   // ---------------------------------------------------------------------------
+  // IMPORT PRODUCTS FROM SPREADSHEET (.xlsx): POST /admin/products/import
+  // ---------------------------------------------------------------------------
+  router.post('/admin/products/import', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const rawRows = req.body?.rows;
+    const duplicateMode: 'skip' | 'update' = req.body?.duplicateMode === 'update' ? 'update' : 'skip';
+
+    if (!Array.isArray(rawRows) || rawRows.length === 0) {
+      return res.status(400).json({ error: 'Nenhum produto enviado para importação.' });
+    }
+
+    if (rawRows.length > 2000) {
+      return res.status(400).json({ error: 'A planilha excede o limite máximo de 2000 linhas.' });
+    }
+
+    const normalizeKey = (val: unknown): string =>
+      String(val ?? '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .trim();
+
+    const parseMoneyBr = (raw: unknown): number | null => {
+      if (raw === null || raw === undefined || typeof raw === 'boolean') return null;
+      if (typeof raw === 'number') {
+        return Number.isFinite(raw) ? Math.round(raw * 100) / 100 : null;
+      }
+      let str = String(raw)
+        .replace(/R\$/gi, '')
+        .replace(/\s+/g, '')
+        .trim();
+      if (!str) return null;
+      if (str.includes('.') && str.includes(',')) {
+        str = str.replace(/\./g, '').replace(',', '.');
+      } else if (str.includes(',')) {
+        str = str.replace(',', '.');
+      }
+      const num = Number(str);
+      if (Number.isNaN(num) || !Number.isFinite(num)) return null;
+      return Math.round(num * 100) / 100;
+    };
+
+    const parseNonNegativeInt = (raw: unknown, defaultVal: number): { valid: boolean; value: number } => {
+      if (raw === null || raw === undefined || String(raw).trim() === '') {
+        return { valid: true, value: defaultVal };
+      }
+      if (typeof raw === 'boolean') return { valid: false, value: 0 };
+      if (typeof raw === 'number') {
+        if (!Number.isInteger(raw) || raw < 0) return { valid: false, value: 0 };
+        return { valid: true, value: raw };
+      }
+      let str = String(raw).trim();
+      if (str.includes(',') && !str.includes('.')) {
+        str = str.replace(',', '.');
+      }
+      const num = Number(str);
+      if (!Number.isFinite(num) || !Number.isInteger(num) || num < 0) {
+        return { valid: false, value: 0 };
+      }
+      return { valid: true, value: num };
+    };
+
+    const normalizeCategory = (raw: unknown): string => {
+      const trimmed = String(raw ?? '').trim();
+      const k = normalizeKey(trimmed);
+      if (!k) return 'cervejas';
+      if (k === 'cervejas' || k === 'cerveja') return 'cervejas';
+      if (k === 'destilados' || k === 'destilado') return 'destilados';
+      if (k === 'vinhos' || k === 'vinho') return 'vinhos';
+      if (
+        k === 'nao_alcoolicos' ||
+        k === 'nao alcoolicos' ||
+        k === 'nao alcoolico' ||
+        k === 'sem alcool'
+      ) {
+        return 'nao_alcoolicos';
+      }
+      if (k === 'gelo_carvao' || k === 'gelo e carvao' || k === 'gelo & carvao') {
+        return 'gelo_carvao';
+      }
+      if (k === 'petiscos' || k === 'petisco') return 'petiscos';
+      return trimmed;
+    };
+
+    const parseActiveFlag = (raw: unknown): boolean => {
+      if (raw === undefined || raw === null || String(raw).trim() === '') return true;
+      if (typeof raw === 'boolean') return raw;
+      const k = normalizeKey(raw);
+      if (['nao', 'false', '0', 'inativo', 'pausado', 'desativado', 'n'].includes(k)) {
+        return false;
+      }
+      return true;
+    };
+
+    const { data: existingRows, error: fetchErr } = await supabase.from('products').select('*');
+    if (fetchErr) {
+      console.error('[Supabase Error] products import fetch existing:', fetchErr.message);
+      return res.status(500).json({ error: fetchErr.message });
+    }
+
+    const byName = new Map<string, any>();
+    const bySku = new Map<string, any>();
+    for (const r of existingRows || []) {
+      const nKey = normalizeKey(r.name);
+      if (nKey) byName.set(nKey, r);
+      const sKey = normalizeKey(r.sku);
+      if (sKey) bySku.set(sKey, r);
+    }
+
+    const toInsert: any[] = [];
+    const toUpdate: { id: string; price: number; cost_price: number; stock: number; updated_at: string }[] = [];
+    let skipped = 0;
+    const errors: { rowNumber: number; name?: string; reason: string }[] = [];
+
+    for (let i = 0; i < rawRows.length; i++) {
+      const item = rawRows[i] || {};
+      const rowNumber = Number(item.rowNumber) || i + 2;
+      const name = String(item.name ?? '').trim();
+
+      if (!name) {
+        errors.push({ rowNumber, name: '', reason: 'Sem nome do produto' });
+        continue;
+      }
+
+      const price = parseMoneyBr(item.price);
+      if (price === null || price <= 0) {
+        errors.push({ rowNumber, name, reason: 'Preço de venda inválido ou <= 0' });
+        continue;
+      }
+
+      let costPrice = 0;
+      if (item.costPrice !== undefined && item.costPrice !== null && String(item.costPrice).trim() !== '') {
+        const parsedCost = parseMoneyBr(item.costPrice);
+        if (parsedCost === null || parsedCost < 0) {
+          errors.push({ rowNumber, name, reason: 'Preço de custo inválido ou negativo' });
+          continue;
+        }
+        costPrice = parsedCost;
+      }
+
+      const stockParsed = parseNonNegativeInt(item.stock, 0);
+      if (!stockParsed.valid) {
+        errors.push({ rowNumber, name, reason: 'Estoque negativo ou não inteiro' });
+        continue;
+      }
+
+      const minStockParsed = parseNonNegativeInt(item.minStock, 10);
+      if (!minStockParsed.valid) {
+        errors.push({ rowNumber, name, reason: 'Estoque mínimo negativo ou não inteiro' });
+        continue;
+      }
+
+      const sku = String(item.sku ?? '').trim();
+      const volume = String(item.volume ?? '').trim();
+      const category = normalizeCategory(item.category);
+      const active = parseActiveFlag(item.active);
+
+      const nameKey = normalizeKey(name);
+      const skuKey = sku ? normalizeKey(sku) : '';
+
+      const existing = (skuKey ? bySku.get(skuKey) : undefined) || byName.get(nameKey);
+
+      if (existing) {
+        if (duplicateMode === 'skip') {
+          skipped++;
+        } else {
+          if (existing.id && !String(existing.id).startsWith('__pending__')) {
+            toUpdate.push({
+              id: String(existing.id),
+              price,
+              cost_price: costPrice,
+              stock: stockParsed.value,
+              updated_at: new Date().toISOString(),
+            });
+          }
+        }
+        continue;
+      }
+
+      const newId = `prod-imp-${Date.now()}-${i}-${crypto.randomBytes(3).toString('hex')}`;
+      const newDbRow = {
+        id: newId,
+        name,
+        category,
+        volume: volume || null,
+        price,
+        promo_price: null,
+        promo_ends_at: null,
+        case_size: null,
+        case_price: null,
+        cost_price: costPrice,
+        stock: stockParsed.value,
+        min_stock: minStockParsed.value,
+        is_cold: true,
+        image: null,
+        sku: sku || null,
+        active,
+        description: '',
+        updated_at: new Date().toISOString(),
+      };
+
+      toInsert.push(newDbRow);
+      byName.set(nameKey, newDbRow);
+      if (skuKey) bySku.set(skuKey, newDbRow);
+    }
+
+    let created = 0;
+    const BATCH_SIZE = 100;
+    for (let start = 0; start < toInsert.length; start += BATCH_SIZE) {
+      const chunk = toInsert.slice(start, start + BATCH_SIZE);
+      const { error: insertErr } = await supabase.from('products').insert(chunk);
+      if (insertErr) {
+        console.error('[Supabase Error] products batch import insert:', insertErr.message);
+        return res.status(500).json({ error: `Erro ao gravar produtos importados: ${insertErr.message}` });
+      }
+      created += chunk.length;
+    }
+
+    let updated = 0;
+    for (const upd of toUpdate) {
+      const { error: updErr } = await supabase
+        .from('products')
+        .update({
+          price: upd.price,
+          cost_price: upd.cost_price,
+          stock: upd.stock,
+          updated_at: upd.updated_at,
+        })
+        .eq('id', upd.id);
+      if (updErr) {
+        console.error('[Supabase Error] products import update:', updErr.message);
+        return res.status(500).json({ error: `Erro ao atualizar produto existente: ${updErr.message}` });
+      }
+      updated++;
+    }
+
+    return res.json({
+      created,
+      updated,
+      skipped,
+      errors,
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // DELIVERY AREAS ROUTES
   // ---------------------------------------------------------------------------
   router.get('/delivery-areas', async (_req, res) => {
@@ -2836,17 +3122,16 @@ export function createApp(): express.Express {
       if (rawOrder.deliveryType !== 'retirada' && (custRow.geo_latitude === null || custRow.geo_latitude === undefined)) {
         const legacyResult = await ensureLegacyCustomerGeocoded(supabase, custRow);
         dbCustomer = legacyResult.customer;
-        if (legacyResult.pinRejectedError) {
-          return res.status(400).json({ error: legacyResult.pinRejectedError });
-        }
       }
 
-      // Calculate distance strictly from the customer's saved DB coordinates (never from req.body)
+      // Calculate distance strictly from the customer's geocoded typed address (or fallback saved coordinates), never from req.body
+      const orderRefLat = dbCustomer.geoLatitude ?? dbCustomer.latitude;
+      const orderRefLng = dbCustomer.geoLongitude ?? dbCustomer.longitude;
       if (
-        dbCustomer.latitude !== undefined &&
-        dbCustomer.latitude !== null &&
-        dbCustomer.longitude !== undefined &&
-        dbCustomer.longitude !== null &&
+        orderRefLat !== undefined &&
+        orderRefLat !== null &&
+        orderRefLng !== undefined &&
+        orderRefLng !== null &&
         dbSettings.storeLatitude !== undefined &&
         dbSettings.storeLatitude !== null &&
         dbSettings.storeLongitude !== undefined &&
@@ -2855,8 +3140,8 @@ export function createApp(): express.Express {
         serverDistanceKm = haversineKm(
           Number(dbSettings.storeLatitude),
           Number(dbSettings.storeLongitude),
-          Number(dbCustomer.latitude),
-          Number(dbCustomer.longitude)
+          Number(orderRefLat),
+          Number(orderRefLng)
         );
         serverIsWithinRadius = serverDistanceKm <= maxRadiusKm;
       }
@@ -2976,10 +3261,9 @@ export function createApp(): express.Express {
     let deliveryFee = 0;
 
     if (deliveryType === 'delivery') {
-      // Entrega exige localização confirmada (sem coordenada não dá para checar o raio)
-      if (effectiveSource !== 'balcao' && serverDistanceKm === undefined) {
+      if (effectiveSource !== 'balcao' && !customerData.address?.trim()) {
         return res.status(400).json({
-          error: 'Confirme sua localização no mapa (Meus dados > Endereço) antes de pedir entrega, ou escolha Retirar no Depósito.',
+          error: 'Preencha seu endereço de entrega antes de finalizar o pedido, ou escolha Retirar no Depósito.',
         });
       }
       if (effectiveSource !== 'balcao' && serverDistanceKm !== undefined && serverDistanceKm > maxRadiusKm) {

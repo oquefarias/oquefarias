@@ -12,13 +12,13 @@ import {
   AlertTriangle,
   Compass,
   Check,
+  Navigation,
 } from 'lucide-react';
 import {
   fetchAddressByCep,
   fetchCoordinatesByCepBrasilApi,
   calculateDistanceKm,
   resolveFullAddressOnServer,
-  checkPinOffsetLimit,
 } from '../../utils/geo';
 import { AddressPinMap } from '../AddressPinMap';
 
@@ -35,7 +35,6 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
   isOpen,
   customer,
   settings,
-  deliveryAreas,
   onSave,
   onClose,
 }) => {
@@ -60,6 +59,11 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
   const [distanceKm, setDistanceKm] = useState<number | null>(null);
   const [isWithinRadius, setIsWithinRadius] = useState<boolean | null>(null);
 
+  // Optional map state (hidden by default)
+  const [showMap, setShowMap] = useState<boolean>(false);
+  const [triggerGpsCount, setTriggerGpsCount] = useState<number>(0);
+  const [isLocatingQuickGps, setIsLocatingQuickGps] = useState<boolean>(false);
+
   const [isSearchingCep, setIsSearchingCep] = useState<boolean>(false);
   const [cepStatusMessage, setCepStatusMessage] = useState<{
     type: 'success' | 'warn' | 'error';
@@ -68,6 +72,8 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
   useEffect(() => {
+    setShowMap(false);
+    setTriggerGpsCount(0);
     if (customer) {
       setName(customer.name || '');
       setPhone(customer.phone || '');
@@ -119,36 +125,70 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
     }
   }, [customer, isOpen]);
 
-  // Recalculate distance whenever customer lat/lng changes
+  // Recalculate distance whenever geocoded address lat/lng changes
   useEffect(() => {
+    const refLat = geoLat ?? lat;
+    const refLng = geoLng ?? lng;
     if (
-      lat !== undefined &&
-      lng !== undefined &&
+      refLat !== undefined &&
+      refLng !== undefined &&
       settings.storeLatitude !== undefined &&
       settings.storeLongitude !== undefined
     ) {
       const dist = calculateDistanceKm(
         settings.storeLatitude,
         settings.storeLongitude,
-        lat,
-        lng
+        refLat,
+        refLng
       );
       setDistanceKm(dist);
       const maxRadius = settings.deliveryRadiusKm || 5;
       setIsWithinRadius(dist <= maxRadius);
     }
-  }, [lat, lng, settings.storeLatitude, settings.storeLongitude, settings.deliveryRadiusKm]);
+  }, [geoLat, geoLng, lat, lng, settings.storeLatitude, settings.storeLongitude, settings.deliveryRadiusKm]);
 
   if (!isOpen) return null;
 
-  const pinCheck = checkPinOffsetLimit(
-    geoLat ?? lat,
-    geoLng ?? lng,
-    lat,
-    lng,
-    geoPrecisao || 'rua'
-  );
-  const isPinTooFar = pinCheck.isTooFar;
+  const handleOpenOptionalMap = () => {
+    const defaultLat = geoLat ?? lat ?? settings.storeLatitude ?? -23.55052;
+    const defaultLng = geoLng ?? lng ?? settings.storeLongitude ?? -46.633308;
+    if (lat === undefined || lng === undefined) {
+      setLat(defaultLat);
+      setLng(defaultLng);
+    }
+    setShowMap(true);
+  };
+
+  const handleUseCurrentLocationQuick = () => {
+    const defaultLat = geoLat ?? lat ?? settings.storeLatitude ?? -23.55052;
+    const defaultLng = geoLng ?? lng ?? settings.storeLongitude ?? -46.633308;
+    if (lat === undefined || lng === undefined) {
+      setLat(defaultLat);
+      setLng(defaultLng);
+    }
+    setShowMap(true);
+
+    if (typeof navigator !== 'undefined' && navigator.geolocation) {
+      setIsLocatingQuickGps(true);
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          setIsLocatingQuickGps(false);
+          const gpsLat = Math.round(position.coords.latitude * 1000000) / 1000000;
+          const gpsLng = Math.round(position.coords.longitude * 1000000) / 1000000;
+          setLat(gpsLat);
+          setLng(gpsLng);
+          setIsPinManuallyAdjusted(true);
+        },
+        () => {
+          setIsLocatingQuickGps(false);
+          setTriggerGpsCount((c) => c + 1);
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
+    } else {
+      setTriggerGpsCount((c) => c + 1);
+    }
+  };
 
   // Format and search CEP
   const handleCepChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -276,10 +316,11 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
       if (resolved) {
         setGeoLat(resolved.latitude);
         setGeoLng(resolved.longitude);
-        setLat(resolved.latitude);
-        setLng(resolved.longitude);
+        if (!isPinManuallyAdjusted) {
+          setLat(resolved.latitude);
+          setLng(resolved.longitude);
+        }
         setGeoPrecisao(resolved.precisao);
-        setIsPinManuallyAdjusted(false);
       }
     } catch {
       // Ignored
@@ -305,10 +346,6 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
     }
     if (!number.trim()) {
       setFormError('Por favor, informe o número do imóvel.');
-      return;
-    }
-    if (isPinTooFar) {
-      setFormError('Alfinete muito longe do endereço digitado.');
       return;
     }
 
@@ -562,21 +599,6 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
               </div>
             </div>
 
-            {lat !== undefined && lng !== undefined && (
-              <AddressPinMap
-                latitude={lat}
-                longitude={lng}
-                geoLatitude={geoLat ?? lat}
-                geoLongitude={geoLng ?? lng}
-                precisao={geoPrecisao}
-                onChange={(newLat, newLng) => {
-                  setLat(newLat);
-                  setLng(newLng);
-                  setIsPinManuallyAdjusted(true);
-                }}
-              />
-            )}
-
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <div>
                 <label className="font-bold text-neutral-700 block mb-1">
@@ -656,6 +678,58 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
                 />
               </div>
             </div>
+
+            {/* Optional Map Buttons (Map is hidden by default) */}
+            {!showMap ? (
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={handleOpenOptionalMap}
+                  className="px-3 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 border border-neutral-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <MapPin className="w-3.5 h-3.5 text-red-600" />
+                  <span>Ajustar no mapa (opcional)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleUseCurrentLocationQuick}
+                  disabled={isLocatingQuickGps}
+                  className="px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  {isLocatingQuickGps ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700" />
+                  ) : (
+                    <Navigation className="w-3.5 h-3.5 text-amber-700" />
+                  )}
+                  <span>Usar minha localização atual</span>
+                </button>
+              </div>
+            ) : (
+              lat !== undefined &&
+              lng !== undefined && (
+                <AddressPinMap
+                  latitude={lat}
+                  longitude={lng}
+                  geoLatitude={geoLat ?? lat}
+                  geoLongitude={geoLng ?? lng}
+                  precisao={geoPrecisao}
+                  triggerGpsCount={triggerGpsCount}
+                  onChange={(newLat, newLng) => {
+                    setLat(newLat);
+                    setLng(newLng);
+                    setIsPinManuallyAdjusted(true);
+                  }}
+                  onResetToAddress={() => {
+                    setIsPinManuallyAdjusted(false);
+                    if (geoLat !== undefined && geoLng !== undefined) {
+                      setLat(geoLat);
+                      setLng(geoLng);
+                    }
+                  }}
+                />
+              )
+            )}
           </div>
 
           {/* Footer Actions */}
@@ -671,7 +745,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
 
             <button
               type="submit"
-              disabled={isSubmitting || isPinTooFar}
+              disabled={isSubmitting}
               className="px-6 py-2.5 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed text-neutral-950 font-black rounded-xl shadow-md transition-all flex items-center gap-1.5 cursor-pointer"
             >
               {isSubmitting ? (

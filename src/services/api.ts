@@ -12,6 +12,8 @@ import {
   TableWithTab,
   TabDetail,
   PaymentMethod,
+  ProductImportItem,
+  ProductImportResult,
 } from '../types';
 import { initialProducts, initialOrders, initialSettings, initialDeliveryAreas, initialCustomers } from '../data/initialData';
 import { soundService } from '../utils/sound';
@@ -731,6 +733,35 @@ class ApiService {
     } catch (err) {
       console.warn('Erro ao recarregar produtos:', err);
     }
+  }
+
+  public async importAdminProducts(
+    rows: ProductImportItem[],
+    duplicateMode: 'skip' | 'update'
+  ): Promise<ProductImportResult> {
+    const res = await fetch('/api/admin/products/import', {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ rows, duplicateMode }),
+    });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
+    if (!res.ok) {
+      let message = 'Não foi possível importar a planilha de produtos.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+
+    const result: ProductImportResult = await res.json();
+    await this.reloadProducts();
+    return result;
   }
 
   public async setProductPromotion(

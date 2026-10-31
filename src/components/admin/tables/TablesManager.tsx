@@ -35,10 +35,39 @@ export const TablesManager: React.FC<TablesManagerProps> = ({ products, settings
   const [isManageModalOpen, setIsManageModalOpen] = useState<boolean>(false);
   const [isOpenTabModalOpen, setIsOpenTabModalOpen] = useState<boolean>(false);
   const [tableToOpen, setTableToOpen] = useState<TableWithTab | null>(null);
+  const [openingTableId, setOpeningTableId] = useState<string | null>(null);
 
   const [activeTabDetailId, setActiveTabDetailId] = useState<string | null>(null);
   const [tabToClose, setTabToClose] = useState<TabDetail | null>(null);
   const [closedOrderReceipt, setClosedOrderReceipt] = useState<Order | null>(null);
+
+  const handleQuickOpenTable = async (tbl: TableWithTab) => {
+    if (openingTableId) return;
+    setOpeningTableId(tbl.id);
+    try {
+      const opened = await api.openTableTab(tbl.id, {
+        people_count: 1,
+      });
+      await loadTables();
+      setActiveTabDetailId(opened.id);
+    } catch (err: any) {
+      try {
+        const updatedList = await api.getAdminTables();
+        setTables(updatedList);
+        const found = updatedList.find((t) => t.id === tbl.id);
+        const existingTabId = found?.currentTab?.id || found?.joinedToTabId;
+        if (existingTabId) {
+          setActiveTabDetailId(existingTabId);
+          return;
+        }
+      } catch {
+        // ignore reload error
+      }
+      api.notifyError(err?.message || 'Não foi possível abrir a mesa.');
+    } finally {
+      setOpeningTableId(null);
+    }
+  };
 
   // Load tables from server
   const loadTables = async (showSpinner = false) => {
@@ -462,14 +491,12 @@ export const TablesManager: React.FC<TablesManagerProps> = ({ products, settings
                 <div className="pt-3 border-t border-neutral-100">
                   <button
                     type="button"
-                    onClick={() => {
-                      setTableToOpen(tbl);
-                      setIsOpenTabModalOpen(true);
-                    }}
-                    className="w-full py-2.5 px-3 bg-neutral-100 hover:bg-amber-500 hover:text-neutral-950 text-neutral-800 rounded-xl text-xs font-black transition-colors flex items-center justify-center gap-1.5"
+                    disabled={openingTableId !== null}
+                    onClick={() => handleQuickOpenTable(tbl)}
+                    className="w-full py-2.5 px-3 bg-neutral-100 hover:bg-amber-500 hover:text-neutral-950 disabled:opacity-50 text-neutral-800 rounded-xl text-xs font-black transition-colors flex items-center justify-center gap-1.5"
                   >
                     <Plus className="w-4 h-4" />
-                    <span>Abrir Mesa</span>
+                    <span>{openingTableId === tbl.id ? 'Abrindo...' : 'Abrir Mesa'}</span>
                   </button>
                 </div>
               </div>
@@ -511,6 +538,7 @@ export const TablesManager: React.FC<TablesManagerProps> = ({ products, settings
         isOpen={Boolean(activeTabDetailId)}
         allTables={tables}
         products={products}
+        settings={settings}
         onClose={() => setActiveTabDetailId(null)}
         onRequestCloseTab={(tab) => {
           setActiveTabDetailId(null);

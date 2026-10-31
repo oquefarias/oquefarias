@@ -1,9 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { CustomerProfile, DeliveryArea, StoreSettings } from '../../types';
 import { api } from '../../services/api';
 import {
   User,
-  Phone,
   Mail,
   Lock,
   MapPin,
@@ -15,14 +14,15 @@ import {
   Loader2,
   Compass,
   LogOut,
-  AlertTriangle,
+  Eye,
+  EyeOff,
+  Navigation,
 } from 'lucide-react';
 import {
   fetchAddressByCep,
   fetchCoordinatesByCepBrasilApi,
   calculateDistanceKm,
   resolveFullAddressOnServer,
-  checkPinOffsetLimit,
 } from '../../utils/geo';
 import { AddressPinMap } from '../AddressPinMap';
 
@@ -50,6 +50,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   // Login form
   const [loginEmail, setLoginEmail] = useState<string>('');
   const [loginPassword, setLoginPassword] = useState<string>('');
+  const [showLoginPassword, setShowLoginPassword] = useState<boolean>(false);
   const [loginError, setLoginError] = useState<string>('');
   const [isLoadingLogin, setIsLoadingLogin] = useState<boolean>(false);
 
@@ -59,6 +60,8 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   const [phone, setPhone] = useState<string>('');
   const [password, setPassword] = useState<string>('');
   const [confirmPassword, setConfirmPassword] = useState<string>('');
+  const [showPassword, setShowPassword] = useState<boolean>(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState<boolean>(false);
   const [cep, setCep] = useState<string>('');
   const [address, setAddress] = useState<string>('');
   const [number, setNumber] = useState<string>('');
@@ -77,20 +80,100 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   const [distanceKm, setDistanceKm] = useState<number | null>(null);
   const [isWithinRadius, setIsWithinRadius] = useState<boolean | null>(null);
 
+  // Optional map state (hidden by default)
+  const [showMap, setShowMap] = useState<boolean>(false);
+  const [triggerGpsCount, setTriggerGpsCount] = useState<number>(0);
+  const [isLocatingQuickGps, setIsLocatingQuickGps] = useState<boolean>(false);
+
   const [isSearchingCep, setIsSearchingCep] = useState<boolean>(false);
+  const [cepNotFound, setCepNotFound] = useState<boolean>(false);
   const [cepStatusMessage, setCepStatusMessage] = useState<{
     type: 'success' | 'warn' | 'error';
     text: string;
   } | null>(null);
   const [registerError, setRegisterError] = useState<string>('');
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [alreadyRegisteredField, setAlreadyRegisteredField] = useState<'email' | 'phone' | null>(null);
   const [isSubmittingRegister, setIsSubmittingRegister] = useState<boolean>(false);
 
+  // Field refs for scrolling & focusing first invalid input
+  const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const emailInputRef = useRef<HTMLInputElement | null>(null);
+  const phoneInputRef = useRef<HTMLInputElement | null>(null);
+  const passwordInputRef = useRef<HTMLInputElement | null>(null);
+  const confirmPasswordInputRef = useRef<HTMLInputElement | null>(null);
+  const cepInputRef = useRef<HTMLInputElement | null>(null);
+  const addressInputRef = useRef<HTMLInputElement | null>(null);
+  const numberInputRef = useRef<HTMLInputElement | null>(null);
+  const neighborhoodInputRef = useRef<HTMLInputElement | null>(null);
+
+  const fieldRefs: Record<string, React.RefObject<HTMLInputElement | null>> = {
+    name: nameInputRef,
+    email: emailInputRef,
+    phone: phoneInputRef,
+    password: passwordInputRef,
+    confirmPassword: confirmPasswordInputRef,
+    cep: cepInputRef,
+    address: addressInputRef,
+    number: numberInputRef,
+    neighborhood: neighborhoodInputRef,
+  };
+
+  const clearFieldError = (field: string) => {
+    setFieldErrors((prev) => {
+      if (!prev[field]) return prev;
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+    if ((field === 'email' && alreadyRegisteredField === 'email') || (field === 'phone' && alreadyRegisteredField === 'phone')) {
+      setAlreadyRegisteredField(null);
+    }
+  };
+
+  const focusFirstErrorField = (errors: Record<string, string>) => {
+    const order = [
+      'name',
+      'email',
+      'phone',
+      'password',
+      'confirmPassword',
+      'cep',
+      'address',
+      'number',
+      'neighborhood',
+    ];
+    for (const key of order) {
+      if (errors[key]) {
+        const el = fieldRefs[key]?.current;
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          setTimeout(() => {
+            el.focus();
+          }, 50);
+        }
+        break;
+      }
+    }
+  };
+
   useEffect(() => {
+    setShowMap(false);
+    setTriggerGpsCount(0);
+    setFieldErrors({});
+    setAlreadyRegisteredField(null);
+    setCepNotFound(false);
+    setShowPassword(false);
+    setShowConfirmPassword(false);
+    setShowLoginPassword(false);
+
     if (currentCustomer) {
       setTab('perfil');
       setName(currentCustomer.name || '');
       setEmail(currentCustomer.email || '');
       setPhone(currentCustomer.phone || '');
+      setPassword('');
+      setConfirmPassword('');
       setCep(currentCustomer.cep || '');
       setAddress(currentCustomer.address || '');
       setNumber(currentCustomer.number || '');
@@ -140,19 +223,11 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setIsWithinRadius(null);
       setLoginError('');
       setRegisterError('');
+      setCepStatusMessage(null);
     }
   }, [currentCustomer, isOpen, deliveryAreas]);
 
   if (!isOpen) return null;
-
-  const pinCheck = checkPinOffsetLimit(
-    geoLat ?? lat,
-    geoLng ?? lng,
-    lat,
-    lng,
-    geoPrecisao || 'rua'
-  );
-  const isPinTooFar = pinCheck.isTooFar;
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -186,6 +261,8 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       formatted = `${val.slice(0, 5)}-${val.slice(5)}`;
     }
     setCep(formatted);
+    setCepNotFound(false);
+    clearFieldError('cep');
     setIsPinManuallyAdjusted(false);
 
     if (val.length === 8) {
@@ -197,9 +274,10 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     setGeoLat(newLat);
     setGeoLng(newLng);
     setGeoPrecisao(precisaoVal);
-    setLat(newLat);
-    setLng(newLng);
-    setIsPinManuallyAdjusted(false);
+    if (!isPinManuallyAdjusted) {
+      setLat(newLat);
+      setLng(newLng);
+    }
 
     if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
       const dist = calculateDistanceKm(
@@ -218,16 +296,44 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     setLat(newLat);
     setLng(newLng);
     setIsPinManuallyAdjusted(true);
-    if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
-      const dist = calculateDistanceKm(
-        settings.storeLatitude,
-        settings.storeLongitude,
-        newLat,
-        newLng
+  };
+
+  const handleOpenOptionalMap = () => {
+    const defaultLat = geoLat ?? lat ?? settings?.storeLatitude ?? -23.55052;
+    const defaultLng = geoLng ?? lng ?? settings?.storeLongitude ?? -46.633308;
+    if (lat === undefined || lng === undefined) {
+      setLat(defaultLat);
+      setLng(defaultLng);
+    }
+    setShowMap(true);
+  };
+
+  const handleUseCurrentLocationQuick = () => {
+    const defaultLat = geoLat ?? lat ?? settings?.storeLatitude ?? -23.55052;
+    const defaultLng = geoLng ?? lng ?? settings?.storeLongitude ?? -46.633308;
+    if (lat === undefined || lng === undefined) {
+      setLat(defaultLat);
+      setLng(defaultLng);
+    }
+    setShowMap(true);
+
+    if (typeof navigator !== 'undefined' && navigator.geolocation) {
+      setIsLocatingQuickGps(true);
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          setIsLocatingQuickGps(false);
+          const gpsLat = Math.round(position.coords.latitude * 1000000) / 1000000;
+          const gpsLng = Math.round(position.coords.longitude * 1000000) / 1000000;
+          updatePinOnly(gpsLat, gpsLng);
+        },
+        () => {
+          setIsLocatingQuickGps(false);
+          setTriggerGpsCount((c) => c + 1);
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
       );
-      setDistanceKm(dist);
-      const maxRadius = settings.deliveryRadiusKm || 5;
-      setIsWithinRadius(dist <= maxRadius);
+    } else {
+      setTriggerGpsCount((c) => c + 1);
     }
   };
 
@@ -264,6 +370,8 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   const executeCepSearch = async (cleanCepArg?: string) => {
     const rawDigits = (cleanCepArg || cep).replace(/\D/g, '');
     if (rawDigits.length !== 8) {
+      setCepNotFound(true);
+      setFieldErrors((prev) => ({ ...prev, cep: 'Digite um CEP completo com 8 dígitos.' }));
       setCepStatusMessage({
         type: 'warn',
         text: 'Digite um CEP completo com 8 dígitos.',
@@ -273,12 +381,18 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
     setIsSearchingCep(true);
     setCepStatusMessage(null);
+    setCepNotFound(false);
 
     try {
       const viaCep = await fetchAddressByCep(rawDigits);
       const brasilApi = await fetchCoordinatesByCepBrasilApi(rawDigits);
 
       if (!viaCep && !brasilApi) {
+        setCepNotFound(true);
+        setFieldErrors((prev) => ({
+          ...prev,
+          cep: `CEP ${rawDigits} não encontrado. Verifique os números digitados.`,
+        }));
         setCepStatusMessage({
           type: 'error',
           text: `CEP ${rawDigits} não encontrado. Verifique os números digitados.`,
@@ -286,13 +400,20 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
         return;
       }
 
+      clearFieldError('cep');
       const logradouro = viaCep?.logradouro || brasilApi?.street || address;
       const bairro = viaCep?.bairro || brasilApi?.neighborhood || neighborhood;
       const localidade = viaCep?.localidade || brasilApi?.city || city;
       const uf = viaCep?.uf || brasilApi?.state || state;
 
-      if (logradouro) setAddress(logradouro);
-      if (bairro) setNeighborhood(bairro);
+      if (logradouro) {
+        setAddress(logradouro);
+        clearFieldError('address');
+      }
+      if (bairro) {
+        setNeighborhood(bairro);
+        clearFieldError('neighborhood');
+      }
       if (localidade) setCity(localidade);
       if (uf) setState(uf);
 
@@ -364,32 +485,116 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     }
   };
 
+  const validateFields = (isProfile: boolean): boolean => {
+    const errors: Record<string, string> = {};
+
+    if (!name.trim()) {
+      errors.name = 'Informe seu nome completo.';
+    }
+
+    if (!isProfile) {
+      const cleanMail = email.trim();
+      if (!cleanMail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanMail)) {
+        errors.email = 'Digite um e-mail válido.';
+      }
+    }
+
+    const phoneDigits = phone.replace(/\D/g, '');
+    if (phoneDigits.length < 10 || phoneDigits.length > 13) {
+      errors.phone = 'Telefone inválido. Digite DDD + número (ex: 11 98888-7777).';
+    }
+
+    if (!isProfile) {
+      if (password.length < 8) {
+        errors.password = 'Mínimo 8 caracteres';
+      }
+      if (!confirmPassword || password !== confirmPassword) {
+        errors.confirmPassword = 'As senhas não são iguais';
+      }
+    } else if (password) {
+      if (password.length < 8) {
+        errors.password = 'Mínimo 8 caracteres';
+      }
+      if (confirmPassword && password !== confirmPassword) {
+        errors.confirmPassword = 'As senhas não são iguais';
+      }
+    }
+
+    const cepDigits = cep.replace(/\D/g, '');
+    if (cepNotFound) {
+      errors.cep = 'CEP não encontrado. Verifique os números digitados.';
+    } else if (cepDigits.length > 0 && cepDigits.length !== 8) {
+      errors.cep = 'Digite um CEP válido com 8 dígitos.';
+    }
+
+    if (!address.trim()) {
+      errors.address = 'Informe a rua / logradouro.';
+    }
+
+    if (!number.trim()) {
+      errors.number = 'Informe o número do imóvel.';
+    }
+
+    if (!neighborhood.trim()) {
+      errors.neighborhood = 'Informe o bairro.';
+    }
+
+    setFieldErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      focusFirstErrorField(errors);
+      return false;
+    }
+    return true;
+  };
+
+  const mapServerErrorToFields = (msg: string) => {
+    const lower = msg.toLowerCase();
+    const mapped: Record<string, string> = {};
+
+    if (lower.includes('e-mail') || lower.includes('email')) {
+      mapped.email = msg;
+      if (lower.includes('cadastrado') || lower.includes('existe')) {
+        setAlreadyRegisteredField('email');
+      }
+    } else if (lower.includes('telefone') || lower.includes('whatsapp') || lower.includes('celular')) {
+      mapped.phone = msg;
+      if (lower.includes('cadastrado') || lower.includes('existe')) {
+        setAlreadyRegisteredField('phone');
+      }
+    } else if (lower.includes('senha')) {
+      mapped.password = msg;
+    } else if (lower.includes('cep')) {
+      mapped.cep = msg;
+    } else if (lower.includes('número') || lower.includes('numero')) {
+      mapped.number = msg;
+    } else if (lower.includes('endereço') || lower.includes('endereco') || lower.includes('área de entrega') || lower.includes('raio')) {
+      mapped.address = msg;
+    }
+
+    if (Object.keys(mapped).length > 0) {
+      setFieldErrors((prev) => ({ ...prev, ...mapped }));
+      focusFirstErrorField(mapped);
+    } else {
+      setRegisterError(msg);
+    }
+  };
+
+  const handleSwitchToLoginWithEmail = () => {
+    if (email.trim()) {
+      setLoginEmail(email.trim());
+    }
+    setFieldErrors({});
+    setRegisterError('');
+    setAlreadyRegisteredField(null);
+    setTab('login');
+  };
+
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setRegisterError('');
+    setAlreadyRegisteredField(null);
 
-    if (!name.trim() || !email.trim() || !phone.trim() || !address.trim() || !number.trim() || !neighborhood.trim()) {
-      setRegisterError('Por favor, preencha todos os campos obrigatórios (*).');
-      return;
-    }
-
-    if (!email.includes('@')) {
-      setRegisterError('Digite um e-mail válido.');
-      return;
-    }
-
-    if (password.length < 8) {
-      setRegisterError('A senha deve conter no mínimo 8 caracteres.');
-      return;
-    }
-
-    if (password !== confirmPassword) {
-      setRegisterError('As senhas não coincidem. Digite novamente.');
-      return;
-    }
-
-    if (isPinTooFar) {
-      setRegisterError('Alfinete muito longe do endereço digitado.');
+    if (!validateFields(false)) {
       return;
     }
 
@@ -417,7 +622,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       }
       onSuccess(saved);
     } catch (err: any) {
-      setRegisterError(err.message || 'Erro ao realizar cadastro.');
+      mapServerErrorToFields(err.message || 'Erro ao realizar cadastro.');
     } finally {
       setIsSubmittingRegister(false);
     }
@@ -426,19 +631,9 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   const handleUpdateProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     setRegisterError('');
+    setAlreadyRegisteredField(null);
 
-    if (!name.trim() || !phone.trim() || !address.trim() || !number.trim() || !neighborhood.trim()) {
-      setRegisterError('Preencha os campos obrigatórios (*).');
-      return;
-    }
-
-    if (password && password.length < 8) {
-      setRegisterError('A nova senha deve ter no mínimo 8 caracteres.');
-      return;
-    }
-
-    if (isPinTooFar) {
-      setRegisterError('Alfinete muito longe do endereço digitado.');
+    if (!validateFields(true)) {
       return;
     }
 
@@ -465,7 +660,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       }
       onSuccess(updated);
     } catch (err: any) {
-      setRegisterError(err.message || 'Erro ao atualizar dados.');
+      mapServerErrorToFields(err.message || 'Erro ao atualizar dados.');
     } finally {
       setIsSubmittingRegister(false);
     }
@@ -478,6 +673,13 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   };
 
   const maxRadiusKm = settings?.deliveryRadiusKm || 5;
+
+  const getInputClass = (field: string, extra = '') =>
+    `w-full px-3 py-2 rounded-xl border transition-colors outline-none ${
+      fieldErrors[field]
+        ? 'border-red-500 bg-red-50/40 focus:border-red-600'
+        : 'bg-neutral-50 border-neutral-300 focus:border-amber-500'
+    } ${extra}`;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 overflow-y-auto">
@@ -524,6 +726,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                 onClick={() => {
                   setTab('cadastro');
                   setRegisterError('');
+                  setFieldErrors({});
                 }}
                 className={`flex-1 py-1.5 rounded-lg transition-all cursor-pointer ${
                   tab === 'cadastro' ? 'bg-white text-amber-950 shadow-xs' : 'text-amber-100 hover:text-white'
@@ -534,7 +737,9 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
             </div>
           ) : (
             <div className="mt-3 flex items-center justify-between text-xs bg-black/15 px-3 py-1.5 rounded-xl">
-              <span className="font-medium text-amber-100">Logado como: <strong className="text-white">{currentCustomer.name}</strong></span>
+              <span className="font-medium text-amber-100">
+                Logado como: <strong className="text-white">{currentCustomer.name}</strong>
+              </span>
               <button
                 type="button"
                 onClick={handleLogoutClick}
@@ -577,7 +782,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
               <div className="relative">
                 <Lock className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
                 <input
-                  type="password"
+                  type={showLoginPassword ? 'text' : 'password'}
                   required
                   placeholder="••••••••"
                   value={loginPassword}
@@ -585,8 +790,17 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                     setLoginPassword(e.target.value);
                     if (loginError) setLoginError('');
                   }}
-                  className="w-full pl-9 pr-3 py-2.5 bg-neutral-50 border border-neutral-300 rounded-xl text-sm font-semibold outline-amber-500"
+                  className="w-full pl-9 pr-10 py-2.5 bg-neutral-50 border border-neutral-300 rounded-xl text-sm font-semibold outline-amber-500"
                 />
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  onClick={() => setShowLoginPassword((v) => !v)}
+                  aria-label={showLoginPassword ? 'Esconder senha' : 'Mostrar senha'}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-neutral-500 hover:text-neutral-800 cursor-pointer"
+                >
+                  {showLoginPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
               </div>
             </div>
 
@@ -629,80 +843,169 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
         {/* Tab 2: Register (New Customer) OR Tab 3: Edit Profile */}
         {(tab === 'cadastro' || tab === 'perfil') && (
           <form
+            noValidate
             onSubmit={tab === 'perfil' ? handleUpdateProfile : handleRegister}
             className="p-6 space-y-3 text-xs max-h-[75vh] overflow-y-auto"
           >
             {registerError && (
-              <p className="text-xs text-red-800 bg-red-50 p-2.5 rounded-xl border border-red-200 font-bold">
-                {registerError}
-              </p>
+              <div className="text-xs text-red-800 bg-red-50 p-2.5 rounded-xl border border-red-200 font-bold space-y-2">
+                <p>{registerError}</p>
+                {alreadyRegisteredField && (
+                  <button
+                    type="button"
+                    onClick={handleSwitchToLoginWithEmail}
+                    className="w-full py-2 px-3 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-lg text-xs cursor-pointer"
+                  >
+                    Já tenho conta — entrar
+                  </button>
+                )}
+              </div>
             )}
 
             <div className="space-y-3">
               <div>
                 <label className="font-bold text-neutral-700 block mb-1">Nome Completo *</label>
                 <input
+                  ref={nameInputRef}
                   type="text"
-                  required
                   placeholder="Ex: João da Silva"
                   value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                  onChange={(e) => {
+                    setName(e.target.value);
+                    clearFieldError('name');
+                  }}
+                  className={getInputClass('name')}
                 />
+                {fieldErrors.name && (
+                  <p className="text-[11px] font-bold text-red-600 mt-1">{fieldErrors.name}</p>
+                )}
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                 <div>
                   <label className="font-bold text-neutral-700 block mb-1">E-mail *</label>
                   <input
+                    ref={emailInputRef}
                     type="email"
-                    required
                     disabled={tab === 'perfil'}
                     placeholder="seu@email.com"
                     value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    className="w-full px-3 py-2 bg-neutral-50 disabled:bg-neutral-100 border border-neutral-300 rounded-xl"
+                    onChange={(e) => {
+                      setEmail(e.target.value);
+                      clearFieldError('email');
+                    }}
+                    className={getInputClass('email', 'disabled:bg-neutral-100')}
                   />
+                  {fieldErrors.email && (
+                    <div className="mt-1 space-y-1.5">
+                      <p className="text-[11px] font-bold text-red-600">{fieldErrors.email}</p>
+                      {alreadyRegisteredField === 'email' && (
+                        <button
+                          type="button"
+                          onClick={handleSwitchToLoginWithEmail}
+                          className="w-full py-1.5 px-2.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-lg text-[11px] flex items-center justify-center gap-1 cursor-pointer shadow-2xs"
+                        >
+                          <span>Já tenho conta — entrar</span>
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
                 <div>
                   <label className="font-bold text-neutral-700 block mb-1">WhatsApp / Celular *</label>
                   <input
+                    ref={phoneInputRef}
                     type="tel"
-                    required
                     placeholder="(11) 98888-7777"
                     value={phone}
-                    onChange={(e) => setPhone(e.target.value)}
-                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                    onChange={(e) => {
+                      setPhone(e.target.value);
+                      clearFieldError('phone');
+                    }}
+                    className={getInputClass('phone')}
                   />
+                  {fieldErrors.phone && (
+                    <div className="mt-1 space-y-1.5">
+                      <p className="text-[11px] font-bold text-red-600">{fieldErrors.phone}</p>
+                      {alreadyRegisteredField === 'phone' && (
+                        <button
+                          type="button"
+                          onClick={handleSwitchToLoginWithEmail}
+                          className="w-full py-1.5 px-2.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-lg text-[11px] flex items-center justify-center gap-1 cursor-pointer shadow-2xs"
+                        >
+                          <span>Já tenho conta — entrar</span>
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {/* Password inputs */}
+              {/* Password inputs with eye toggle */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                 <div>
                   <label className="font-bold text-neutral-700 block mb-1">
                     {tab === 'perfil' ? 'Nova Senha (opcional)' : 'Senha (mínimo 8 dígitos) *'}
                   </label>
-                  <input
-                    type="password"
-                    required={tab === 'cadastro'}
-                    placeholder="Mínimo 8 caracteres"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
-                  />
+                  <div className="relative">
+                    <input
+                      ref={passwordInputRef}
+                      type={showPassword ? 'text' : 'password'}
+                      placeholder="Mínimo 8 caracteres"
+                      value={password}
+                      onChange={(e) => {
+                        setPassword(e.target.value);
+                        clearFieldError('password');
+                        if (confirmPassword && e.target.value === confirmPassword) {
+                          clearFieldError('confirmPassword');
+                        }
+                      }}
+                      className={getInputClass('password', 'pr-9')}
+                    />
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      onClick={() => setShowPassword((v) => !v)}
+                      aria-label={showPassword ? 'Esconder senha' : 'Mostrar senha'}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-neutral-500 hover:text-neutral-800 cursor-pointer"
+                    >
+                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                  {fieldErrors.password && (
+                    <p className="text-[11px] font-bold text-red-600 mt-1">{fieldErrors.password}</p>
+                  )}
                 </div>
                 {tab === 'cadastro' && (
                   <div>
                     <label className="font-bold text-neutral-700 block mb-1">Confirmar Senha *</label>
-                    <input
-                      type="password"
-                      required
-                      placeholder="Repita a senha"
-                      value={confirmPassword}
-                      onChange={(e) => setConfirmPassword(e.target.value)}
-                      className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
-                    />
+                    <div className="relative">
+                      <input
+                        ref={confirmPasswordInputRef}
+                        type={showConfirmPassword ? 'text' : 'password'}
+                        placeholder="Repita a senha"
+                        value={confirmPassword}
+                        onChange={(e) => {
+                          setConfirmPassword(e.target.value);
+                          clearFieldError('confirmPassword');
+                        }}
+                        className={getInputClass('confirmPassword', 'pr-9')}
+                      />
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        onClick={() => setShowConfirmPassword((v) => !v)}
+                        aria-label={showConfirmPassword ? 'Esconder confirmação de senha' : 'Mostrar confirmação de senha'}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-neutral-500 hover:text-neutral-800 cursor-pointer"
+                      >
+                        {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                    {fieldErrors.confirmPassword && (
+                      <p className="text-[11px] font-bold text-red-600 mt-1">{fieldErrors.confirmPassword}</p>
+                    )}
                   </div>
                 )}
               </div>
@@ -720,12 +1023,15 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
               <div className="flex gap-1.5">
                 <input
+                  ref={cepInputRef}
                   type="text"
                   maxLength={9}
                   placeholder="00000-000"
                   value={cep}
                   onChange={handleCepChange}
-                  className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl font-mono font-bold text-xs outline-none"
+                  className={`w-full px-3 py-2 bg-white border rounded-xl font-mono font-bold text-xs outline-none ${
+                    fieldErrors.cep ? 'border-red-500 bg-red-50/40' : 'border-amber-300'
+                  }`}
                 />
                 <button
                   type="button"
@@ -738,20 +1044,32 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                 </button>
               </div>
 
-              {cepStatusMessage && (
-                <p className={`text-[10px] font-bold p-1.5 rounded-lg ${
-                  cepStatusMessage.type === 'success' ? 'bg-emerald-100 text-emerald-900' : 'bg-amber-100 text-amber-900'
-                }`}>
+              {fieldErrors.cep && (
+                <p className="text-[11px] font-bold text-red-600">{fieldErrors.cep}</p>
+              )}
+
+              {cepStatusMessage && !fieldErrors.cep && (
+                <p
+                  className={`text-[10px] font-bold p-1.5 rounded-lg ${
+                    cepStatusMessage.type === 'success'
+                      ? 'bg-emerald-100 text-emerald-900'
+                      : cepStatusMessage.type === 'error'
+                      ? 'bg-red-100 text-red-800'
+                      : 'bg-amber-100 text-amber-900'
+                  }`}
+                >
                   {cepStatusMessage.text}
                 </p>
               )}
 
               {distanceKm !== null && (
-                <div className={`p-2 rounded-xl text-[11px] font-bold flex items-center gap-1.5 border ${
-                  isWithinRadius
-                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                    : 'bg-red-50 text-red-800 border-red-300'
-                }`}>
+                <div
+                  className={`p-2 rounded-xl text-[11px] font-bold flex items-center gap-1.5 border ${
+                    isWithinRadius
+                      ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                      : 'bg-red-50 text-red-800 border-red-300'
+                  }`}
+                >
                   <Compass className="w-3.5 h-3.5 shrink-0" />
                   <span>
                     {isWithinRadius
@@ -767,62 +1085,61 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                 <div className="col-span-2">
                   <label className="font-bold text-neutral-700 block mb-1">Rua / Logradouro *</label>
                   <input
+                    ref={addressInputRef}
                     type="text"
-                    required
                     placeholder="Ex: Rua das Flores"
                     value={address}
                     onChange={(e) => {
                       setAddress(e.target.value);
+                      clearFieldError('address');
                       setIsPinManuallyAdjusted(false);
                     }}
                     onBlur={handleAddressOrNumberBlur}
-                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                    className={getInputClass('address')}
                   />
+                  {fieldErrors.address && (
+                    <p className="text-[11px] font-bold text-red-600 mt-1">{fieldErrors.address}</p>
+                  )}
                 </div>
                 <div>
                   <label className="font-bold text-neutral-700 block mb-1">Número *</label>
                   <input
+                    ref={numberInputRef}
                     type="text"
-                    required
                     placeholder="123"
                     value={number}
                     onChange={(e) => {
                       setNumber(e.target.value);
+                      clearFieldError('number');
                       setIsPinManuallyAdjusted(false);
                     }}
                     onBlur={handleAddressOrNumberBlur}
-                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
+                    className={getInputClass('number')}
                   />
+                  {fieldErrors.number && (
+                    <p className="text-[11px] font-bold text-red-600 mt-1">{fieldErrors.number}</p>
+                  )}
                 </div>
               </div>
-
-              {lat !== undefined && lng !== undefined && (
-                <AddressPinMap
-                  latitude={lat}
-                  longitude={lng}
-                  geoLatitude={geoLat ?? lat}
-                  geoLongitude={geoLng ?? lng}
-                  precisao={geoPrecisao}
-                  onChange={(newLat, newLng) => {
-                    updatePinOnly(newLat, newLng);
-                  }}
-                />
-              )}
 
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="font-bold text-neutral-700 block mb-1">Bairro *</label>
                   <input
+                    ref={neighborhoodInputRef}
                     type="text"
                     placeholder="Ex: Centro"
                     value={neighborhood}
                     onChange={(e) => {
                       setNeighborhood(e.target.value);
+                      clearFieldError('neighborhood');
                       setIsPinManuallyAdjusted(false);
                     }}
-                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium"
-                    required
+                    className={getInputClass('neighborhood', 'font-medium')}
                   />
+                  {fieldErrors.neighborhood && (
+                    <p className="text-[11px] font-bold text-red-600 mt-1">{fieldErrors.neighborhood}</p>
+                  )}
                 </div>
                 <div>
                   <label className="font-bold text-neutral-700 block mb-1">Complemento</label>
@@ -876,12 +1193,62 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                   className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
                 />
               </div>
+
+              {/* Optional Map Buttons (Map is hidden by default) */}
+              {!showMap ? (
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleOpenOptionalMap}
+                    className="px-3 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 border border-neutral-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <MapPin className="w-3.5 h-3.5 text-red-600" />
+                    <span>Ajustar no mapa (opcional)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleUseCurrentLocationQuick}
+                    disabled={isLocatingQuickGps}
+                    className="px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    {isLocatingQuickGps ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700" />
+                    ) : (
+                      <Navigation className="w-3.5 h-3.5 text-amber-700" />
+                    )}
+                    <span>Usar minha localização atual</span>
+                  </button>
+                </div>
+              ) : (
+                lat !== undefined &&
+                lng !== undefined && (
+                  <AddressPinMap
+                    latitude={lat}
+                    longitude={lng}
+                    geoLatitude={geoLat ?? lat}
+                    geoLongitude={geoLng ?? lng}
+                    precisao={geoPrecisao}
+                    triggerGpsCount={triggerGpsCount}
+                    onChange={(newLat, newLng) => {
+                      updatePinOnly(newLat, newLng);
+                    }}
+                    onResetToAddress={() => {
+                      setIsPinManuallyAdjusted(false);
+                      if (geoLat !== undefined && geoLng !== undefined) {
+                        setLat(geoLat);
+                        setLng(geoLng);
+                      }
+                    }}
+                  />
+                )
+              )}
             </div>
 
             <div className="pt-2">
               <button
                 type="submit"
-                disabled={isSubmittingRegister || isPinTooFar}
+                disabled={isSubmittingRegister}
                 className="w-full py-3 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed text-neutral-950 font-black text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
                 {isSubmittingRegister ? (

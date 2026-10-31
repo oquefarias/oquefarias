@@ -22,6 +22,7 @@ import { PrintReceiptModal } from '../PrintReceiptModal';
 import { QRCodeModal } from '../QRCodeModal';
 import { GoogleDeliveryRadiusMap } from './GoogleDeliveryRadiusMap';
 import { CustomerModal } from './CustomerModal';
+import { ImportProductsModal } from './ImportProductsModal';
 import { TablesManager } from './tables/TablesManager';
 import { calculateDistanceKm } from '../../utils/geo';
 import {
@@ -57,6 +58,7 @@ import {
   Ticket,
   Tag,
   Utensils,
+  FileSpreadsheet,
 } from 'lucide-react';
 
 // Compress image uploaded from computer so it stays lightweight and fast
@@ -280,6 +282,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [stockCategoryFilter, setStockCategoryFilter] = useState<ProductCategory | 'todas'>('todas');
   const [onlyLowStock, setOnlyLowStock] = useState<boolean>(false);
   const [isProductModalOpen, setIsProductModalOpen] = useState<boolean>(false);
+  const [isImportModalOpen, setIsImportModalOpen] = useState<boolean>(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [stockRowUnits, setStockRowUnits] = useState<Record<string, SaleUnit>>({});
   const [stockAdjustModal, setStockAdjustModal] = useState<{
@@ -290,6 +293,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     error?: string;
     loading?: boolean;
   } | null>(null);
+
+  const customCategories = useMemo(() => {
+    const baseIds = new Set(['cervejas', 'destilados', 'nao_alcoolicos', 'vinhos', 'gelo_carvao', 'petiscos']);
+    const extras = new Set<string>();
+    products.forEach((p) => {
+      if (p.category && !baseIds.has(p.category)) {
+        extras.add(p.category);
+      }
+    });
+    return Array.from(extras);
+  }, [products]);
 
   // Delivery Areas state
   const [isAreaModalOpen, setIsAreaModalOpen] = useState<boolean>(false);
@@ -2173,13 +2187,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </button>
             </div>
 
-            <button
-              onClick={handleOpenNewProduct}
-              className="w-full sm:w-auto flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs shadow-xs transition-colors"
-            >
-              <Plus className="w-4 h-4" />
-              <span>Novo Produto</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+              <button
+                type="button"
+                onClick={() => setIsImportModalOpen(true)}
+                className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-white hover:bg-neutral-50 text-neutral-800 border border-neutral-300 font-bold rounded-xl text-xs shadow-2xs transition-colors cursor-pointer"
+              >
+                <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                <span>Importar planilha (.xlsx)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleOpenNewProduct}
+                className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs shadow-xs transition-colors cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Novo Produto</span>
+              </button>
+            </div>
           </div>
 
           <div className="flex items-center gap-2 overflow-x-auto pb-2 scrollbar-none">
@@ -2191,6 +2217,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               { id: 'vinhos', label: 'Vinhos' },
               { id: 'gelo_carvao', label: 'Gelo & Carvão' },
               { id: 'petiscos', label: 'Petiscos' },
+              ...customCategories.map((c) => ({ id: c, label: c })),
             ].map(cat => (
               <button
                 key={cat.id}
@@ -2241,11 +2268,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <tr key={p.id} className="hover:bg-neutral-50 transition-colors">
                         <td className="py-3 px-4">
                           <div className="flex items-center gap-3">
-                            <img
-                              src={p.image}
-                              alt={p.name}
-                              className="w-10 h-10 rounded-xl object-cover border border-neutral-200 shrink-0"
-                            />
+                            {p.image ? (
+                              <img
+                                src={p.image}
+                                alt={p.name}
+                                className="w-10 h-10 rounded-xl object-cover border border-neutral-200 shrink-0"
+                              />
+                            ) : (
+                              <div className="w-10 h-10 rounded-xl bg-neutral-100 border border-neutral-200 flex items-center justify-center text-neutral-400 shrink-0">
+                                <Package className="w-5 h-5" />
+                              </div>
+                            )}
                             <div>
                               <div className="flex items-center gap-2 flex-wrap">
                                 <span className="font-bold text-neutral-900 text-sm">{p.name}</span>
@@ -2517,11 +2550,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <tr key={prod.id} className="hover:bg-neutral-50/80 transition-colors">
                           <td className="py-3.5 px-4">
                             <div className="flex items-center gap-3">
-                              <img
-                                src={prod.image}
-                                alt={prod.name}
-                                className="w-11 h-11 rounded-xl object-cover border border-neutral-200 shrink-0"
-                              />
+                              {prod.image ? (
+                                <img
+                                  src={prod.image}
+                                  alt={prod.name}
+                                  className="w-11 h-11 rounded-xl object-cover border border-neutral-200 shrink-0"
+                                />
+                              ) : (
+                                <div className="w-11 h-11 rounded-xl bg-neutral-100 border border-neutral-200 flex items-center justify-center text-neutral-400 shrink-0">
+                                  <Package className="w-5 h-5" />
+                                </div>
+                              )}
                               <div>
                                 <div className="font-bold text-neutral-900 text-sm flex items-center gap-2">
                                   <span>{prod.name}</span>
@@ -2617,6 +2656,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <option value="vinhos">Vinhos</option>
                 <option value="gelo_carvao">Gelo & Carvão</option>
                 <option value="petiscos">Petiscos</option>
+                {customCategories.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
               </select>
             </div>
 
@@ -3516,6 +3560,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <option value="vinhos">Vinhos</option>
                     <option value="gelo_carvao">Gelo & Carvão</option>
                     <option value="petiscos">Petiscos & Copos</option>
+                    {customCategories.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
@@ -4413,6 +4462,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
         </div>
       )}
+
+      <ImportProductsModal
+        isOpen={isImportModalOpen}
+        existingProducts={products}
+        onClose={() => setIsImportModalOpen(false)}
+        onImported={() => api.reloadProducts()}
+      />
 
       {/* End Modals */}
     </div>

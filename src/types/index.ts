@@ -4,7 +4,8 @@ export type ProductCategory =
   | 'vinhos'
   | 'nao_alcoolicos'
   | 'gelo_carvao'
-  | 'petiscos';
+  | 'petiscos'
+  | (string & {});
 
 export type SaleUnit = 'unit' | 'case';
 
@@ -276,3 +277,30 @@ export interface AppState {
   customers: CustomerProfile[];
   coupons?: Coupon[];
 }
+
+export interface ProductImportItem {
+  rowNumber?: number;
+  name: string;
+  category?: string;
+  price: number | string;
+  costPrice?: number | string;
+  stock?: number | string;
+  minStock?: number | string;
+  sku?: string;
+  volume?: string;
+  active?: boolean | string;
+}
+
+export interface ProductImportErrorItem {
+  rowNumber: number;
+  name?: string;
+  reason: string;
+}
+
+export interface ProductImportResult {
+  created: number;
+  updated: number;
+  skipped: number;
+  errors: ProductImportErrorItem[];
+}
+

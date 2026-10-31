@@ -7,6 +7,7 @@ import {
   TableTabItem,
   LinkedTable,
   SaleUnit,
+  StoreSettings,
   isProductPromoActive,
   getEffectiveProductPrice,
   hasProductCase,
@@ -22,6 +23,7 @@ import {
   Merge,
   MoveRight,
   Receipt,
+  Printer,
   Users,
   Clock,
   AlertCircle,
@@ -38,6 +40,7 @@ interface TableTabDetailModalProps {
   isOpen: boolean;
   allTables: TableWithTab[];
   products: Product[];
+  settings?: StoreSettings;
   onClose: () => void;
   onRequestCloseTab: (tab: TabDetail) => void;
   onRefreshParent: () => void;
@@ -48,6 +51,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
   isOpen,
   allTables,
   products,
+  settings,
   onClose,
   onRequestCloseTab,
   onRefreshParent,
@@ -95,6 +99,20 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
   const [isCancelTabModalOpen, setIsCancelTabModalOpen] = useState<boolean>(false);
   const [cancelTabReason, setCancelTabReason] = useState<string>('');
   const [isCancellingTab, setIsCancellingTab] = useState<boolean>(false);
+  const [isPreBillModalOpen, setIsPreBillModalOpen] = useState<boolean>(false);
+
+  const [isCompactLayout, setIsCompactLayout] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth < 640 || window.innerHeight < 800 : false
+  );
+
+  useEffect(() => {
+    const handleResize = () => {
+      setIsCompactLayout(window.innerWidth < 640 || window.innerHeight < 800);
+    };
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   const [lastLaunchedItemKey, setLastLaunchedItemKey] = useState<{
     productId: string;
@@ -125,6 +143,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
       setItemToCancel(null);
       setTableToUnjoin(null);
       setIsCancelTabModalOpen(false);
+      setIsPreBillModalOpen(false);
       setLastLaunchedItemKey(null);
       loadDetail();
     } else {
@@ -139,6 +158,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
       setItemToCancel(null);
       setTableToUnjoin(null);
       setIsCancelTabModalOpen(false);
+      setIsPreBillModalOpen(false);
       setLastLaunchedItemKey(null);
     }
   }, [isOpen, tabId]);
@@ -437,11 +457,19 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
     ? Math.max(0, Math.floor((Date.now() - new Date(tabDetail.openedAt).getTime()) / 60000))
     : 0;
 
+  const handleOpenPreBill = () => {
+    if (!tabDetail) return;
+    setIsPreBillModalOpen(true);
+    window.setTimeout(() => {
+      window.print();
+    }, 120);
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-black/60 backdrop-blur-xs animate-in fade-in duration-200">
       <div className="bg-white rounded-none sm:rounded-3xl w-full max-w-5xl h-[100dvh] sm:h-[94vh] shadow-2xl border-0 sm:border border-neutral-100 overflow-hidden flex flex-col relative">
-        {/* Single Scroll Container on <640px, Flex Column on >=640px */}
-        <div className="flex-1 overflow-y-auto sm:overflow-hidden flex flex-col">
+        {/* Single Scroll Container when <640px width or <800px height, Flex Column otherwise */}
+        <div className={`flex-1 flex flex-col ${isCompactLayout ? 'overflow-y-auto' : 'overflow-hidden'}`}>
           {/* Top Header */}
           <div className="bg-neutral-900 px-4 py-3.5 sm:px-6 sm:py-4 text-white flex items-center justify-between border-b border-neutral-800 shrink-0">
             <div className="flex items-center gap-3 sm:gap-4 min-w-0">
@@ -603,10 +631,10 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
             </div>
           )}
 
-          {/* Main Body: Single flow on <640px, 2 Columns on Desktop */}
-          <div className="sm:flex-1 sm:overflow-hidden grid grid-cols-1 lg:grid-cols-12">
+          {/* Main Body: Single flow when compact (<640px width or <800px height), 2 Columns on tall Desktop */}
+          <div className={isCompactLayout ? 'grid grid-cols-1' : 'flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-12'}>
             {/* LEFT COLUMN: Items List (Col 7) */}
-            <div className="lg:col-span-7 lg:border-r border-neutral-200 flex flex-col sm:h-full sm:overflow-hidden bg-neutral-50/50">
+            <div className={`lg:col-span-7 lg:border-r border-neutral-200 flex flex-col bg-neutral-50/50 ${isCompactLayout ? '' : 'h-full overflow-hidden'}`}>
               {/* Items Header */}
               <div className="p-4 bg-white border-b border-neutral-200 flex items-center justify-between shrink-0">
                 <div>
@@ -623,8 +651,8 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                 </div>
               </div>
 
-              {/* Items List (full height without inner scroll on <640px, scrollable on >=640px) */}
-              <div className="sm:flex-1 sm:overflow-y-auto p-4 space-y-2">
+              {/* Items List (full height without inner scroll when compact, scrollable on tall desktop) */}
+              <div className={`p-4 space-y-2 ${isCompactLayout ? '' : 'flex-1 overflow-y-auto'}`}>
                 {loading ? (
                   <div className="p-12 text-center text-xs text-neutral-400 font-bold">
                     Carregando itens da comanda...
@@ -783,20 +811,32 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                   </button>
                 </div>
 
-                {/* Primary Close Button (>=640px) */}
-                <button
-                  type="button"
-                  onClick={() => tabDetail && onRequestCloseTab(tabDetail)}
-                  className="hidden sm:flex w-full py-3.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl text-sm font-black shadow-lg hover:shadow-xl transition-all items-center justify-center gap-2"
-                >
-                  <Receipt className="w-5 h-5" />
-                  <span>Fechar Conta • R$ {(tabDetail?.subtotal || 0).toFixed(2)}</span>
-                </button>
+                {/* Primary Print & Close Buttons (Tall Desktop only; Compact uses sticky footer) */}
+                {!isCompactLayout && (
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleOpenPreBill}
+                      className="py-3.5 px-4 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 border border-neutral-300 rounded-2xl text-xs font-black transition-all flex items-center justify-center gap-2 shrink-0"
+                    >
+                      <Printer className="w-4 h-4 text-neutral-700" />
+                      <span>Imprimir conta</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => tabDetail && onRequestCloseTab(tabDetail)}
+                      className="flex-1 py-3.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl text-sm font-black shadow-lg hover:shadow-xl transition-all flex items-center justify-center gap-2"
+                    >
+                      <Receipt className="w-5 h-5" />
+                      <span>Fechar Conta • R$ {(tabDetail?.subtotal || 0).toFixed(2)}</span>
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
 
             {/* RIGHT COLUMN: Launch Products Catalog (Col 5) */}
-            <div className="lg:col-span-5 flex flex-col sm:h-full sm:overflow-hidden bg-white border-t sm:border-t-0 border-neutral-200">
+            <div className={`lg:col-span-5 flex flex-col bg-white border-neutral-200 ${isCompactLayout ? 'border-t' : 'h-full overflow-hidden'}`}>
               {/* Search and Category Filters */}
               <div className="p-4 border-b border-neutral-200 space-y-3 shrink-0">
                 <div className="relative">
@@ -837,7 +877,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
               </div>
 
               {/* Products Grid / List */}
-              <div className="sm:flex-1 sm:overflow-y-auto p-3 space-y-2 pb-6 sm:pb-3">
+              <div className={`p-3 space-y-2 ${isCompactLayout ? 'pb-6' : 'flex-1 overflow-y-auto'}`}>
                 {filteredProducts.length === 0 ? (
                   <div className="p-8 text-center text-xs text-neutral-400">
                     Nenhum produto encontrado.
@@ -937,14 +977,20 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
 
                 return (
                   <>
-                    {/* Mobile Drawer Backdrop (<640px) */}
-                    <div
-                      onClick={() => setSelectedProduct(null)}
-                      className="fixed inset-0 z-40 bg-black/50 backdrop-blur-[1px] sm:hidden animate-in fade-in duration-150"
-                    />
+                    {/* Compact Drawer Backdrop (<640px width or <800px height) */}
+                    {isCompactLayout && (
+                      <div
+                        onClick={() => setSelectedProduct(null)}
+                        className="fixed inset-0 z-40 bg-black/50 backdrop-blur-[1px] animate-in fade-in duration-150"
+                      />
+                    )}
                     <form
                       onSubmit={handleAddItem}
-                      className="fixed inset-x-0 bottom-0 z-50 rounded-t-3xl bg-white p-4 shadow-2xl border-t border-neutral-200 space-y-3 animate-in slide-in-from-bottom-2 sm:static sm:z-auto sm:rounded-none sm:bg-neutral-50 sm:shadow-none shrink-0"
+                      className={
+                        isCompactLayout
+                          ? 'fixed inset-x-0 bottom-0 z-50 max-w-lg mx-auto rounded-t-3xl bg-white p-4 shadow-2xl border-t border-neutral-200 space-y-3 animate-in slide-in-from-bottom-2 shrink-0'
+                          : 'p-4 bg-neutral-50 border-t border-neutral-200 space-y-3 shrink-0'
+                      }
                     >
                       {addItemError && (
                         <div className="p-2 bg-red-50 border border-red-200 rounded-xl flex items-center gap-2 text-[11px] text-red-700 font-bold">
@@ -1073,17 +1119,173 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
           </div>
         </div>
 
-        {/* Fixed Mobile Footer (<640px): Fechar Conta always visible */}
-        <div className="sm:hidden p-3 bg-white border-t border-neutral-200 shrink-0 shadow-[0_-4px_12px_rgba(0,0,0,0.06)]">
-          <button
-            type="button"
-            onClick={() => tabDetail && onRequestCloseTab(tabDetail)}
-            className="w-full py-3.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl text-sm font-black shadow-lg transition-all flex items-center justify-center gap-2"
-          >
-            <Receipt className="w-5 h-5" />
-            <span>Fechar Conta • R$ {(tabDetail?.subtotal || 0).toFixed(2)}</span>
-          </button>
-        </div>
+        {/* Fixed Footer when compact (<640px width or <800px height): Imprimir conta & Fechar Conta always visible */}
+        {isCompactLayout && (
+          <div className="p-3 bg-white border-t border-neutral-200 shrink-0 shadow-[0_-4px_12px_rgba(0,0,0,0.06)] flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleOpenPreBill}
+              className="py-3.5 px-3.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-900 border border-neutral-300 rounded-2xl text-xs font-black transition-all flex items-center justify-center gap-1.5 shrink-0"
+            >
+              <Printer className="w-4 h-4 text-neutral-700" />
+              <span>Imprimir conta</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => tabDetail && onRequestCloseTab(tabDetail)}
+              className="flex-1 py-3.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl text-sm font-black shadow-lg transition-all flex items-center justify-center gap-2"
+            >
+              <Receipt className="w-5 h-5" />
+              <span>Fechar Conta • R$ {(tabDetail?.subtotal || 0).toFixed(2)}</span>
+            </button>
+          </div>
+        )}
+
+        {/* Sub-Dialog: 80mm Pre-Bill ("Imprimir conta") */}
+        {isPreBillModalOpen && tabDetail && (() => {
+          const subtotalVal = Math.round((tabDetail.subtotal || 0) * 100) / 100;
+          const optionalFee10 = Math.round(subtotalVal * 0.10 * 100) / 100;
+          const totalWithFee10 = Math.round((subtotalVal + optionalFee10) * 100) / 100;
+          const now = new Date();
+
+          return (
+            <div className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-in fade-in duration-150">
+              <div className="bg-white rounded-3xl w-full max-w-md shadow-2xl border border-neutral-200 overflow-hidden flex flex-col max-h-[90vh]">
+                <div className="print:hidden bg-neutral-900 text-white p-4 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Printer className="w-4 h-4 text-amber-400" />
+                    <span className="text-xs font-black uppercase tracking-wider">
+                      Pré-Conta • Mesa {allTableNumbers}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsPreBillModalOpen(false)}
+                    className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Printable 80mm Pre-Bill Paper */}
+                <div
+                  id="receipt-to-print"
+                  className="p-6 overflow-y-auto flex-1 font-mono text-xs text-neutral-800 bg-neutral-50/50 space-y-4"
+                >
+                  <div className="text-center pb-3 border-b border-dashed border-neutral-300">
+                    <h3 className="font-black text-sm uppercase tracking-wider text-neutral-900">
+                      {settings?.storeName || 'Depósito'}
+                    </h3>
+                    {settings?.cnpjOrCpf && (
+                      <p className="text-[11px] text-neutral-500 mt-0.5">CNPJ/CPF: {settings.cnpjOrCpf}</p>
+                    )}
+                    {settings?.address && <p className="text-[11px] text-neutral-500">{settings.address}</p>}
+                    {settings?.phone && <p className="text-[11px] text-neutral-500">Tel: {settings.phone}</p>}
+                    <p className="text-[10px] font-bold text-neutral-600 mt-1">
+                      *** PRÉ-CONTA DE CONFERÊNCIA ***
+                    </p>
+                  </div>
+
+                  <div className="space-y-1 text-[11px] border-b border-dashed border-neutral-300 pb-3">
+                    <div className="flex justify-between font-bold text-neutral-900">
+                      <span>
+                        MESA {allTableNumbers}
+                        {tabDetail.tableLabel ? ` (${tabDetail.tableLabel})` : ''}
+                      </span>
+                      <span>{now.toLocaleDateString('pt-BR')}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>
+                        {tabDetail.customerName ? `Cliente: ${tabDetail.customerName}` : 'Cliente na Mesa'}
+                        {tabDetail.peopleCount ? ` (${tabDetail.peopleCount}p)` : ''}
+                      </span>
+                      <span>{now.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</span>
+                    </div>
+                    {tabDetail.notes && (
+                      <p className="text-[10px] text-neutral-500 italic mt-1">{tabDetail.notes}</p>
+                    )}
+                  </div>
+
+                  {/* Items */}
+                  <div className="space-y-1.5 border-b border-dashed border-neutral-300 pb-3">
+                    <div className="flex justify-between font-bold text-[10px] uppercase text-neutral-500 pb-1">
+                      <span>Item / Qtd</span>
+                      <span>Total</span>
+                    </div>
+                    {groupedActiveItems.length === 0 ? (
+                      <p className="text-[11px] text-neutral-500 text-center py-2">Nenhum item consumido.</p>
+                    ) : (
+                      groupedActiveItems.map((it) => {
+                        const isCase = it.saleUnit === 'case' && it.unitsPerSale > 1;
+                        return (
+                          <div key={it.key} className="flex justify-between items-start text-[11px]">
+                            <div className="pr-2">
+                              <span>
+                                {isCase
+                                  ? `${it.quantity} cx ${it.productName} (c/${it.unitsPerSale})`
+                                  : `${it.quantity}x ${it.productName}`}
+                              </span>
+                              <div className="text-[10px] text-neutral-400">
+                                {it.quantity} {isCase ? 'cx' : 'x'} R$ {it.unitPrice.toFixed(2)}
+                              </div>
+                            </div>
+                            <span className="font-bold whitespace-nowrap">
+                              R$ {(it.unitPrice * it.quantity).toFixed(2)}
+                            </span>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  {/* Totals */}
+                  <div className="space-y-1.5 pt-1 text-xs">
+                    <div className="flex justify-between text-neutral-700">
+                      <span>Subtotal:</span>
+                      <span>R$ {subtotalVal.toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between text-neutral-700">
+                      <span>Taxa de serviço (opcional):</span>
+                      <span>R$ {optionalFee10.toFixed(2)}</span>
+                    </div>
+                    <div className="pt-1.5 border-t border-dashed border-neutral-300 space-y-1">
+                      <div className="flex justify-between text-xs font-bold text-neutral-800">
+                        <span>Total sem taxa:</span>
+                        <span>R$ {subtotalVal.toFixed(2)}</span>
+                      </div>
+                      <div className="flex justify-between text-sm font-black text-neutral-950">
+                        <span>Total com taxa (10%):</span>
+                        <span>R$ {totalWithFee10.toFixed(2)}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="text-center pt-3 border-t border-dashed border-neutral-300 text-[10px] font-bold text-neutral-700 uppercase">
+                    CONFERÊNCIA — NÃO É COMPROVANTE DE PAGAMENTO
+                  </div>
+                </div>
+
+                <div className="print:hidden p-4 bg-white border-t border-neutral-200 flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => window.print()}
+                    className="flex-1 py-3 px-4 bg-amber-500 hover:bg-amber-400 text-neutral-950 rounded-2xl text-xs font-black shadow-md flex items-center justify-center gap-2 transition-colors"
+                  >
+                    <Printer className="w-4 h-4" />
+                    <span>Imprimir conta</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsPreBillModalOpen(false)}
+                    className="py-3 px-5 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 rounded-2xl text-xs font-bold transition-colors"
+                  >
+                    Fechar
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Sub-Dialog: Move Tab to Another Table */}
         {moveModalOpen && (

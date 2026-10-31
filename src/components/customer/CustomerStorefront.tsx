@@ -44,6 +44,7 @@ import {
   Building2,
   Loader2,
   Ticket,
+  Navigation,
 } from 'lucide-react';
 import {
   calculateDistanceKm,
@@ -117,6 +118,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [isPinConfirmed, setIsPinConfirmed] = useState<boolean>(() =>
     Boolean(currentCustomer?.locationVerified || api.isCustomerPinConfirmed(currentCustomer?.id))
   );
+  const [showCheckoutMap, setShowCheckoutMap] = useState<boolean>(false);
+  const [checkoutTriggerGpsCount, setCheckoutTriggerGpsCount] = useState<number>(0);
 
   // Coupon state
   const [couponInput, setCouponInput] = useState<string>('');
@@ -691,15 +694,6 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     hasCheckoutCashTyped &&
     (Number.isNaN(checkoutCashNum) || Math.round(checkoutCashNum * 100) < Math.round(cartTotal * 100));
 
-  const checkoutPinCheck = checkPinOffsetLimit(
-    checkoutGeoLat ?? checkoutLat,
-    checkoutGeoLng ?? checkoutLng,
-    checkoutLat,
-    checkoutLng,
-    checkoutPrecisao || 'rua'
-  );
-  const isCheckoutPinTooFar = deliveryType === 'delivery' && checkoutPinCheck.isTooFar;
-
   // Submit order to depot
   const handleCheckoutSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -709,7 +703,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setCheckoutError(settings.closedMessage || 'Desculpe, o depósito está fechado no momento para novos pedidos.');
       return;
     }
-    if (cart.length === 0 || isCheckoutCashInvalid || isCheckoutPinTooFar) return;
+    if (cart.length === 0 || isCheckoutCashInvalid) return;
 
     // Requirement: Mandatory login/registration before completing order
     if (!api.isCustomerAuthenticated() || !currentCustomer) {
@@ -725,12 +719,6 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     if (deliveryType === 'delivery') {
       if (!address.trim() || !addressNumber.trim() || !neighborhood.trim()) {
         setCheckoutError('Por favor preencha o endereço completo de entrega.');
-        return;
-      }
-      if (isCheckoutPinTooFar) {
-        setCheckoutError(
-          `O alfinete está longe do endereço que você digitou (${checkoutPinCheck.offsetM} m). Confira a rua e o número ou coloque o alfinete na sua casa.`
-        );
         return;
       }
       const radiusCheckFailed =
@@ -896,15 +884,28 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     }
   };
 
-  const categories = [
-    { id: 'todas', label: 'Todas as Bebidas', icon: Sparkles },
-    { id: 'cervejas', label: 'Cervejas', icon: Beer },
-    { id: 'destilados', label: 'Destilados & Drinks', icon: Wine },
-    { id: 'nao_alcoolicos', label: 'Refrigerantes & Sucos', icon: Coffee },
-    { id: 'vinhos', label: 'Vinhos & Espumantes', icon: Wine },
-    { id: 'gelo_carvao', label: 'Gelo & Carvão', icon: Flame },
-    { id: 'petiscos', label: 'Petiscos & Copos', icon: Package },
-  ];
+  const categories = useMemo(() => {
+    const base = [
+      { id: 'todas', label: 'Todas as Bebidas', icon: Sparkles },
+      { id: 'cervejas', label: 'Cervejas', icon: Beer },
+      { id: 'destilados', label: 'Destilados & Drinks', icon: Wine },
+      { id: 'nao_alcoolicos', label: 'Refrigerantes & Sucos', icon: Coffee },
+      { id: 'vinhos', label: 'Vinhos & Espumantes', icon: Wine },
+      { id: 'gelo_carvao', label: 'Gelo & Carvão', icon: Flame },
+      { id: 'petiscos', label: 'Petiscos & Copos', icon: Package },
+    ];
+    const baseIds = new Set(base.map((b) => b.id));
+    const extras = new Set<string>();
+    products.forEach((p) => {
+      if (p.active && p.category && !baseIds.has(p.category)) {
+        extras.add(p.category);
+      }
+    });
+    return [
+      ...base,
+      ...Array.from(extras).map((c) => ({ id: c, label: c, icon: Package })),
+    ];
+  }, [products]);
 
   const getStatusBadgeInfo = (status: OrderStatus, delivType: 'delivery' | 'retirada' | 'local') => {
     switch (status) {
@@ -1424,12 +1425,18 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 >
                   <div>
                     <div className="relative h-48 bg-neutral-100 overflow-hidden">
-                      <img
-                        src={product.image}
-                        alt={product.name}
-                        className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                        loading="lazy"
-                      />
+                      {product.image ? (
+                        <img
+                          src={product.image}
+                          alt={product.name}
+                          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                          loading="lazy"
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-neutral-300">
+                          <Package className="w-12 h-12" />
+                        </div>
+                      )}
                       {/* Red Discount Badge */}
                       <div className="absolute top-3 right-3 bg-red-600 text-white text-xs font-black px-2.5 py-1 rounded-full shadow-md">
                         -{discountPct}%
@@ -1678,12 +1685,18 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 }`}
               >
                 <div className="relative aspect-square bg-neutral-100 overflow-hidden">
-                  <img
-                    src={product.image}
-                    alt={product.name}
-                    className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                    loading="lazy"
-                  />
+                  {product.image ? (
+                    <img
+                      src={product.image}
+                      alt={product.name}
+                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                      loading="lazy"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-neutral-300">
+                      <Package className="w-12 h-12" />
+                    </div>
+                  )}
                   {product.isCold && (
                     <div className="absolute top-2 left-2 bg-sky-500/95 backdrop-blur-xs text-white text-[10px] font-black px-2 py-0.5 rounded-full shadow-sm flex items-center gap-1">
                       <span>❄️</span>
@@ -1914,11 +1927,17 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       key={`${item.product.id}-${item.saleUnit}`}
                       className="flex items-center justify-between gap-2.5 p-3 bg-neutral-50 rounded-2xl border border-neutral-200"
                     >
-                      <img
-                        src={currentProd.image}
-                        alt={currentProd.name}
-                        className="w-11 h-11 rounded-xl object-cover shrink-0"
-                      />
+                      {currentProd.image ? (
+                        <img
+                          src={currentProd.image}
+                          alt={currentProd.name}
+                          className="w-11 h-11 rounded-xl object-cover shrink-0"
+                        />
+                      ) : (
+                        <div className="w-11 h-11 rounded-xl bg-neutral-200 flex items-center justify-center text-neutral-400 shrink-0">
+                          <Package className="w-5 h-5" />
+                        </div>
+                      )}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-start gap-1.5">
                           <h5 className="font-bold text-xs text-neutral-900 line-clamp-2 break-words leading-snug">
@@ -2225,58 +2244,79 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       </div>
                     </div>
 
-                    {/* Map Pin Confirmation in Checkout (shown when coordinates exist after CEP+number or for existing customer with unconfirmed coordinates) */}
-                    {checkoutLat !== undefined && checkoutLng !== undefined && (
-                      <div className="space-y-2">
-                        {currentCustomer && !isPinConfirmed && (
-                          <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-xl text-[11px] text-amber-950 font-bold flex items-center gap-2">
-                            <MapPin className="w-4 h-4 text-amber-600 shrink-0" />
-                            <span>
-                              Confirme a localização do seu endereço no mapa abaixo uma vez para garantir o cálculo exato da entrega:
-                            </span>
-                          </div>
-                        )}
-                        <AddressPinMap
-                          latitude={checkoutLat}
-                          longitude={checkoutLng}
-                          geoLatitude={checkoutGeoLat ?? checkoutLat}
-                          geoLongitude={checkoutGeoLng ?? checkoutLng}
-                          precisao={checkoutPrecisao}
-                          showConfirmButton={Boolean(currentCustomer && !isPinConfirmed)}
-                          isConfirmingPin={isConfirmingPin}
-                          pinConfirmed={isPinConfirmed}
-                          onConfirmPin={(confirmedLat, confirmedLng) => {
-                            const check = checkPinOffsetLimit(
-                              checkoutGeoLat ?? confirmedLat,
-                              checkoutGeoLng ?? confirmedLng,
-                              confirmedLat,
-                              confirmedLng,
-                              checkoutPrecisao || 'rua'
-                            );
-                            setCheckoutLat(confirmedLat);
-                            setCheckoutLng(confirmedLng);
-                            if (!check.isTooFar) {
+                    {/* Optional Map Pin in Checkout */}
+                    {!showCheckoutMap ? (
+                      <div className="flex flex-wrap items-center gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const fallbackLat = checkoutGeoLat ?? checkoutLat ?? settings.storeLatitude ?? -23.55052;
+                            const fallbackLng = checkoutGeoLng ?? checkoutLng ?? settings.storeLongitude ?? -46.633308;
+                            if (checkoutLat === undefined || checkoutLng === undefined) {
+                              setCheckoutLat(fallbackLat);
+                              setCheckoutLng(fallbackLng);
+                            }
+                            setShowCheckoutMap(true);
+                          }}
+                          className="px-3 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 border border-neutral-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          <MapPin className="w-3.5 h-3.5 text-red-600" />
+                          <span>Ajustar no mapa (opcional)</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const fallbackLat = checkoutGeoLat ?? checkoutLat ?? settings.storeLatitude ?? -23.55052;
+                            const fallbackLng = checkoutGeoLng ?? checkoutLng ?? settings.storeLongitude ?? -46.633308;
+                            if (checkoutLat === undefined || checkoutLng === undefined) {
+                              setCheckoutLat(fallbackLat);
+                              setCheckoutLng(fallbackLng);
+                            }
+                            setShowCheckoutMap(true);
+                            setCheckoutTriggerGpsCount((c) => c + 1);
+                          }}
+                          className="px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          <Navigation className="w-3.5 h-3.5 text-amber-700" />
+                          <span>Usar minha localização atual</span>
+                        </button>
+                      </div>
+                    ) : (
+                      checkoutLat !== undefined &&
+                      checkoutLng !== undefined && (
+                        <div className="space-y-2">
+                          <AddressPinMap
+                            latitude={checkoutLat}
+                            longitude={checkoutLng}
+                            geoLatitude={checkoutGeoLat ?? checkoutLat}
+                            geoLongitude={checkoutGeoLng ?? checkoutLng}
+                            precisao={checkoutPrecisao}
+                            triggerGpsCount={checkoutTriggerGpsCount}
+                            showConfirmButton={Boolean(currentCustomer && !isPinConfirmed)}
+                            isConfirmingPin={isConfirmingPin}
+                            pinConfirmed={isPinConfirmed}
+                            onConfirmPin={(confirmedLat, confirmedLng) => {
+                              setCheckoutLat(confirmedLat);
+                              setCheckoutLng(confirmedLng);
                               setCheckoutError('');
                               persistCheckoutCoordinates(confirmedLat, confirmedLng, true);
-                            }
-                          }}
-                          onChange={(newLat, newLng) => {
-                            const check = checkPinOffsetLimit(
-                              checkoutGeoLat ?? newLat,
-                              checkoutGeoLng ?? newLng,
-                              newLat,
-                              newLng,
-                              checkoutPrecisao || 'rua'
-                            );
-                            setCheckoutLat(newLat);
-                            setCheckoutLng(newLng);
-                            if (!check.isTooFar) {
+                            }}
+                            onChange={(newLat, newLng) => {
+                              setCheckoutLat(newLat);
+                              setCheckoutLng(newLng);
                               setCheckoutError('');
                               persistCheckoutCoordinates(newLat, newLng, true);
-                            }
-                          }}
-                        />
-                      </div>
+                            }}
+                            onResetToAddress={() => {
+                              if (checkoutGeoLat !== undefined && checkoutGeoLng !== undefined) {
+                                setCheckoutLat(checkoutGeoLat);
+                                setCheckoutLng(checkoutGeoLng);
+                                persistCheckoutCoordinates(checkoutGeoLat, checkoutGeoLng, true);
+                              }
+                            }}
+                          />
+                        </div>
+                      )
                     )}
 
                     <div className="grid grid-cols-2 gap-2">
@@ -2496,7 +2536,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
               <button
                 type="submit"
-                disabled={isSubmitting || cart.length === 0 || !isAreaCovered || !settings.isOpen || isCheckoutCashInvalid || isCheckoutPinTooFar}
+                disabled={isSubmitting || cart.length === 0 || !isAreaCovered || !settings.isOpen || isCheckoutCashInvalid}
                 className="w-full py-4 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 disabled:cursor-not-allowed text-white font-black text-base rounded-2xl shadow-xl shadow-amber-500/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
                 {!settings.isOpen ? (
