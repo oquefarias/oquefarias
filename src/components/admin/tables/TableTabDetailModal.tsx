@@ -12,6 +12,7 @@ import {
   getEffectiveProductPrice,
   hasProductCase,
   formatStockWithCases,
+  sortProductsByPreference,
 } from '../../../types';
 import { api } from '../../../services/api';
 import {
@@ -181,9 +182,9 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
     return () => window.clearTimeout(timer);
   }, [lastLaunchedItemKey, tabDetail]);
 
-  // Filter products for launching items
+  // Filter products for launching items (with owner's preferred products first)
   const filteredProducts = useMemo(() => {
-    return products.filter((p) => {
+    const matching = products.filter((p) => {
       if (!p.active) return false;
       if (categoryFilter !== 'todas' && p.category !== categoryFilter) return false;
       if (prodSearch.trim()) {
@@ -194,7 +195,8 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
       }
       return true;
     });
-  }, [products, categoryFilter, prodSearch]);
+    return sortProductsByPreference(matching, settings?.featuredProductIds);
+  }, [products, categoryFilter, prodSearch, settings?.featuredProductIds]);
 
   // Other open tabs for transfer (only primary tables with open tabs, excluding joined tables)
   const otherOpenTables = useMemo(() => {
@@ -226,6 +228,56 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
     ].sort((a, b) => a - b);
     return nums.join(' + ');
   }, [tabDetail]);
+
+  useEffect(() => {
+    if (!isOpen || !tabId) return;
+    const closeKey = (settings?.shortcuts?.fecharModal || 'Escape').toUpperCase();
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (window.innerWidth < 768) return;
+      const pressed = e.key.toUpperCase();
+      if (pressed === closeKey || (closeKey === 'ESC' && e.key === 'Escape')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (isPreBillModalOpen) {
+          setIsPreBillModalOpen(false);
+        } else if (isCancelTabModalOpen) {
+          setIsCancelTabModalOpen(false);
+        } else if (tableToUnjoin) {
+          setTableToUnjoin(null);
+        } else if (itemToCancel) {
+          setItemToCancel(null);
+        } else if (transferItem) {
+          setTransferItem(null);
+        } else if (joinModalOpen) {
+          setJoinModalOpen(false);
+        } else if (moveModalOpen) {
+          setMoveModalOpen(false);
+        } else if (selectedProduct) {
+          setSelectedProduct(null);
+        } else if (isEditingMeta) {
+          setIsEditingMeta(false);
+        } else {
+          onClose();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    isOpen,
+    tabId,
+    settings?.shortcuts,
+    isPreBillModalOpen,
+    isCancelTabModalOpen,
+    tableToUnjoin,
+    itemToCancel,
+    transferItem,
+    joinModalOpen,
+    moveModalOpen,
+    selectedProduct,
+    isEditingMeta,
+    onClose,
+  ]);
 
   if (!isOpen || !tabId) return null;
 
@@ -843,6 +895,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                   <Search className="w-4 h-4 text-neutral-400 absolute left-3 top-3 pointer-events-none" />
                   <input
                     type="text"
+                    data-admin-search="comanda"
                     value={prodSearch}
                     onChange={(e) => setProdSearch(e.target.value)}
                     placeholder="Buscar produto por nome ou código..."

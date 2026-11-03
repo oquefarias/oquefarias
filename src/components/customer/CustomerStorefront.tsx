@@ -14,6 +14,7 @@ import {
   getEffectiveProductPrice,
   getPromoDiscountPercent,
   hasProductCase,
+  sortProductsByPreference,
 } from '../../types';
 import { api, CouponValidationResult, CustomerDeliveryQuoteResult } from '../../services/api';
 import { CustomerAuthModal } from './CustomerAuthModal';
@@ -132,6 +133,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [myOrders, setMyOrders] = useState<Order[]>([]);
   const [isLoadingMyOrders, setIsLoadingMyOrders] = useState<boolean>(false);
   const [myOrdersError, setMyOrdersError] = useState<string>('');
+  const [outOfStockNotices, setOutOfStockNotices] = useState<string[]>([]);
 
   const handleOpenMyOrders = async () => {
     setIsMyOrdersOpen(true);
@@ -465,15 +467,77 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return !!matchedArea;
   }, [deliveryType, activeAreas.length, matchedArea, deliveryQuote, customerDistance, settings.deliveryModel, settings.deliveryRadiusKm]);
 
-  // Featured promotional products
-  const promoProducts = useMemo(() => {
-    return products.filter((p) => p.active && isProductPromoActive(p));
-  }, [products]);
+  const showOutOfStock = Boolean(settings.showOutOfStock);
 
-  // Filter products
-  const filteredProducts = useMemo(() => {
+  // Refresh products when cart is opened or periodically while cart has items
+  useEffect(() => {
+    if (cart.length === 0) return;
+    if (isCartOpen) {
+      api.reloadProducts().catch(() => {});
+    }
+    const interval = setInterval(() => {
+      api.reloadProducts().catch(() => {});
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [cart.length, isCartOpen]);
+
+  // If a product in the cart goes out of stock (stock < 1) or becomes inactive, remove it and notify the customer
+  useEffect(() => {
+    if (cart.length === 0 || products.length === 0) return;
+    const productMap = new Map<string, Product>(products.map((p) => [p.id, p]));
+    const exhaustedNames = new Set<string>();
+    let hasExhausted = false;
+
+    for (const item of cart) {
+      const fresh = productMap.get(item.product.id);
+      if (!fresh || !fresh.active || fresh.stock < 1) {
+        hasExhausted = true;
+        exhaustedNames.add(fresh?.name || item.product.name);
+      }
+    }
+
+    if (hasExhausted) {
+      setCart((prev) => {
+        const next = prev.filter((item) => {
+          const fresh = productMap.get(item.product.id);
+          return Boolean(fresh && fresh.active && fresh.stock >= 1);
+        });
+        if (next.length === 0) {
+          setCheckoutClientRequestId(crypto.randomUUID());
+        }
+        return next;
+      });
+      const messages = Array.from(exhaustedNames).map(
+        (name) => `${name} esgotou e saiu do carrinho`
+      );
+      setOutOfStockNotices((prev) => {
+        const combined = [...prev];
+        for (const msg of messages) {
+          if (!combined.includes(msg)) combined.push(msg);
+        }
+        return combined;
+      });
+    }
+  }, [products, cart]);
+
+  // Visible products in the store (respecting showOutOfStock setting)
+  const storeVisibleProducts = useMemo(() => {
     return products.filter((p) => {
       if (!p.active) return false;
+      if (!showOutOfStock && p.stock < 1) return false;
+      return true;
+    });
+  }, [products, showOutOfStock]);
+
+  // Active promotional products for the "🔥 Promoções" section
+  const promoProducts = useMemo(() => {
+    const activePromos = storeVisibleProducts.filter((p) => isProductPromoActive(p));
+    return sortProductsByPreference(activePromos, settings.featuredProductIds);
+  }, [storeVisibleProducts, settings.featuredProductIds]);
+
+  // Filter products and place preferred products (settings.featuredProductIds) first in any list
+  const filteredProducts = useMemo(() => {
+    const matching = storeVisibleProducts.filter((p) => {
       if (selectedCategory !== 'todas' && p.category !== selectedCategory) return false;
       if (onlyCold && !p.isCold) return false;
       if (searchQuery.trim()) {
@@ -486,7 +550,9 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       }
       return true;
     });
-  }, [products, selectedCategory, onlyCold, searchQuery]);
+
+    return sortProductsByPreference(matching, settings.featuredProductIds);
+  }, [storeVisibleProducts, selectedCategory, onlyCold, searchQuery, settings.featuredProductIds]);
 
   const getSelectedUnit = (product: Product): SaleUnit => {
     if (!hasProductCase(product)) return 'unit';
@@ -835,7 +901,9 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
           for (const item of prevCart) {
             const fp = freshMap.get(item.product.id);
             if (!fp || !fp.active || fp.stock <= 0) {
-              stockWarnings.push(`Só restam 0 unidades de ${fp?.name || item.product.name}`);
+              const exhaustedMsg = `${fp?.name || item.product.name} esgotou e saiu do carrinho`;
+              stockWarnings.push(exhaustedMsg);
+              setOutOfStockNotices((prev) => (prev.includes(exhaustedMsg) ? prev : [...prev, exhaustedMsg]));
               continue;
             }
             const avail = remainingByProd.has(fp.id) ? remainingByProd.get(fp.id)! : fp.stock;
@@ -895,17 +963,33 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       { id: 'petiscos', label: 'Petiscos & Copos', icon: Package },
     ];
     const baseIds = new Set(base.map((b) => b.id));
+    const availableCategories = new Set<string>();
     const extras = new Set<string>();
-    products.forEach((p) => {
-      if (p.active && p.category && !baseIds.has(p.category)) {
-        extras.add(p.category);
+
+    storeVisibleProducts.forEach((p) => {
+      if (p.category) {
+        availableCategories.add(p.category);
+        if (!baseIds.has(p.category)) {
+          extras.add(p.category);
+        }
       }
     });
+
+    const visibleBase = base.filter(
+      (cat) => cat.id === 'todas' || availableCategories.has(cat.id)
+    );
     return [
-      ...base,
+      ...visibleBase,
       ...Array.from(extras).map((c) => ({ id: c, label: c, icon: Package })),
     ];
-  }, [products]);
+  }, [storeVisibleProducts]);
+
+  // If the currently selected category becomes empty, switch back to 'todas'
+  useEffect(() => {
+    if (selectedCategory !== 'todas' && !categories.some((c) => c.id === selectedCategory)) {
+      setSelectedCategory('todas');
+    }
+  }, [categories, selectedCategory]);
 
   const getStatusBadgeInfo = (status: OrderStatus, delivType: 'delivery' | 'retirada' | 'local') => {
     switch (status) {
@@ -1376,6 +1460,32 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
           )}
         </div>
       </div>
+
+      {/* Out-of-Stock Cart Removal Notices */}
+      {outOfStockNotices.length > 0 && (
+        <div className="mb-6 space-y-2">
+          {outOfStockNotices.map((notice) => (
+            <div
+              key={notice}
+              className="p-3.5 bg-amber-50 border border-amber-300 text-amber-900 rounded-2xl shadow-sm flex items-center justify-between gap-3"
+            >
+              <div className="flex items-center gap-2.5 text-xs sm:text-sm font-bold">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>{notice}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  setOutOfStockNotices((prev) => prev.filter((m) => m !== notice))
+                }
+                className="p-1 hover:bg-amber-200/60 rounded-lg text-amber-800 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Featured 🔥 Promoções Horizontal Carousel (right below Hero Banner) */}
       {promoProducts.length > 0 && (
@@ -1908,6 +2018,31 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             </div>
 
             <form onSubmit={handleCheckoutSubmit} className="p-6 space-y-6 flex-1">
+              {outOfStockNotices.length > 0 && (
+                <div className="space-y-2">
+                  {outOfStockNotices.map((notice) => (
+                    <div
+                      key={`cart-${notice}`}
+                      className="p-3 bg-amber-50 border border-amber-300 text-amber-900 rounded-xl flex items-center justify-between gap-2 text-xs font-bold"
+                    >
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>{notice}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setOutOfStockNotices((prev) => prev.filter((m) => m !== notice))
+                        }
+                        className="p-0.5 hover:bg-amber-200/60 rounded text-amber-800 cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {/* Selected items */}
               <div className="space-y-3">
                 <h4 className="text-xs font-bold uppercase tracking-wider text-neutral-400">

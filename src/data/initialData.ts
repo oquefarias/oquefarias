@@ -1,4 +1,4 @@
-import { Product, StoreSettings, Order, DeliveryArea, CustomerProfile } from '../types';
+import { Product, StoreSettings, Order, DeliveryArea, CustomerProfile, DEFAULT_SHORTCUTS } from '../types/index.js';
 
 export const initialSettings: StoreSettings = {
   storeName: 'Depósito & Distribuidora de Bebidas',
@@ -23,6 +23,9 @@ export const initialSettings: StoreSettings = {
   storeLatitude: -23.55052,
   storeLongitude: -46.633308,
   deliveryModel: 'both',
+  showOutOfStock: false,
+  featuredProductIds: [],
+  shortcuts: { ...DEFAULT_SHORTCUTS },
 };
 
 // All simulation data wiped clean for real depot operation

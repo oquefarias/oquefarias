@@ -10,11 +10,15 @@ import {
   CustomerProfile,
   Coupon,
   SaleUnit,
+  ShortcutAction,
+  DEFAULT_SHORTCUTS,
   hasProductCase,
   formatStockWithCases,
   isProductPromoActive,
   getEffectiveProductPrice,
   getPromoDiscountPercent,
+  sortProductsByPreference,
+  formatCategoryLabel,
 } from '../../types';
 import { api } from '../../services/api';
 import { soundService } from '../../utils/sound';
@@ -24,7 +28,12 @@ import { GoogleDeliveryRadiusMap } from './GoogleDeliveryRadiusMap';
 import { CustomerModal } from './CustomerModal';
 import { ImportProductsModal } from './ImportProductsModal';
 import { TablesManager } from './tables/TablesManager';
-import { calculateDistanceKm } from '../../utils/geo';
+import {
+  calculateDistanceKm,
+  buildSingleDeliveryRouteUrl,
+  buildMultiStopDeliveryRoute,
+} from '../../utils/geo';
+import QRCode from 'qrcode';
 import {
   Bell,
   Package,
@@ -59,7 +68,95 @@ import {
   Tag,
   Utensils,
   FileSpreadsheet,
+  ArrowUp,
+  ArrowDown,
+  HelpCircle,
+  Keyboard,
+  Navigation,
 } from 'lucide-react';
+
+const SHORTCUT_ACTION_ITEMS: Array<{
+  action: ShortcutAction;
+  label: string;
+  description: string;
+}> = [
+  {
+    action: 'pdv',
+    label: 'PDV Balcão (e focar na busca)',
+    description: 'Abre a aba PDV Balcão e posiciona o cursor no campo de busca de produtos',
+  },
+  {
+    action: 'mesas',
+    label: 'Mesas & Comandas',
+    description: 'Abre a aba Mesas & Comandas',
+  },
+  {
+    action: 'pedidos',
+    label: 'Pedidos',
+    description: 'Abre a aba de Pedidos',
+  },
+  {
+    action: 'estoque',
+    label: 'Estoque',
+    description: 'Abre a aba de Estoque',
+  },
+  {
+    action: 'finalizar',
+    label: 'Finalizar Venda (PDV) / Receber e Fechar (Mesa)',
+    description: 'Conclui a venda no PDV ou fecha a conta da mesa quando o botão está habilitado',
+  },
+  {
+    action: 'busca',
+    label: 'Focar na busca de produtos',
+    description: 'Posiciona o cursor no campo de busca da tela aberta',
+  },
+  {
+    action: 'fecharModal',
+    label: 'Fechar janela / modal aberto',
+    description: 'Fecha o modal aberto no momento sem limpar o que foi digitado nas outras telas',
+  },
+];
+
+const FORBIDDEN_BROWSER_SHORTCUTS = new Set([
+  'F5',
+  'F7',
+  'F11',
+  'F12',
+  'TAB',
+  'ENTER',
+  'CTRL+W',
+  'CTRL+T',
+  'CTRL+N',
+  'CTRL+R',
+  'CTRL+L',
+  'CTRL+P',
+  'ALT+F4',
+]);
+
+function formatKeyboardEventCombo(e: KeyboardEvent): string | null {
+  if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) {
+    return null;
+  }
+  const parts: string[] = [];
+  if (e.ctrlKey || e.metaKey) parts.push('Ctrl');
+  if (e.altKey) parts.push('Alt');
+  if (e.shiftKey && e.key.length > 1) parts.push('Shift');
+
+  let baseKey = e.key;
+  if (baseKey === ' ') baseKey = 'Space';
+  else if (baseKey === 'Escape') baseKey = 'Escape';
+  else if (/^f\d+$/i.test(baseKey)) baseKey = baseKey.toUpperCase();
+  else if (baseKey.length === 1) baseKey = baseKey === '/' ? '/' : baseKey.toUpperCase();
+
+  parts.push(baseKey);
+  return parts.join('+');
+}
+
+function formatShortcutDisplay(key: string): string {
+  if (!key) return '';
+  if (key.toUpperCase() === 'ESCAPE') return 'Esc';
+  return key;
+}
 
 // Compress image uploaded from computer so it stays lightweight and fast
 function compressImageFile(file: File, maxDim: number = 600, quality: number = 0.88): Promise<string> {
@@ -341,10 +438,35 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     error?: string;
   } | null>(null);
 
-  const [settingsForm, setSettingsForm] = useState<StoreSettings>({ ...settings });
+  const [settingsForm, setSettingsForm] = useState<StoreSettings>(() => ({
+    ...settings,
+    showOutOfStock: Boolean(settings.showOutOfStock),
+    featuredProductIds: Array.isArray(settings.featuredProductIds) ? settings.featuredProductIds : [],
+    shortcuts: { ...DEFAULT_SHORTCUTS, ...(settings.shortcuts || {}) },
+  }));
   const [settingsSavedMessage, setSettingsSavedMessage] = useState<boolean>(false);
   const [isUploadingLogo, setIsUploadingLogo] = useState<boolean>(false);
   const [isUploadingProductPhoto, setIsUploadingProductPhoto] = useState<boolean>(false);
+
+  // Shortcuts UI states
+  const [isShortcutsModalOpen, setIsShortcutsModalOpen] = useState<boolean>(false);
+  const [recordingShortcutAction, setRecordingShortcutAction] = useState<ShortcutAction | null>(null);
+  const [shortcutWarning, setShortcutWarning] = useState<string>('');
+
+  // Multi-order delivery route states
+  const [selectedRouteOrderIds, setSelectedRouteOrderIds] = useState<string[]>([]);
+  const [isMultiRouteModalOpen, setIsMultiRouteModalOpen] = useState<boolean>(false);
+  const [multiRouteQrDataUrl, setMultiRouteQrDataUrl] = useState<string>('');
+
+  useEffect(() => {
+    setSettingsForm((prev) => ({
+      ...prev,
+      ...settings,
+      showOutOfStock: Boolean(settings.showOutOfStock),
+      featuredProductIds: Array.isArray(settings.featuredProductIds) ? settings.featuredProductIds : [],
+      shortcuts: { ...DEFAULT_SHORTCUTS, ...(settings.shortcuts || {}) },
+    }));
+  }, [settings]);
 
   // Local optimistic state for instant order status changes without requiring page reload
   const [localOrders, setLocalOrders] = useState<Order[]>(orders);
@@ -352,6 +474,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   useEffect(() => {
     setLocalOrders(orders);
   }, [orders]);
+
+  // Keep selectedRouteOrderIds clean of orders that are no longer eligible
+  useEffect(() => {
+    setSelectedRouteOrderIds((prev) => {
+      if (prev.length === 0) return prev;
+      const validIds = new Set(
+        localOrders
+          .filter(
+            (o) =>
+              o.deliveryType === 'delivery' &&
+              o.source !== 'balcao' &&
+              o.source !== 'mesa' &&
+              (o.status === 'em_separacao' || o.status === 'em_rota')
+          )
+          .map((o) => o.id)
+      );
+      const next = prev.filter((id) => validIds.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [localOrders]);
 
   // Sub-tab for Delivery Areas (Map vs Neighborhoods)
   const [areaSubTab, setAreaSubTab] = useState<'mapa' | 'bairros'>('mapa');
@@ -432,6 +574,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     stock: number;
     minStock: number;
     isCold: boolean;
+    active: boolean;
     image: string;
     sku: string;
     description: string;
@@ -448,6 +591,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     stock: 0,
     minStock: 12,
     isCold: true,
+    active: true,
     image: '',
     sku: '',
     description: '',
@@ -746,6 +890,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       stock: 24,
       minStock: 12,
       isCold: true,
+      active: true,
       image: 'https://images.unsplash.com/photo-1535958636474-b021ee887b13?w=500&auto=format&fit=crop&q=80',
       sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
       description: '',
@@ -770,6 +915,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       stock: p.stock,
       minStock: p.minStock,
       isCold: p.isCold,
+      active: p.active !== false,
       image: p.image,
       sku: p.sku,
       description: p.description,
@@ -804,7 +950,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       ...restForm,
       caseSize,
       casePrice,
-      active: true,
+      active: productForm.active !== false,
     };
     try {
       await api.saveProduct(productToSave);
@@ -812,6 +958,76 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     } catch (err: any) {
       setProductModalError(err?.message || 'Erro ao salvar produto.');
     }
+  };
+
+  const handleToggleProductActive = async (p: Product) => {
+    try {
+      await api.saveProduct({
+        ...p,
+        active: !p.active,
+      });
+    } catch (err: any) {
+      setPanelError(err?.message || 'Erro ao alterar visibilidade do produto.');
+    }
+  };
+
+  // Preferred products ("Ordem de preferência na loja") helpers
+  const validFeaturedIds = useMemo(() => {
+    const raw = Array.isArray(settings.featuredProductIds) ? settings.featuredProductIds : [];
+    const productMap = new Set(products.map((p) => p.id));
+    const seen = new Set<string>();
+    const list: string[] = [];
+    for (const id of raw) {
+      if (typeof id === 'string' && productMap.has(id) && !seen.has(id)) {
+        seen.add(id);
+        list.push(id);
+        if (list.length >= 50) break;
+      }
+    }
+    return list;
+  }, [settings.featuredProductIds, products]);
+
+  const featuredProductsList = useMemo(() => {
+    const productMap = new Map<string, Product>(products.map((p) => [p.id, p]));
+    return validFeaturedIds
+      .map((id) => productMap.get(id))
+      .filter((p): p is Product => Boolean(p));
+  }, [validFeaturedIds, products]);
+
+  const saveFeaturedProductIds = async (nextIds: string[]) => {
+    const trimmed = nextIds.slice(0, 50);
+    setSettingsForm((prev) => ({ ...prev, featuredProductIds: trimmed }));
+    try {
+      await api.updateSettings({ featuredProductIds: trimmed });
+    } catch (err: any) {
+      setPanelError(err?.message || 'Erro ao atualizar a ordem de preferência na loja.');
+    }
+  };
+
+  const handleToggleFeaturedProduct = async (productId: string) => {
+    const exists = validFeaturedIds.includes(productId);
+    if (exists) {
+      await saveFeaturedProductIds(validFeaturedIds.filter((id) => id !== productId));
+    } else {
+      if (validFeaturedIds.length >= 50) {
+        setPanelError('Você pode adicionar no máximo 50 produtos na ordem de preferência.');
+        return;
+      }
+      await saveFeaturedProductIds([...validFeaturedIds, productId]);
+    }
+  };
+
+  const handleMoveFeaturedProduct = async (index: number, direction: -1 | 1) => {
+    const targetIdx = index + direction;
+    if (targetIdx < 0 || targetIdx >= validFeaturedIds.length) return;
+    const next = [...validFeaturedIds];
+    const [moved] = next.splice(index, 1);
+    next.splice(targetIdx, 0, moved);
+    await saveFeaturedProductIds(next);
+  };
+
+  const handleRemoveFeaturedProduct = async (productId: string) => {
+    await saveFeaturedProductIds(validFeaturedIds.filter((id) => id !== productId));
   };
 
   const handleDeleteProduct = (id: string) => {
@@ -1031,6 +1247,315 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     }
   };
 
+  // Active keyboard shortcuts (merging defaults with saved settings)
+  const activeShortcuts = useMemo<Record<ShortcutAction, string>>(() => {
+    return {
+      ...DEFAULT_SHORTCUTS,
+      ...(settings.shortcuts || {}),
+    };
+  }, [settings.shortcuts]);
+
+  const finishPosSaleRef = React.useRef(handleFinishPosSale);
+  finishPosSaleRef.current = handleFinishPosSale;
+
+  // Capture key when owner clicks "Alterar" in Configurações -> Atalhos do teclado
+  useEffect(() => {
+    if (!recordingShortcutAction) return;
+
+    const handleRecordKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      const combo = formatKeyboardEventCombo(e);
+      if (!combo) return;
+
+      const upperCombo = combo.toUpperCase();
+      if (FORBIDDEN_BROWSER_SHORTCUTS.has(upperCombo)) {
+        setShortcutWarning(
+          `A tecla "${combo}" é reservada pelo navegador e não pode ser usada como atalho.`
+        );
+        setRecordingShortcutAction(null);
+        return;
+      }
+
+      const currentShortcuts: Record<ShortcutAction, string> = {
+        ...DEFAULT_SHORTCUTS,
+        ...(settingsForm.shortcuts || {}),
+      };
+
+      const duplicateEntry = SHORTCUT_ACTION_ITEMS.find(
+        (item) =>
+          item.action !== recordingShortcutAction &&
+          (currentShortcuts[item.action] || '').toUpperCase() === upperCombo
+      );
+
+      if (duplicateEntry) {
+        setShortcutWarning(
+          `⚠ A tecla "${formatShortcutDisplay(combo)}" já está em uso em "${duplicateEntry.label}".`
+        );
+      } else {
+        setShortcutWarning('');
+      }
+
+      const updatedShortcuts = {
+        ...currentShortcuts,
+        [recordingShortcutAction]: combo,
+      };
+      setSettingsForm((prev) => ({
+        ...prev,
+        shortcuts: updatedShortcuts,
+      }));
+      setRecordingShortcutAction(null);
+    };
+
+    window.addEventListener('keydown', handleRecordKey, true);
+    return () => window.removeEventListener('keydown', handleRecordKey, true);
+  }, [recordingShortcutAction, settingsForm.shortcuts]);
+
+  // Desktop Keyboard Shortcuts Listener (/control-panel)
+  useEffect(() => {
+    if (recordingShortcutAction) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Only active on desktop screens
+      if (window.innerWidth < 768) return;
+
+      const combo = formatKeyboardEventCombo(e);
+      if (!combo) return;
+      const upperCombo = combo.toUpperCase();
+
+      const pdvKey = (activeShortcuts.pdv || 'F2').toUpperCase();
+      const mesasKey = (activeShortcuts.mesas || 'F3').toUpperCase();
+      const pedidosKey = (activeShortcuts.pedidos || 'F4').toUpperCase();
+      const estoqueKey = (activeShortcuts.estoque || 'F8').toUpperCase();
+      const finalizarKey = (activeShortcuts.finalizar || 'F9').toUpperCase();
+      const buscaKey = (activeShortcuts.busca || '/').toUpperCase();
+      const fecharKey = (activeShortcuts.fecharModal || 'Escape').toUpperCase();
+
+      const target = e.target as HTMLElement | null;
+      const tagName = target?.tagName?.toUpperCase() || '';
+      const isTextField =
+        tagName === 'INPUT' ||
+        tagName === 'TEXTAREA' ||
+        tagName === 'SELECT' ||
+        Boolean(target?.isContentEditable);
+
+      // Always preventDefault on F2, F3, F4, F8, F9 (and configured action equivalents when triggered)
+      if (['F2', 'F3', 'F4', 'F8', 'F9'].includes(e.key.toUpperCase())) {
+        e.preventDefault();
+      }
+
+      const isPdvShortcut = upperCombo === pdvKey;
+      const isFinalizarShortcut = upperCombo === finalizarKey;
+      const isFecharShortcut =
+        upperCombo === fecharKey || (fecharKey === 'ESC' && e.key === 'Escape');
+
+      // Rule 3b: Do not fire shortcuts when cursor is inside a text field (input, textarea, select), EXCEPT F2 (pdv), F9 (finalizar), and Esc (fecharModal)
+      const allowedInInput =
+        isPdvShortcut ||
+        isFinalizarShortcut ||
+        isFecharShortcut ||
+        e.key.toUpperCase() === 'F2' ||
+        e.key.toUpperCase() === 'F9' ||
+        e.key === 'Escape';
+
+      if (isTextField && !allowedInInput) {
+        return;
+      }
+
+      if (isFecharShortcut) {
+        if (isShortcutsModalOpen) {
+          e.preventDefault();
+          setIsShortcutsModalOpen(false);
+          return;
+        }
+        if (isMultiRouteModalOpen) {
+          e.preventDefault();
+          setIsMultiRouteModalOpen(false);
+          return;
+        }
+        if (confirmModal && !confirmModal.loading) {
+          e.preventDefault();
+          setConfirmModal(null);
+          return;
+        }
+        if (cancelOrderModal && !cancelOrderModal.loading) {
+          e.preventDefault();
+          setCancelOrderModal(null);
+          return;
+        }
+        if (stockAdjustModal && !stockAdjustModal.loading) {
+          e.preventDefault();
+          setStockAdjustModal(null);
+          return;
+        }
+        if (isPromoModalOpen) {
+          e.preventDefault();
+          setIsPromoModalOpen(false);
+          return;
+        }
+        if (isCouponModalOpen) {
+          e.preventDefault();
+          setIsCouponModalOpen(false);
+          return;
+        }
+        if (isCustomerModalOpen) {
+          e.preventDefault();
+          setIsCustomerModalOpen(false);
+          setEditingCustomer(null);
+          return;
+        }
+        if (isQRCodeModalOpen) {
+          e.preventDefault();
+          setIsQRCodeModalOpen(false);
+          return;
+        }
+        if (selectedReceiptOrder) {
+          e.preventDefault();
+          setSelectedReceiptOrder(null);
+          return;
+        }
+        if (isProductModalOpen) {
+          e.preventDefault();
+          setIsProductModalOpen(false);
+          return;
+        }
+        if (isAreaModalOpen) {
+          e.preventDefault();
+          setIsAreaModalOpen(false);
+          return;
+        }
+        if (isImportModalOpen) {
+          e.preventDefault();
+          setIsImportModalOpen(false);
+          return;
+        }
+        return;
+      }
+
+      if (isPdvShortcut) {
+        e.preventDefault();
+        setActiveTab('pdv');
+        window.setTimeout(() => {
+          const input = document.querySelector<HTMLInputElement>('[data-admin-search="pdv"]');
+          if (input) {
+            input.focus();
+            input.select();
+          }
+        }, 40);
+        return;
+      }
+
+      if (upperCombo === mesasKey) {
+        e.preventDefault();
+        setActiveTab('mesas');
+        return;
+      }
+
+      if (upperCombo === pedidosKey) {
+        e.preventDefault();
+        setActiveTab('pedidos');
+        return;
+      }
+
+      if (upperCombo === estoqueKey) {
+        e.preventDefault();
+        setActiveTab('estoque');
+        return;
+      }
+
+      if (isFinalizarShortcut) {
+        e.preventDefault();
+        if (activeTab === 'pdv') {
+          finishPosSaleRef.current();
+        }
+        return;
+      }
+
+      if (upperCombo === buscaKey) {
+        e.preventDefault();
+        // Focus search input of currently open modal or active tab
+        const comandaSearch = document.querySelector<HTMLInputElement>('[data-admin-search="comanda"]');
+        if (comandaSearch) {
+          comandaSearch.focus();
+          return;
+        }
+        const tabSearch = document.querySelector<HTMLInputElement>(`[data-admin-search="${activeTab}"]`);
+        if (tabSearch) {
+          tabSearch.focus();
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    recordingShortcutAction,
+    activeShortcuts,
+    activeTab,
+    isShortcutsModalOpen,
+    isMultiRouteModalOpen,
+    confirmModal,
+    cancelOrderModal,
+    stockAdjustModal,
+    isPromoModalOpen,
+    isCouponModalOpen,
+    isCustomerModalOpen,
+    isQRCodeModalOpen,
+    selectedReceiptOrder,
+    isProductModalOpen,
+    isAreaModalOpen,
+    isImportModalOpen,
+  ]);
+
+  // Multi-order route calculation (nearest-neighbor from store, max 9 stops)
+  const selectedRouteOrders = useMemo(() => {
+    const idSet = new Set(selectedRouteOrderIds);
+    return localOrders.filter((o) => idSet.has(o.id)).slice(0, 9);
+  }, [localOrders, selectedRouteOrderIds]);
+
+  const multiRouteResult = useMemo(() => {
+    if (selectedRouteOrders.length === 0) {
+      return { url: '', orderedStops: [] };
+    }
+    return buildMultiStopDeliveryRoute(selectedRouteOrders, settings);
+  }, [selectedRouteOrders, settings]);
+
+  useEffect(() => {
+    let active = true;
+    if (!isMultiRouteModalOpen || !multiRouteResult.url) {
+      setMultiRouteQrDataUrl('');
+      return;
+    }
+    QRCode.toDataURL(multiRouteResult.url, {
+      width: 320,
+      margin: 1,
+      errorCorrectionLevel: 'M',
+    })
+      .then((url) => {
+        if (active) setMultiRouteQrDataUrl(url);
+      })
+      .catch(() => {
+        if (active) setMultiRouteQrDataUrl('');
+      });
+    return () => {
+      active = false;
+    };
+  }, [isMultiRouteModalOpen, multiRouteResult.url]);
+
+  const toggleSelectOrderForRoute = (orderId: string) => {
+    setSelectedRouteOrderIds((prev) => {
+      if (prev.includes(orderId)) {
+        return prev.filter((id) => id !== orderId);
+      }
+      if (prev.length >= 9) {
+        setPanelError('A rota com vários pedidos permite no máximo 9 paradas por vez.');
+        return prev;
+      }
+      return [...prev, orderId];
+    });
+  };
+
   return (
     <div className="max-w-7xl mx-auto px-3 sm:px-6 py-4 sm:py-6 pb-20 overflow-x-hidden">
       {panelError && (
@@ -1098,6 +1623,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           >
             <Bell className="w-4 h-4" />
             <span>Pedidos</span>
+            <span
+              className={`hidden md:inline-block text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                activeTab === 'pedidos'
+                  ? 'bg-black/20 text-white'
+                  : 'bg-neutral-200/80 text-neutral-600'
+              }`}
+            >
+              {formatShortcutDisplay(activeShortcuts.pedidos)}
+            </span>
             {pendingOrders.length > 0 && (
               <span className="w-5 h-5 rounded-full bg-red-600 text-white text-[10px] font-black flex items-center justify-center">
                 {pendingOrders.length}
@@ -1113,6 +1647,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           >
             <Package className="w-4 h-4" />
             <span>Estoque</span>
+            <span
+              className={`hidden md:inline-block text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                activeTab === 'estoque'
+                  ? 'bg-black/20 text-white'
+                  : 'bg-neutral-200/80 text-neutral-600'
+              }`}
+            >
+              {formatShortcutDisplay(activeShortcuts.estoque)}
+            </span>
             {lowStockProducts.length > 0 && (
               <span className="w-5 h-5 rounded-full bg-amber-200 text-amber-900 text-[10px] font-bold flex items-center justify-center">
                 {lowStockProducts.length}
@@ -1144,6 +1687,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           >
             <Utensils className="w-4 h-4" />
             <span>Mesas & Comandas</span>
+            <span
+              className={`hidden md:inline-block text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                activeTab === 'mesas'
+                  ? 'bg-black/20 text-white'
+                  : 'bg-neutral-200/80 text-neutral-600'
+              }`}
+            >
+              {formatShortcutDisplay(activeShortcuts.mesas)}
+            </span>
           </button>
 
           <button
@@ -1154,6 +1706,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           >
             <ShoppingCart className="w-4 h-4" />
             <span>PDV Balcão</span>
+            <span
+              className={`hidden md:inline-block text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                activeTab === 'pdv'
+                  ? 'bg-black/20 text-white'
+                  : 'bg-neutral-200/80 text-neutral-600'
+              }`}
+            >
+              {formatShortcutDisplay(activeShortcuts.pdv)}
+            </span>
           </button>
 
           {/* Áreas de Entrega Tab */}
@@ -1216,6 +1777,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         {/* Security & Preview controls */}
         <div className="flex flex-wrap items-center gap-2 px-1 sm:px-2 w-full sm:w-auto justify-end pt-2 sm:pt-0 border-t sm:border-t-0 border-neutral-100">
           <button
+            type="button"
+            onClick={() => setIsShortcutsModalOpen(true)}
+            className="hidden md:inline-flex items-center justify-center w-8 h-8 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded-xl text-xs font-black transition-colors cursor-pointer"
+            title="Atalhos do teclado (?)"
+          >
+            ?
+          </button>
+
+          <button
             onClick={() => setIsQRCodeModalOpen(true)}
             className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-bold transition-colors"
           >
@@ -1276,9 +1846,33 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               ))}
             </div>
 
-            <div className="flex items-center gap-2 text-xs text-neutral-500">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
-              <span>Monitoramento em tempo real ativo</span>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={selectedRouteOrderIds.length === 0}
+                onClick={() => setIsMultiRouteModalOpen(true)}
+                className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-black transition-all ${
+                  selectedRouteOrderIds.length > 0
+                    ? 'bg-amber-500 hover:bg-amber-600 text-neutral-950 shadow-sm cursor-pointer'
+                    : 'bg-neutral-100 text-neutral-400 border border-neutral-200 cursor-not-allowed'
+                }`}
+              >
+                <Navigation className="w-3.5 h-3.5" />
+                <span>Montar rota ({selectedRouteOrderIds.length})</span>
+              </button>
+              {selectedRouteOrderIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedRouteOrderIds([])}
+                  className="px-2.5 py-2 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-600 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  Limpar seleção
+                </button>
+              )}
+              <div className="flex items-center gap-2 text-xs text-neutral-500 ml-1">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+                <span className="hidden sm:inline">Monitoramento em tempo real ativo</span>
+              </div>
             </div>
           </div>
 
@@ -1297,19 +1891,44 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 const isCompleted = order.status === 'concluido';
                 const isCanceled = order.status === 'cancelado';
 
+                const isRouteEligible =
+                  order.deliveryType === 'delivery' &&
+                  order.source !== 'balcao' &&
+                  order.source !== 'mesa' &&
+                  (isSeparating || isEnRoute);
+                const isSelectedForRoute = selectedRouteOrderIds.includes(order.id);
+
                 const waPhone = formatWhatsAppPhone(order.customer?.phone);
 
                 return (
                   <div
                     key={order.id}
                     className={`bg-white rounded-3xl border transition-all p-4 sm:p-5 shadow-xs flex flex-col justify-between min-w-0 overflow-hidden ${
-                      isPending ? 'border-amber-400 ring-2 ring-amber-400/30' : 'border-neutral-300'
+                      isSelectedForRoute
+                        ? 'border-amber-500 ring-2 ring-amber-500/30'
+                        : isPending
+                        ? 'border-amber-400 ring-2 ring-amber-400/30'
+                        : 'border-neutral-300'
                     }`}
                   >
                     <div>
                       <div className="flex flex-wrap items-start justify-between gap-2 border-b border-neutral-100 pb-3 mb-3">
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+                            {isRouteEligible && (
+                              <label
+                                className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-950 text-[11px] font-bold cursor-pointer select-none"
+                                title="Selecionar pedido para montar rota do motoboy"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isSelectedForRoute}
+                                  onChange={() => toggleSelectOrderForRoute(order.id)}
+                                  className="w-3.5 h-3.5 rounded text-amber-600 focus:ring-amber-500 cursor-pointer"
+                                />
+                                <span>Rota</span>
+                              </label>
+                            )}
                             <span className="font-black text-base text-neutral-900">#{order.id}</span>
                             <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded-full ${
                               order.source === 'online'
@@ -1343,7 +1962,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         }`}>
                           {isPending && 'Pendente / Novo'}
                           {isSeparating && 'Em Separação'}
-                          {isEnRoute && (order.deliveryType === 'delivery' ? 'Em Rota' : 'Pronto Retirada')}
+                          {isEnRoute && (order.deliveryType === 'delivery' ? 'Pronto / Em Rota' : 'Pronto Retirada')}
                           {isCompleted && 'Concluído'}
                           {isCanceled && 'Cancelado'}
                         </span>
@@ -1363,16 +1982,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                 <span>Entrega</span>
                               </div>
                               <a
-                                href={
-                                  order.customer.latitude !== undefined &&
-                                  order.customer.latitude !== null &&
-                                  order.customer.longitude !== undefined &&
-                                  order.customer.longitude !== null
-                                    ? `https://www.google.com/maps?q=${order.customer.latitude},${order.customer.longitude}`
-                                    : `https://www.google.com/maps?q=${encodeURIComponent(
-                                        `${order.customer.address || ''}, ${order.customer.number || ''}, ${order.customer.neighborhood || ''}`
-                                      )}`
-                                }
+                                href={buildSingleDeliveryRouteUrl(order.customer)}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 font-bold text-[11px] transition-colors shrink-0"
@@ -1743,6 +2353,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-neutral-400" />
               <input
                 type="text"
+                data-admin-search="clientes"
                 placeholder="Buscar cliente por nome, telefone, bairro ou CEP..."
                 value={customerSearch}
                 onChange={(e) => setCustomerSearch(e.target.value)}
@@ -2162,12 +2773,113 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           </div>
 
+          {/* Ordem de preferência na loja block */}
+          <div className="bg-white p-5 rounded-3xl border border-amber-200 shadow-xs space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <ArrowUp className="w-5 h-5 text-amber-600" />
+                <h3 className="font-black text-sm sm:text-base text-neutral-900">
+                  Ordem de preferência na loja ({featuredProductsList.length}/50)
+                </h3>
+              </div>
+              <span className="text-xs text-neutral-500">
+                Esses produtos aparecem antes dos outros na loja, na busca e na categoria deles
+              </span>
+            </div>
+
+            {featuredProductsList.length === 0 ? (
+              <div className="p-4 rounded-2xl bg-amber-50/50 border border-dashed border-amber-200 text-xs text-neutral-500 text-center">
+                Nenhum produto na ordem de preferência. Clique em <strong>"Mostrar primeiro"</strong> em qualquer produto abaixo para que ele apareça antes dos outros.
+              </div>
+            ) : (
+              <div className="divide-y divide-neutral-100 border border-neutral-200 rounded-2xl overflow-hidden">
+                {featuredProductsList.map((fp, idx) => {
+                  const isHiddenByStock = !settings.showOutOfStock && fp.stock < 1;
+                  return (
+                    <div
+                      key={`featured-admin-${fp.id}`}
+                      className="p-3 bg-white hover:bg-neutral-50 flex items-center justify-between gap-3 text-xs"
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <span className="w-6 h-6 rounded-lg bg-amber-500 text-neutral-950 font-black flex items-center justify-center shrink-0">
+                          {idx + 1}º
+                        </span>
+                        {fp.image ? (
+                          <img
+                            src={fp.image}
+                            alt={fp.name}
+                            className="w-9 h-9 rounded-lg object-cover border border-neutral-200 shrink-0"
+                          />
+                        ) : (
+                          <div className="w-9 h-9 rounded-lg bg-neutral-100 flex items-center justify-center text-neutral-400 shrink-0">
+                            <Package className="w-4 h-4" />
+                          </div>
+                        )}
+                        <div className="min-w-0">
+                          <div className="font-bold text-neutral-900 truncate flex items-center gap-1.5 flex-wrap">
+                            <span>{fp.name}</span>
+                            <span className="px-1.5 py-0.5 rounded bg-neutral-100 border border-neutral-200 text-neutral-600 text-[10px] font-bold">
+                              {formatCategoryLabel(fp.category)}
+                            </span>
+                            {!fp.active && (
+                              <span className="px-1.5 py-0.5 rounded bg-neutral-200 text-neutral-700 text-[10px] font-bold">
+                                Oculto da loja
+                              </span>
+                            )}
+                            {fp.active && isHiddenByStock && (
+                              <span className="px-1.5 py-0.5 rounded bg-red-100 text-red-700 text-[10px] font-bold">
+                                Esgotado (oculto na loja)
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-[11px] text-neutral-500">
+                            {fp.volume} • {formatCurrency(getEffectiveProductPrice(fp))} • Estoque: {fp.stock} un
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          disabled={idx === 0}
+                          onClick={() => handleMoveFeaturedProduct(idx, -1)}
+                          className="w-7 h-7 rounded-lg bg-neutral-100 hover:bg-neutral-200 disabled:opacity-40 text-neutral-800 font-black flex items-center justify-center cursor-pointer"
+                          title="Subir posição (↑)"
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          disabled={idx === featuredProductsList.length - 1}
+                          onClick={() => handleMoveFeaturedProduct(idx, 1)}
+                          className="w-7 h-7 rounded-lg bg-neutral-100 hover:bg-neutral-200 disabled:opacity-40 text-neutral-800 font-black flex items-center justify-center cursor-pointer"
+                          title="Descer posição (↓)"
+                        >
+                          ↓
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveFeaturedProduct(fp.id)}
+                          className="w-7 h-7 rounded-lg bg-red-50 hover:bg-red-100 text-red-700 font-black flex items-center justify-center cursor-pointer ml-1"
+                          title="Remover da ordem de preferência (✕)"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
             <div className="flex items-center gap-2 w-full sm:max-w-md">
               <div className="relative flex-1">
                 <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
                 <input
                   type="text"
+                  data-admin-search="estoque"
                   placeholder="Buscar produto ou SKU..."
                   value={stockSearch}
                   onChange={(e) => setStockSearch(e.target.value)}
@@ -2459,16 +3171,64 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           </div>
                         </td>
                         <td className="py-3 px-4 text-right">
-                          <div className="flex items-center justify-end gap-1">
+                          <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                            {(() => {
+                              const isFeatured = validFeaturedIds.includes(p.id);
+                              return (
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleFeaturedProduct(p.id)}
+                                  className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 border transition-colors cursor-pointer ${
+                                    isFeatured
+                                      ? 'bg-amber-100 text-amber-900 border-amber-300 hover:bg-amber-200'
+                                      : 'bg-white text-neutral-600 border-neutral-200 hover:bg-neutral-100'
+                                  }`}
+                                  title="Mostrar primeiro"
+                                >
+                                  <ArrowUp
+                                    className={`w-3.5 h-3.5 ${
+                                      isFeatured ? 'text-amber-600' : 'text-neutral-400'
+                                    }`}
+                                  />
+                                  <span>Mostrar primeiro</span>
+                                </button>
+                              );
+                            })()}
+
+                            <button
+                              type="button"
+                              onClick={() => handleToggleProductActive(p)}
+                              className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 border transition-colors cursor-pointer ${
+                                p.active !== false
+                                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                                  : 'bg-neutral-100 text-neutral-600 border-neutral-300 hover:bg-neutral-200'
+                              }`}
+                              title={p.active !== false ? 'Produto visível na loja (clique para ocultar)' : 'Produto oculto da loja (clique para mostrar)'}
+                            >
+                              {p.active !== false ? (
+                                <>
+                                  <Eye className="w-3.5 h-3.5 text-emerald-600" />
+                                  <span>Mostrar na loja</span>
+                                </>
+                              ) : (
+                                <>
+                                  <EyeOff className="w-3.5 h-3.5 text-neutral-500" />
+                                  <span>Oculto da loja</span>
+                                </>
+                              )}
+                            </button>
+
                             <button
                               onClick={() => handleOpenEditProduct(p)}
                               className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 rounded-lg transition-colors"
+                              title="Editar produto"
                             >
                               <Edit2 className="w-3.5 h-3.5" />
                             </button>
                             <button
                               onClick={() => handleDeleteProduct(p.id)}
                               className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                              title="Excluir produto"
                             >
                               <Trash2 className="w-3.5 h-3.5" />
                             </button>
@@ -2637,6 +3397,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
                 <input
                   type="text"
+                  data-admin-search="pdv"
                   placeholder="Buscar bebida para adicionar no caixa..."
                   value={posSearch}
                   onChange={(e) => setPosSearch(e.target.value)}
@@ -2672,16 +3433,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <p className="text-xs text-neutral-400 mt-1">Cadastre seus produtos na aba "Estoque" para realizar vendas no balcão.</p>
                 </div>
               ) : (
-                products
-                  .filter(p => {
+                sortProductsByPreference(
+                  products.filter(p => {
                     if (posCategory !== 'todas' && p.category !== posCategory) return false;
                     if (posSearch.trim()) {
                       const q = posSearch.toLowerCase();
                       return p.name.toLowerCase().includes(q) || p.volume.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q);
                     }
                     return true;
-                  })
-                  .map(product => {
+                  }),
+                  validFeaturedIds
+                ).map(product => {
                     const sellsCase = hasProductCase(product);
                     const hasCaseStock = sellsCase && product.stock >= (product.caseSize || 2);
                     const selectedUnit: SaleUnit =
@@ -3407,6 +4169,135 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
             </div>
 
+            {/* EXIBIÇÃO DE ESTOQUE NA LOJA */}
+            <div className="pt-4 border-t border-neutral-100">
+              <h4 className="font-black text-sm text-neutral-900 mb-2">Vitrine & Estoque na Loja Online</h4>
+              <label className="flex items-center justify-between gap-4 p-4 rounded-2xl bg-neutral-50 border border-neutral-200 cursor-pointer">
+                <div>
+                  <span className="font-bold text-xs sm:text-sm text-neutral-900 block">
+                    Mostrar produtos esgotados na loja (como 'Esgotado')
+                  </span>
+                  <span className="text-[11px] text-neutral-500 block mt-0.5">
+                    Quando desligado (padrão), produtos com estoque zerado ficam ocultos na loja online e categorias vazias somem do menu.
+                  </span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={Boolean(settingsForm.showOutOfStock)}
+                  onChange={(e) =>
+                    setSettingsForm({
+                      ...settingsForm,
+                      showOutOfStock: e.target.checked,
+                    })
+                  }
+                  className="w-5 h-5 rounded text-amber-500 focus:ring-amber-500 shrink-0 cursor-pointer"
+                />
+              </label>
+            </div>
+
+            {/* ATALHOS DO TECLADO (DESKTOP) */}
+            <div className="pt-4 border-t border-neutral-100 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h4 className="font-black text-sm text-neutral-900 flex items-center gap-2">
+                    <Keyboard className="w-4 h-4 text-amber-500" />
+                    <span>Atalhos do teclado</span>
+                  </h4>
+                  <p className="text-[11px] text-neutral-500 mt-0.5">
+                    Atalhos rápidos para uso no computador. Clique em "Alterar" e pressione a nova tecla desejada.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSettingsForm((prev) => ({
+                      ...prev,
+                      shortcuts: { ...DEFAULT_SHORTCUTS },
+                    }));
+                    setRecordingShortcutAction(null);
+                    setShortcutWarning('');
+                  }}
+                  className="px-3 py-1.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 rounded-xl text-xs font-bold transition-colors cursor-pointer"
+                >
+                  Restaurar padrão
+                </button>
+              </div>
+
+              {shortcutWarning && (
+                <div className="p-3 rounded-xl bg-amber-50 border border-amber-300 text-amber-900 text-xs font-bold flex items-center justify-between gap-2">
+                  <span>{shortcutWarning}</span>
+                  <button
+                    type="button"
+                    onClick={() => setShortcutWarning('')}
+                    className="p-1 hover:bg-amber-200/60 rounded text-amber-800 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
+              <div className="divide-y divide-neutral-100 border border-neutral-200 rounded-2xl overflow-hidden text-xs">
+                {SHORTCUT_ACTION_ITEMS.map((item) => {
+                  const currentKey =
+                    settingsForm.shortcuts?.[item.action] || DEFAULT_SHORTCUTS[item.action];
+                  const isRecording = recordingShortcutAction === item.action;
+                  const duplicateOther = SHORTCUT_ACTION_ITEMS.find(
+                    (other) =>
+                      other.action !== item.action &&
+                      (
+                        settingsForm.shortcuts?.[other.action] ||
+                        DEFAULT_SHORTCUTS[other.action]
+                      ).toUpperCase() === currentKey.toUpperCase()
+                  );
+
+                  return (
+                    <div
+                      key={item.action}
+                      className="p-3 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                    >
+                      <div>
+                        <span className="font-bold text-neutral-900 block">{item.label}</span>
+                        <span className="text-[11px] text-neutral-500 block">{item.description}</span>
+                        {duplicateOther && (
+                          <span className="text-[11px] text-amber-700 font-bold block mt-0.5">
+                            ⚠ Tecla também atribuída a "{duplicateOther.label}"
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span
+                          className={`px-3 py-1.5 rounded-lg font-mono font-black text-xs border ${
+                            isRecording
+                              ? 'bg-amber-100 text-amber-900 border-amber-400 animate-pulse'
+                              : 'bg-neutral-100 text-neutral-900 border-neutral-300'
+                          }`}
+                        >
+                          {isRecording
+                            ? 'Pressione uma tecla...'
+                            : formatShortcutDisplay(currentKey)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShortcutWarning('');
+                            setRecordingShortcutAction(isRecording ? null : item.action);
+                          }}
+                          className={`px-3 py-1.5 rounded-lg font-bold text-xs transition-colors cursor-pointer ${
+                            isRecording
+                              ? 'bg-neutral-900 text-white'
+                              : 'bg-neutral-100 hover:bg-neutral-200 text-neutral-800'
+                          }`}
+                        >
+                          {isRecording ? 'Cancelar' : 'Alterar'}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
             <div className="pt-4 border-t border-neutral-100 flex items-center justify-end">
               <button
                 type="submit"
@@ -3760,7 +4651,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   />
                 </div>
 
-                <div className="flex items-center pt-5">
+                <div className="flex flex-col gap-2 pt-4">
                   <label className="flex items-center gap-2 cursor-pointer font-bold text-neutral-800">
                     <input
                       type="checkbox"
@@ -3769,6 +4660,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       className="w-4 h-4 rounded text-amber-500 focus:ring-amber-500"
                     />
                     <span>❄️ Opção Gelada</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer font-bold text-neutral-800">
+                    <input
+                      type="checkbox"
+                      checked={productForm.active !== false}
+                      onChange={(e) => setProductForm({ ...productForm, active: e.target.checked })}
+                      className="w-4 h-4 rounded text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span>{productForm.active !== false ? '👁️ Mostrar na loja' : '🚫 Oculto da loja'}</span>
                   </label>
                 </div>
               </div>
@@ -4469,6 +5369,208 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         onClose={() => setIsImportModalOpen(false)}
         onImported={() => api.reloadProducts()}
       />
+
+      {/* Modal: Keyboard Shortcuts List ("?") */}
+      {isShortcutsModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+          <div className="bg-white rounded-3xl max-w-lg w-full shadow-2xl border border-neutral-200 overflow-hidden">
+            <div className="p-5 bg-neutral-900 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Keyboard className="w-5 h-5 text-amber-400" />
+                <h3 className="font-black text-base">Atalhos do Teclado</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsShortcutsModalOpen(false)}
+                className="p-1.5 hover:bg-neutral-800 rounded-xl text-neutral-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-3 text-xs">
+              <div className="divide-y divide-neutral-100 border border-neutral-200 rounded-2xl overflow-hidden">
+                {SHORTCUT_ACTION_ITEMS.map((item) => {
+                  const keyLabel = formatShortcutDisplay(
+                    activeShortcuts[item.action] || DEFAULT_SHORTCUTS[item.action]
+                  );
+                  return (
+                    <div
+                      key={`modal-shortcut-${item.action}`}
+                      className="p-3 bg-white flex items-center justify-between gap-3"
+                    >
+                      <div>
+                        <span className="font-bold text-neutral-900 block">{item.label}</span>
+                        <span className="text-[11px] text-neutral-500 block">{item.description}</span>
+                      </div>
+                      <span className="px-3 py-1.5 rounded-lg bg-neutral-100 border border-neutral-300 font-mono font-black text-xs text-neutral-900 shrink-0">
+                        {keyLabel}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="flex items-center justify-between pt-2">
+                <span className="text-[11px] text-neutral-500">
+                  Você pode personalizar as teclas na aba <strong>Configurações</strong>.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsShortcutsModalOpen(false)}
+                  className="px-4 py-2 bg-neutral-900 hover:bg-neutral-800 text-white font-bold rounded-xl cursor-pointer"
+                >
+                  Fechar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Multi-Order Delivery Route ("Montar rota (N)") */}
+      {isMultiRouteModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 overflow-y-auto">
+          <div className="bg-white rounded-3xl max-w-xl w-full shadow-2xl border border-amber-200 overflow-hidden my-6 max-h-[92vh] flex flex-col">
+            <div className="print:hidden p-5 bg-neutral-900 text-white flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2">
+                <Navigation className="w-5 h-5 text-amber-400" />
+                <div>
+                  <h3 className="font-black text-base">
+                    Rota de Entrega ({multiRouteResult.orderedStops.length}{' '}
+                    {multiRouteResult.orderedStops.length === 1 ? 'parada' : 'paradas'})
+                  </h3>
+                  <p className="text-[11px] text-neutral-400">
+                    Ordenada automaticamente pela parada mais próxima a partir do depósito
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsMultiRouteModalOpen(false)}
+                className="p-1.5 hover:bg-neutral-800 rounded-xl text-neutral-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Printable 80mm Route Sheet */}
+            <div
+              id="receipt-to-print"
+              className="p-6 overflow-y-auto flex-1 font-mono text-xs text-neutral-900 bg-white space-y-4"
+            >
+              <div className="text-center border-b-2 border-dashed border-neutral-400 pb-3">
+                <h2 className="text-base font-black uppercase text-neutral-900">
+                  {settings.storeName}
+                </h2>
+                <p className="text-[11px] text-neutral-600">Saída: {settings.address}</p>
+                <p className="text-xs font-black uppercase mt-1">
+                  🛵 ROTEIRO DO MOTOBOY ({multiRouteResult.orderedStops.length}{' '}
+                  {multiRouteResult.orderedStops.length === 1 ? 'PARADA' : 'PARADAS'})
+                </p>
+              </div>
+
+              {multiRouteQrDataUrl && (
+                <div className="flex flex-col items-center text-center py-2 border-b border-dashed border-neutral-300">
+                  <img
+                    src={multiRouteQrDataUrl}
+                    alt="QR Code da Rota Completa"
+                    className="w-52 h-52 print:w-[42mm] print:h-[42mm] object-contain mx-auto block"
+                  />
+                  <p className="text-xs font-bold text-neutral-900 mt-1.5">
+                    Escaneie para abrir a rota no Google Maps
+                  </p>
+                  <a
+                    href={multiRouteResult.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="print:hidden mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 font-sans font-bold text-xs transition-colors"
+                  >
+                    <MapPin className="w-3.5 h-3.5" />
+                    <span>Abrir rota no navegador</span>
+                  </a>
+                </div>
+              )}
+
+              <div className="space-y-3">
+                <div className="font-bold text-xs uppercase text-neutral-600 border-b border-neutral-200 pb-1">
+                  Ordem de Paradas:
+                </div>
+                {multiRouteResult.orderedStops.map((stop) => {
+                  const ord = stop.order;
+                  const payLabel =
+                    ord.paymentMethod === 'pix'
+                      ? 'PIX'
+                      : ord.paymentMethod === 'cartao_credito'
+                      ? 'Cartão de Crédito'
+                      : ord.paymentMethod === 'cartao_debito'
+                      ? 'Cartão de Débito'
+                      : 'Dinheiro';
+
+                  return (
+                    <div
+                      key={`route-stop-${ord.id}`}
+                      className="p-3 rounded-xl bg-neutral-50 border border-neutral-200 space-y-1 text-xs"
+                    >
+                      <div className="flex items-center justify-between font-black text-neutral-900">
+                        <span>
+                          {stop.stopNumber}. {ord.customer.name} (#{ord.id})
+                        </span>
+                        <span>{formatCurrency(ord.total)}</span>
+                      </div>
+                      <p className="text-neutral-800 font-medium">
+                        End.: {stop.writtenAddress}
+                        {ord.customer.complement ? ` (${ord.customer.complement})` : ''}
+                      </p>
+                      {ord.customer.reference && (
+                        <p className="text-neutral-600 italic">Ref: {ord.customer.reference}</p>
+                      )}
+                      {!stop.isVerified && (
+                        <p className="font-bold text-amber-900 bg-amber-100 px-2 py-0.5 rounded inline-block text-[11px]">
+                          ⚠ Confira o endereço escrito
+                        </p>
+                      )}
+                      <div className="pt-1 border-t border-dashed border-neutral-200 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                        <span>
+                          Pagamento: <strong>{payLabel}</strong>
+                        </span>
+                        <span>
+                          Valor a receber: <strong>{formatCurrency(ord.total)}</strong>
+                        </span>
+                      </div>
+                      {ord.paymentMethod === 'dinheiro' &&
+                        ord.cashChangeFor !== undefined &&
+                        ord.cashChangeFor !== null && (
+                          <div className="text-[11px] font-bold text-amber-800">
+                            Troco p/ {formatCurrency(ord.cashChangeFor)} (Levar{' '}
+                            {formatCurrency(Math.max(0, ord.cashChangeFor - ord.total))})
+                          </div>
+                        )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="print:hidden p-4 bg-neutral-100 border-t border-neutral-200 flex items-center justify-between gap-3 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsMultiRouteModalOpen(false)}
+                className="px-4 py-2.5 text-xs font-bold text-neutral-700 hover:bg-neutral-200 rounded-xl transition-colors cursor-pointer"
+              >
+                Fechar
+              </button>
+              <button
+                type="button"
+                onClick={() => window.print()}
+                className="flex-1 flex items-center justify-center gap-2 px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-xl shadow-sm transition-colors text-xs cursor-pointer"
+              >
+                <Printer className="w-4 h-4" />
+                <span>Imprimir rota</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* End Modals */}
     </div>

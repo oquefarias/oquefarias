@@ -1,6 +1,8 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Order, StoreSettings } from '../types';
 import { Printer, X } from 'lucide-react';
+import QRCode from 'qrcode';
+import { buildSingleDeliveryRouteUrl, isCustomerLocationVerified } from '../utils/geo';
 
 interface PrintReceiptModalProps {
   order: Order | null;
@@ -9,6 +11,55 @@ interface PrintReceiptModalProps {
 }
 
 export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, settings, onClose }) => {
+  const [qrDataUrl, setQrDataUrl] = useState<string>('');
+
+  const isDeliveryRouteOrder = Boolean(
+    order &&
+    order.deliveryType === 'delivery' &&
+    order.source !== 'balcao' &&
+    order.source !== 'mesa'
+  );
+
+  const locationVerified = order ? isCustomerLocationVerified(order.customer) : false;
+  const routeUrl = order && isDeliveryRouteOrder ? buildSingleDeliveryRouteUrl(order.customer) : '';
+
+  useEffect(() => {
+    let active = true;
+    if (!isDeliveryRouteOrder || !routeUrl) {
+      setQrDataUrl('');
+      return;
+    }
+    QRCode.toDataURL(routeUrl, {
+      width: 240,
+      margin: 1,
+      errorCorrectionLevel: 'M',
+    })
+      .then((url) => {
+        if (active) setQrDataUrl(url);
+      })
+      .catch(() => {
+        if (active) setQrDataUrl('');
+      });
+    return () => {
+      active = false;
+    };
+  }, [isDeliveryRouteOrder, routeUrl]);
+
+  useEffect(() => {
+    if (!order) return;
+    const closeKey = (settings.shortcuts?.fecharModal || 'Escape').toUpperCase();
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (window.innerWidth < 768) return;
+      if (e.key.toUpperCase() === closeKey || (closeKey === 'ESC' && e.key === 'Escape')) {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [order, onClose, settings.shortcuts]);
+
   if (!order) return null;
 
   const handlePrint = () => {
@@ -80,11 +131,34 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
                   Endereço: {order.customer.address}, Nº {order.customer.number}
                 </p>
                 <p className="text-neutral-700">Bairro: {order.customer.neighborhood}</p>
+                {(order.customer.city || order.customer.state) && (
+                  <p className="text-neutral-700">
+                    Cidade: {[order.customer.city, order.customer.state].filter(Boolean).join(' - ')}
+                    {order.customer.cep ? ` • CEP: ${order.customer.cep}` : ''}
+                  </p>
+                )}
                 {order.customer.complement && <p className="text-neutral-600">Compl: {order.customer.complement}</p>}
                 {order.customer.reference && (
                   <p className="text-neutral-900 font-semibold bg-amber-100 px-1.5 py-0.5 rounded mt-1">
                     Ref: {order.customer.reference}
                   </p>
+                )}
+                {isDeliveryRouteOrder && qrDataUrl && (
+                  <div className="mt-3 pt-2.5 border-t border-dashed border-neutral-300 flex flex-col items-center text-center">
+                    <img
+                      src={qrDataUrl}
+                      alt="QR Code Rota de Entrega"
+                      className="w-[30mm] h-[30mm] object-contain mx-auto block"
+                    />
+                    <p className="text-[11px] font-bold text-neutral-900 mt-1">
+                      Escaneie para abrir a rota
+                    </p>
+                    {!locationVerified && (
+                      <p className="text-[11px] font-bold text-amber-900 bg-amber-100 px-2 py-0.5 rounded mt-1">
+                        ⚠ Confira o endereço escrito
+                      </p>
+                    )}
+                  </div>
                 )}
               </>
             ) : (

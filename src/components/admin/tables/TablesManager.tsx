@@ -150,6 +150,29 @@ export const TablesManager: React.FC<TablesManagerProps> = ({ products, settings
     return `Há ${hours}h ${remMin}m`;
   };
 
+  useEffect(() => {
+    if (!closedOrderReceipt && !isManageModalOpen && !isOpenTabModalOpen) return;
+    const closeKey = (settings.shortcuts?.fecharModal || 'Escape').toUpperCase();
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (window.innerWidth < 768) return;
+      const pressed = e.key.toUpperCase();
+      if (pressed === closeKey || (closeKey === 'ESC' && e.key === 'Escape')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (closedOrderReceipt) {
+          setClosedOrderReceipt(null);
+        } else if (isManageModalOpen) {
+          setIsManageModalOpen(false);
+        } else if (isOpenTabModalOpen) {
+          setIsOpenTabModalOpen(false);
+          setTableToOpen(null);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [closedOrderReceipt, isManageModalOpen, isOpenTabModalOpen, settings.shortcuts]);
+
   return (
     <div className="space-y-6 min-w-0">
       {/* 1. Summary Cards */}
@@ -223,6 +246,7 @@ export const TablesManager: React.FC<TablesManagerProps> = ({ products, settings
             <Search className="w-4 h-4 text-neutral-400 absolute left-3 top-3 pointer-events-none" />
             <input
               type="text"
+              data-admin-search="mesas"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Buscar mesa ou cliente..."
@@ -551,6 +575,7 @@ export const TablesManager: React.FC<TablesManagerProps> = ({ products, settings
       <CloseTabModal
         tab={tabToClose}
         isOpen={Boolean(tabToClose)}
+        settings={settings}
         onClose={() => setTabToClose(null)}
         onSuccess={(createdOrder) => {
           setTabToClose(null);

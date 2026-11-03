@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { TabDetail, PaymentMethod, Order } from '../../../types';
+import { TabDetail, PaymentMethod, Order, StoreSettings, DEFAULT_SHORTCUTS } from '../../../types';
 import { api } from '../../../services/api';
 import {
   X,
@@ -17,6 +17,7 @@ import {
 interface CloseTabModalProps {
   tab: TabDetail | null;
   isOpen: boolean;
+  settings?: StoreSettings;
   onClose: () => void;
   onSuccess: (order: Order) => void;
 }
@@ -24,6 +25,7 @@ interface CloseTabModalProps {
 export const CloseTabModal: React.FC<CloseTabModalProps> = ({
   tab,
   isOpen,
+  settings,
   onClose,
   onSuccess,
 }) => {
@@ -171,9 +173,8 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
       ? `R$ ${(baseCents / 100).toFixed(2).replace('.', ',')} por pessoa`
       : `${normalPeople} × R$ ${(baseCents / 100).toFixed(2).replace('.', ',')} + ${extraPeople} × R$ ${((baseCents + 1) / 100).toFixed(2).replace('.', ',')}`;
 
-  const handleConfirmClose = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (isDiscountInvalid || isCashShort) return;
+  const submitCloseTab = async () => {
+    if (isSubmitting || isDiscountInvalid || isCashShort) return;
     setIsSubmitting(true);
     setError('');
 
@@ -212,6 +213,38 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
       setIsSubmitting(false);
     }
   };
+
+  const handleConfirmClose = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await submitCloseTab();
+  };
+
+  const submitRef = React.useRef(submitCloseTab);
+  submitRef.current = submitCloseTab;
+
+  React.useEffect(() => {
+    if (!isOpen || !currentTab) return;
+    const shortcuts = { ...DEFAULT_SHORTCUTS, ...(settings?.shortcuts || {}) };
+    const finishKey = (shortcuts.finalizar || 'F9').toUpperCase();
+    const closeKey = (shortcuts.fecharModal || 'Escape').toUpperCase();
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (window.innerWidth < 768) return;
+      const pressed = e.key.toUpperCase();
+      if (pressed === finishKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        submitRef.current();
+      } else if (pressed === closeKey || (closeKey === 'ESC' && e.key === 'Escape')) {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [isOpen, currentTab, onClose, settings?.shortcuts]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-4 bg-black/60 backdrop-blur-xs animate-in fade-in duration-200">

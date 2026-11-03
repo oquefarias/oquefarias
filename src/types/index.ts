@@ -243,6 +243,25 @@ export interface TabDetail extends TableTab {
   linkedTables?: LinkedTable[];
 }
 
+export type ShortcutAction =
+  | 'pdv'
+  | 'mesas'
+  | 'pedidos'
+  | 'estoque'
+  | 'finalizar'
+  | 'busca'
+  | 'fecharModal';
+
+export const DEFAULT_SHORTCUTS: Record<ShortcutAction, string> = {
+  pdv: 'F2',
+  mesas: 'F3',
+  pedidos: 'F4',
+  estoque: 'F8',
+  finalizar: 'F9',
+  busca: '/',
+  fecharModal: 'Escape',
+};
+
 export interface StoreSettings {
   storeName: string;
   logoUrl?: string; // Foto de perfil / Logotipo da loja
@@ -267,6 +286,59 @@ export interface StoreSettings {
   storeLongitude?: number; // Coordenada Longitude da loja
   deliveryModel?: 'radius' | 'neighborhoods' | 'both'; // Modo de validação de entrega
   pricePerKm?: number; // Taxa adicional por km (opcional)
+  showOutOfStock?: boolean; // Mostrar produtos esgotados na loja (padrão false)
+  featuredProductIds?: string[]; // Lista ordenada de IDs de produtos de preferência (máx 50)
+  shortcuts?: Record<string, string>; // Atalhos do teclado customizados no painel
+}
+
+export function sortProductsByPreference(
+  list: Product[],
+  featuredProductIds?: string[]
+): Product[] {
+  if (!Array.isArray(featuredProductIds) || featuredProductIds.length === 0 || list.length <= 1) {
+    return list;
+  }
+  const rankMap = new Map<string, number>();
+  for (const id of featuredProductIds) {
+    if (typeof id === 'string' && !rankMap.has(id)) {
+      rankMap.set(id, rankMap.size);
+      if (rankMap.size >= 50) break;
+    }
+  }
+  if (rankMap.size === 0) return list;
+
+  const preferred: Product[] = [];
+  const rest: Product[] = [];
+  for (const p of list) {
+    if (rankMap.has(p.id)) {
+      preferred.push(p);
+    } else {
+      rest.push(p);
+    }
+  }
+  if (preferred.length === 0) return list;
+
+  preferred.sort((a, b) => (rankMap.get(a.id) ?? 0) - (rankMap.get(b.id) ?? 0));
+  return [...preferred, ...rest];
+}
+
+export function formatCategoryLabel(category: string): string {
+  switch (category) {
+    case 'cervejas':
+      return 'Cervejas';
+    case 'destilados':
+      return 'Destilados';
+    case 'nao_alcoolicos':
+      return 'Não Alcoólicos';
+    case 'vinhos':
+      return 'Vinhos';
+    case 'gelo_carvao':
+      return 'Gelo & Carvão';
+    case 'petiscos':
+      return 'Petiscos';
+    default:
+      return category;
+  }
 }
 
 export interface AppState {
@@ -303,4 +375,5 @@ export interface ProductImportResult {
   skipped: number;
   errors: ProductImportErrorItem[];
 }
+
 

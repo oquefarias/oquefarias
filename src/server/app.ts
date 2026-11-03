@@ -1044,12 +1044,86 @@ function sanitizeCustomerOrder(o: Order): Order {
   };
 }
 
+const DEFAULT_SERVER_SHORTCUTS: Record<string, string> = {
+  pdv: 'F2',
+  mesas: 'F3',
+  pedidos: 'F4',
+  estoque: 'F8',
+  finalizar: 'F9',
+  busca: '/',
+  fecharModal: 'Escape',
+};
+
+const FORBIDDEN_SHORTCUT_KEYS = new Set([
+  'F5',
+  'F7',
+  'F11',
+  'F12',
+  'TAB',
+  'ENTER',
+  'CTRL+W',
+  'CTRL+T',
+  'CTRL+N',
+  'CTRL+R',
+  'CTRL+L',
+  'CTRL+P',
+  'ALT+F4',
+]);
+
+function isForbiddenShortcutKey(key: string): boolean {
+  const upper = key.trim().toUpperCase();
+  if (!upper || upper.length > 32) return true;
+  if (FORBIDDEN_SHORTCUT_KEYS.has(upper)) return true;
+  return false;
+}
+
 function sanitizePublicSettings(settings: StoreSettings): StoreSettings {
-  const clean = { ...settings };
+  const clean: StoreSettings = { ...initialSettings, ...(settings || {}) };
   delete (clean as any).adminPin;
   delete (clean as any).supabaseUrl;
   delete (clean as any).supabaseAnonKey;
   delete (clean as any).supabaseSecretKey;
+
+  // Validate showOutOfStock (boolean, default false)
+  clean.showOutOfStock = typeof (settings as any)?.showOutOfStock === 'boolean'
+    ? (settings as any).showOutOfStock
+    : false;
+
+  // Validate featuredProductIds (ordered string array, max 50, max 100 chars per ID, deduplicated)
+  if (Array.isArray((settings as any)?.featuredProductIds)) {
+    const seen = new Set<string>();
+    const validIds: string[] = [];
+    for (const item of (settings as any).featuredProductIds) {
+      if (typeof item === 'string') {
+        const trimmed = item.trim();
+        if (trimmed.length > 0 && trimmed.length <= 100 && !seen.has(trimmed)) {
+          seen.add(trimmed);
+          validIds.push(trimmed);
+          if (validIds.length >= 50) break;
+        }
+      }
+    }
+    clean.featuredProductIds = validIds;
+  } else {
+    clean.featuredProductIds = [];
+  }
+
+  // Validate shortcuts (object mapping valid actions to valid non-reserved keys)
+  const rawShortcuts = (settings as any)?.shortcuts;
+  const sanitizedShortcuts: Record<string, string> = { ...DEFAULT_SERVER_SHORTCUTS };
+  if (rawShortcuts && typeof rawShortcuts === 'object' && !Array.isArray(rawShortcuts)) {
+    for (const action of Object.keys(DEFAULT_SERVER_SHORTCUTS)) {
+      const val = rawShortcuts[action];
+      if (typeof val === 'string') {
+        const trimmed = val.trim();
+        if (trimmed.length > 0 && trimmed.length <= 32 && !isForbiddenShortcutKey(trimmed)) {
+          sanitizedShortcuts[action] = trimmed;
+        }
+      }
+    }
+  }
+  clean.shortcuts = sanitizedShortcuts;
+
   return clean;
 }
 
@@ -3647,7 +3721,11 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado.' });
 
-    const { data } = await supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle();
+    const { data, error } = await supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle();
+    if (error) {
+      console.error('[Supabase Error] store_settings get:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
     const settings = data?.data ? sanitizePublicSettings(data.data) : sanitizePublicSettings(initialSettings);
     res.json(settings);
   });
@@ -3656,9 +3734,26 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
-    const { data: existingData } = await supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle();
+    const { data: existingData, error: fetchError } = await supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle();
+    if (fetchError) {
+      console.error('[Supabase Error] store_settings fetch before update:', fetchError.message);
+      return res.status(500).json({ error: fetchError.message });
+    }
     const current = existingData?.data || initialSettings;
     const cleanSettings = sanitizePublicSettings({ ...current, ...req.body });
+
+    if (cleanSettings.featuredProductIds && cleanSettings.featuredProductIds.length > 0) {
+      const { data: prodRows, error: prodError } = await supabase
+        .from('products')
+        .select('id')
+        .in('id', cleanSettings.featuredProductIds);
+      if (prodError) {
+        console.error('[Supabase Error] products check in settings update:', prodError.message);
+        return res.status(500).json({ error: prodError.message });
+      }
+      const existingIds = new Set((prodRows || []).map((r: any) => String(r.id)));
+      cleanSettings.featuredProductIds = cleanSettings.featuredProductIds.filter(id => existingIds.has(id));
+    }
 
     const { error } = await supabase.from('store_settings').upsert({
       id: 'default',
