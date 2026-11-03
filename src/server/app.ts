@@ -1011,13 +1011,62 @@ function orderToDB(o: Order) {
   };
 }
 
-function orderFromDB(row: any): Order {
+function orderFromDB(row: any, customerById?: Map<string, CustomerProfile>): Order {
+  const rawCust = row.customer && typeof row.customer === 'object' ? { ...row.customer } : {};
+  const customerId = row.customer_id ? String(row.customer_id) : undefined;
+  const linkedCust = customerId && customerById ? customerById.get(customerId) : undefined;
+
+  const rawGeoLat =
+    rawCust.geoLatitude !== undefined && rawCust.geoLatitude !== null
+      ? rawCust.geoLatitude
+      : rawCust.geo_latitude !== undefined && rawCust.geo_latitude !== null
+      ? rawCust.geo_latitude
+      : linkedCust?.geoLatitude;
+
+  const rawGeoLng =
+    rawCust.geoLongitude !== undefined && rawCust.geoLongitude !== null
+      ? rawCust.geoLongitude
+      : rawCust.geo_longitude !== undefined && rawCust.geo_longitude !== null
+      ? rawCust.geo_longitude
+      : linkedCust?.geoLongitude;
+
+  const rawPinOffset =
+    rawCust.pinOffsetM !== undefined && rawCust.pinOffsetM !== null
+      ? rawCust.pinOffsetM
+      : rawCust.pin_offset_m !== undefined && rawCust.pin_offset_m !== null
+      ? rawCust.pin_offset_m
+      : linkedCust?.pinOffsetM;
+
+  const rawVerified =
+    rawCust.locationVerified !== undefined && rawCust.locationVerified !== null
+      ? rawCust.locationVerified
+      : rawCust.location_verified !== undefined && rawCust.location_verified !== null
+      ? rawCust.location_verified
+      : linkedCust?.locationVerified;
+
+  if (rawGeoLat !== undefined && rawGeoLat !== null && !Number.isNaN(Number(rawGeoLat))) {
+    rawCust.geoLatitude = Number(rawGeoLat);
+    rawCust.geo_latitude = Number(rawGeoLat);
+  }
+  if (rawGeoLng !== undefined && rawGeoLng !== null && !Number.isNaN(Number(rawGeoLng))) {
+    rawCust.geoLongitude = Number(rawGeoLng);
+    rawCust.geo_longitude = Number(rawGeoLng);
+  }
+  if (rawPinOffset !== undefined && rawPinOffset !== null && !Number.isNaN(Number(rawPinOffset))) {
+    rawCust.pinOffsetM = Math.round(Number(rawPinOffset));
+    rawCust.pin_offset_m = Math.round(Number(rawPinOffset));
+  }
+  if (rawVerified !== undefined && rawVerified !== null) {
+    rawCust.locationVerified = Boolean(rawVerified);
+    rawCust.location_verified = Boolean(rawVerified);
+  }
+
   return {
     id: String(row.id),
     source: row.source || 'online',
     status: (row.status as OrderStatus) || 'pendente',
-    customer: row.customer || {},
-    customerId: row.customer_id || undefined,
+    customer: rawCust,
+    customerId,
     couponCode: row.coupon_code || undefined,
     discount: Number(row.discount || 0),
     deliveryType: row.delivery_type || 'delivery',
@@ -1037,9 +1086,20 @@ function orderFromDB(row: any): Order {
   };
 }
 
+function sanitizePublicCustomer<T extends Record<string, any>>(c: T): T {
+  if (!c || typeof c !== 'object') return c;
+  const {
+    pinOffsetM: _pinOffsetM,
+    pin_offset_m: _pin_offset_m,
+    ...rest
+  } = c;
+  return rest as T;
+}
+
 function sanitizeCustomerOrder(o: Order): Order {
   return {
     ...o,
+    customer: o.customer ? sanitizePublicCustomer(o.customer) : o.customer,
     items: (o.items || []).map(({ costPrice: _costPrice, ...itemRest }) => itemRest),
   };
 }
@@ -1698,7 +1758,7 @@ export function createApp(): express.Express {
         success: true,
         token,
         expiresAt,
-        customer: insertedRow ? customerFromDB(insertedRow) : newCustProfile,
+        customer: sanitizePublicCustomer(insertedRow ? customerFromDB(insertedRow) : newCustProfile),
       });
     } catch (err: any) {
       console.error('[Auth Error] customer registration error:', err);
@@ -1776,7 +1836,7 @@ export function createApp(): express.Express {
       success: true,
       token,
       expiresAt,
-      customer,
+      customer: sanitizePublicCustomer(customer),
     });
   });
 
@@ -1796,7 +1856,7 @@ export function createApp(): express.Express {
     }
 
     const { customer } = await ensureLegacyCustomerGeocoded(supabase, data);
-    res.json(customer);
+    res.json(sanitizePublicCustomer(customer));
   });
 
   router.put('/customer/me', requireCustomer, async (req, res) => {
@@ -1908,7 +1968,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: saveErr.message });
     }
 
-    return res.json(customerFromDB(savedRow));
+    return res.json(sanitizePublicCustomer(customerFromDB(savedRow)));
   });
 
   // ---------------------------------------------------------------------------
@@ -2034,7 +2094,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
-    return res.json((data || []).map(orderFromDB).map(sanitizeCustomerOrder));
+    return res.json((data || []).map((r: any) => orderFromDB(r)).map(sanitizeCustomerOrder));
   });
 
   router.get('/customer/orders/:id', requireCustomer, async (req, res) => {
@@ -2304,11 +2364,14 @@ export function createApp(): express.Express {
         settings = sanitizePublicSettings(settingsRes.data.data);
       }
 
+      const customers = (custRes.data || []).map(customerFromDB);
+      const customerById = new Map<string, CustomerProfile>(customers.map((c) => [c.id, c]));
+
       return res.json({
         products: (prodRes.data || []).map(productFromDB),
-        orders: (orderRes.data || []).map(orderFromDB),
+        orders: (orderRes.data || []).map((r: any) => orderFromDB(r, customerById)),
         deliveryAreas: (areasRes.data || []).map(deliveryAreaFromDB),
-        customers: (custRes.data || []).map(customerFromDB),
+        customers,
         coupons: (couponsRes.data || []).map(couponFromDB),
         settings,
       });
@@ -2328,17 +2391,23 @@ export function createApp(): express.Express {
     }
 
     try {
-      const { data, error } = await supabase
-        .from('orders')
-        .select('*')
-        .order('created_at', { ascending: false });
+      const [orderRes, custRes] = await Promise.all([
+        supabase.from('orders').select('*').order('created_at', { ascending: false }),
+        supabase.from('customers').select('*'),
+      ]);
 
-      if (error) {
-        console.error('[Supabase Error] admin orders query:', error.message);
-        return res.status(500).json({ error: error.message });
+      if (orderRes.error) {
+        console.error('[Supabase Error] admin orders query:', orderRes.error.message);
+        return res.status(500).json({ error: orderRes.error.message });
+      }
+      if (custRes.error) {
+        console.error('[Supabase Error] admin customers for orders query:', custRes.error.message);
+        return res.status(500).json({ error: custRes.error.message });
       }
 
-      const orders = (data || []).map(orderFromDB);
+      const customers = (custRes.data || []).map(customerFromDB);
+      const customerById = new Map<string, CustomerProfile>(customers.map((c) => [c.id, c]));
+      const orders = (orderRes.data || []).map((r: any) => orderFromDB(r, customerById));
       return res.json(orders);
     } catch (err: any) {
       return res.status(500).json({ error: err.message });

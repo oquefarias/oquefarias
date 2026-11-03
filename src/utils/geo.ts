@@ -325,6 +325,12 @@ export interface RouteCustomerLike {
   cep?: string;
   latitude?: number | null;
   longitude?: number | null;
+  geoLatitude?: number | null;
+  geoLongitude?: number | null;
+  geo_latitude?: number | null;
+  geo_longitude?: number | null;
+  pinOffsetM?: number | null;
+  pin_offset_m?: number | null;
   locationVerified?: boolean | null;
   location_verified?: boolean | null;
 }
@@ -364,52 +370,118 @@ export function formatCustomerWrittenAddress(customer?: RouteCustomerLike | null
 }
 
 /**
- * Checks whether the customer's location is verified (`location_verified !== false`)
- * AND has valid numeric coordinates.
- * Note: Requirement 4c specifies:
- * "Se a localização do cliente não estiver conferida (location_verified = false),
- * imprima abaixo do QR '⚠ Confira o endereço escrito' e use o endereço escrito no QR em vez do alfinete."
+ * Checks whether the customer's location is verified (`location_verified === true`).
+ * When false, the receipt prints "⚠ Confira o endereço escrito".
  */
 export function isCustomerLocationVerified(customer?: RouteCustomerLike | null): boolean {
   if (!customer) return false;
-  const rawVerified = customer.location_verified !== undefined && customer.location_verified !== null
-    ? customer.location_verified
-    : customer.locationVerified;
-  if (rawVerified !== true) return false;
-
-  const lat = Number(customer.latitude);
-  const lng = Number(customer.longitude);
-  return Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0);
+  const rawVerified =
+    customer.location_verified !== undefined && customer.location_verified !== null
+      ? customer.location_verified
+      : customer.locationVerified;
+  return rawVerified === true;
 }
 
 /**
- * Returns the Google Maps destination token (either "LAT,LNG" or URL-encoded written address)
- * for a delivery customer.
+ * Determines whether the route QR / link should use (LAT,LNG) coordinates.
+ * Coordinates are used ONLY when:
+ * 1. location_verified is true, AND
+ * 2. The customer positioned the pin (pin_offset_m / pinOffsetM >= 15m, meaning
+ *    final coordinates differ from geocoded address coordinates geo_latitude/geo_longitude).
+ * If pinOffsetM is missing or < 15m, or location_verified is false, returns false (uses written address).
+ */
+export function shouldUseCustomerCoordinatesForRoute(customer?: RouteCustomerLike | null): boolean {
+  if (!customer) return false;
+  if (!isCustomerLocationVerified(customer)) return false;
+
+  const lat = Number(customer.latitude);
+  const lng = Number(customer.longitude);
+  if (
+    customer.latitude === undefined ||
+    customer.latitude === null ||
+    customer.longitude === undefined ||
+    customer.longitude === null ||
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    (lat === 0 && lng === 0)
+  ) {
+    return false;
+  }
+
+  const rawPinOffset =
+    customer.pinOffsetM !== undefined && customer.pinOffsetM !== null
+      ? customer.pinOffsetM
+      : customer.pin_offset_m;
+
+  if (
+    rawPinOffset === undefined ||
+    rawPinOffset === null ||
+    typeof rawPinOffset === 'boolean' ||
+    String(rawPinOffset).trim() === ''
+  ) {
+    return false;
+  }
+
+  const pinOffsetM = Number(rawPinOffset);
+  if (!Number.isFinite(pinOffsetM) || pinOffsetM < 15) {
+    return false;
+  }
+
+  const rawGeoLat =
+    customer.geoLatitude !== undefined && customer.geoLatitude !== null
+      ? customer.geoLatitude
+      : customer.geo_latitude;
+  const rawGeoLng =
+    customer.geoLongitude !== undefined && customer.geoLongitude !== null
+      ? customer.geoLongitude
+      : customer.geo_longitude;
+
+  if (
+    rawGeoLat !== undefined &&
+    rawGeoLat !== null &&
+    rawGeoLng !== undefined &&
+    rawGeoLng !== null &&
+    Number.isFinite(Number(rawGeoLat)) &&
+    Number.isFinite(Number(rawGeoLng))
+  ) {
+    const actualDiffM = calculateDistanceMeters(Number(rawGeoLat), Number(rawGeoLng), lat, lng);
+    if (actualDiffM < 15) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Returns the Google Maps destination parameter for a delivery customer:
+ * - DEFAULT: full written address (street, number, neighborhood, city, UF, CEP) encoded with encodeURIComponent.
+ * - Coordinates (LAT,LNG) ONLY when location_verified is true AND pinOffsetM >= 15m.
  */
 export function getDeliveryDestinationParam(customer?: RouteCustomerLike | null): string {
   if (!customer) return '';
-  if (isCustomerLocationVerified(customer)) {
+
+  if (shouldUseCustomerCoordinatesForRoute(customer)) {
     const lat = Number(customer.latitude);
     const lng = Number(customer.longitude);
     return `${lat},${lng}`;
   }
+
   const written = formatCustomerWrittenAddress(customer);
   if (written) {
     return encodeURIComponent(written);
   }
-  // Fallback if written address is somehow empty but coordinates exist
-  const lat = Number(customer.latitude);
-  const lng = Number(customer.longitude);
-  if (Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0)) {
-    return `${lat},${lng}`;
+
+  if (customer.address?.trim()) {
+    return encodeURIComponent(customer.address.trim());
   }
+
   return '';
 }
 
 /**
  * Builds the public Google Maps route URL for a single delivery order:
- * https://www.google.com/maps/dir/?api=1&destination=LAT,LNG&travelmode=driving
- * Or with encoded full written address if location_verified is false or coordinates are missing.
+ * https://www.google.com/maps/dir/?api=1&destination=...&travelmode=driving
  */
 export function buildSingleDeliveryRouteUrl(customer?: RouteCustomerLike | null): string {
   const dest = getDeliveryDestinationParam(customer);
@@ -428,7 +500,8 @@ export interface MultiRouteOrderStop<T = any> {
 
 /**
  * Sorts up to 9 delivery orders by nearest-neighbor starting from the store coordinates
- * (using calculateDistanceKm) and builds a single multi-stop Google Maps directions URL.
+ * (using calculateDistanceKm with whatever coordinates exist) and builds a single
+ * multi-stop Google Maps directions URL where each stop link follows getDeliveryDestinationParam.
  */
 export function buildMultiStopDeliveryRoute<T extends { id: string; customer: RouteCustomerLike }>(
   orders: T[],
@@ -451,6 +524,26 @@ export function buildMultiStopDeliveryRoute<T extends { id: string; customer: Ro
   let currentLat = hasStoreCoords ? Number(storeSettings.storeLatitude) : null;
   let currentLng = hasStoreCoords ? Number(storeSettings.storeLongitude) : null;
 
+  const getStopSortingCoords = (c?: RouteCustomerLike | null): { lat: number; lng: number } | null => {
+    if (!c) return null;
+    const rawLat = c.latitude ?? c.geoLatitude ?? c.geo_latitude;
+    const rawLng = c.longitude ?? c.geoLongitude ?? c.geo_longitude;
+    const lat = Number(rawLat);
+    const lng = Number(rawLng);
+    if (
+      rawLat !== undefined &&
+      rawLat !== null &&
+      rawLng !== undefined &&
+      rawLng !== null &&
+      Number.isFinite(lat) &&
+      Number.isFinite(lng) &&
+      (lat !== 0 || lng !== 0)
+    ) {
+      return { lat, lng };
+    }
+    return null;
+  };
+
   const remaining = [...limited];
   const orderedStops: MultiRouteOrderStop<T>[] = [];
 
@@ -460,12 +553,9 @@ export function buildMultiStopDeliveryRoute<T extends { id: string; customer: Ro
 
     if (currentLat !== null && currentLng !== null) {
       for (let i = 0; i < remaining.length; i++) {
-        const c = remaining[i].customer;
-        const lat = Number(c?.latitude);
-        const lng = Number(c?.longitude);
-        const hasValidCoords = Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0);
-        if (hasValidCoords) {
-          const d = calculateDistanceKm(currentLat, currentLng, lat, lng);
+        const coords = getStopSortingCoords(remaining[i].customer);
+        if (coords) {
+          const d = calculateDistanceKm(currentLat, currentLng, coords.lat, coords.lng);
           if (bestDist === null || d < bestDist) {
             bestDist = d;
             bestIdx = i;
@@ -476,13 +566,11 @@ export function buildMultiStopDeliveryRoute<T extends { id: string; customer: Ro
 
     const [chosen] = remaining.splice(bestIdx, 1);
     const c = chosen.customer;
-    const lat = Number(c?.latitude);
-    const lng = Number(c?.longitude);
-    const hasValidCoords = Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0);
+    const chosenCoords = getStopSortingCoords(c);
 
-    if (hasValidCoords) {
-      currentLat = lat;
-      currentLng = lng;
+    if (chosenCoords) {
+      currentLat = chosenCoords.lat;
+      currentLng = chosenCoords.lng;
     }
 
     orderedStops.push({
@@ -526,5 +614,6 @@ export function buildMultiStopDeliveryRoute<T extends { id: string; customer: Ro
     orderedStops,
   };
 }
+
 
 
