@@ -1,5 +1,13 @@
 import React, { useEffect, useState } from 'react';
-import { Order, StoreSettings } from '../types';
+import {
+  Order,
+  OrderItemAddon,
+  OrderItemComboComponent,
+  StoreSettings,
+  buildOrderItemAddonsSignature,
+  formatOrderItemAddonLine,
+  formatOrderItemComboLine,
+} from '../types';
 import { Printer, X } from 'lucide-react';
 import QRCode from 'qrcode';
 import { buildSingleDeliveryRouteUrl, isCustomerLocationVerified } from '../utils/geo';
@@ -185,12 +193,18 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
                     isCold?: boolean;
                     saleUnit?: 'unit' | 'case';
                     unitsPerSale?: number;
+                    addons?: OrderItemAddon[];
+                    comboItems?: OrderItemComboComponent[];
                   }
                 >();
                 for (const item of order.items) {
                   const saleUnit = item.saleUnit === 'case' ? 'case' : 'unit';
                   const unitsPerSale = item.unitsPerSale && item.unitsPerSale > 1 ? item.unitsPerSale : 1;
-                  const key = `${item.productId || item.name}::${saleUnit}::${Number(item.price).toFixed(2)}`;
+                  const addonsSig = buildOrderItemAddonsSignature(item.addons);
+                  const comboSig = Array.isArray(item.comboItems)
+                    ? item.comboItems.map((ci) => `${ci.productId}:${ci.quantity}`).join('|')
+                    : '';
+                  const key = `${item.productId || item.name}::${saleUnit}::${Number(item.price).toFixed(2)}::${addonsSig}::${comboSig}`;
                   const existing = map.get(key);
                   if (existing) {
                     existing.quantity += item.quantity;
@@ -204,6 +218,8 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
                       isCold: item.isCold,
                       saleUnit,
                       unitsPerSale,
+                      addons: item.addons,
+                      comboItems: item.comboItems,
                     });
                   }
                 }
@@ -222,6 +238,24 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
                         <span className="block text-[11px] text-neutral-500">
                           {item.volume} {item.isCold ? '• Gelada ❄️' : ''} ({formatCurrency(item.price)} {isCase ? 'cx' : 'un'})
                         </span>
+                        {item.comboItems && item.comboItems.length > 0 && (
+                          <div className="mt-0.5 space-y-0.5 pl-2">
+                            {item.comboItems.map((ci, cIdx) => (
+                              <span key={cIdx} className="block text-[11px] font-semibold text-neutral-800">
+                                {formatOrderItemComboLine(ci)}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {item.addons && item.addons.length > 0 && (
+                          <div className="mt-0.5 space-y-0.5 pl-2">
+                            {item.addons.map((addon, aIdx) => (
+                              <span key={aIdx} className="block text-[11px] font-semibold text-neutral-800">
+                                {formatOrderItemAddonLine(addon)}
+                              </span>
+                            ))}
+                          </div>
+                        )}
                       </div>
                       <span className="font-bold text-neutral-900 whitespace-nowrap">
                         {formatCurrency(item.price * item.quantity)}

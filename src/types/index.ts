@@ -86,6 +86,44 @@ export type PaymentMethod =
   | 'cartao_debito' 
   | 'dinheiro';
 
+export interface AddonOption {
+  id: string;
+  name: string;
+  price: number;
+  active: boolean;
+}
+
+export interface AddonGroup {
+  id: string;
+  name: string;
+  active?: boolean;
+  min: number;
+  max: number;
+  options: AddonOption[];
+  categoryIds: string[];
+  productIds: string[];
+}
+
+export interface OrderItemAddon {
+  groupId?: string;
+  optionId?: string;
+  groupName: string;
+  optionName: string;
+  price: number;
+  quantity: number;
+}
+
+export interface ComboComponentItem {
+  productId: string;
+  quantity: number;
+}
+
+export interface OrderItemComboComponent {
+  productId: string;
+  name: string;
+  quantity: number;
+}
+
 export interface OrderItem {
   productId: string;
   name: string;
@@ -97,6 +135,9 @@ export interface OrderItem {
   saleUnit?: SaleUnit;
   unitsPerSale?: number;
   isCold?: boolean;
+  addons?: OrderItemAddon[];
+  addonsTotal?: number;
+  comboItems?: OrderItemComboComponent[];
 }
 
 export type GeoPrecision = 'exata' | 'rua' | 'aproximada';
@@ -250,7 +291,10 @@ export type ShortcutAction =
   | 'estoque'
   | 'finalizar'
   | 'busca'
-  | 'fecharModal';
+  | 'fecharModal'
+  | 'newProduct'
+  | 'saveProduct'
+  | 'saveAndNewProduct';
 
 export const DEFAULT_SHORTCUTS: Record<ShortcutAction, string> = {
   pdv: 'F2',
@@ -260,7 +304,17 @@ export const DEFAULT_SHORTCUTS: Record<ShortcutAction, string> = {
   finalizar: 'F9',
   busca: '/',
   fecharModal: 'Escape',
+  newProduct: 'F6',
+  saveProduct: 'Ctrl+S',
+  saveAndNewProduct: 'Ctrl+Enter',
 };
+
+export interface StoreCategoryItem {
+  id: string;
+  name: string;
+}
+
+export type ProductSortMode = 'manual' | 'az' | 'price_asc' | 'price_desc';
 
 export interface StoreSettings {
   storeName: string;
@@ -288,7 +342,391 @@ export interface StoreSettings {
   pricePerKm?: number; // Taxa adicional por km (opcional)
   showOutOfStock?: boolean; // Mostrar produtos esgotados na loja (padrão false)
   featuredProductIds?: string[]; // Lista ordenada de IDs de produtos de preferência (máx 50)
+  categories?: StoreCategoryItem[]; // Lista ordenada de categorias { id, name } (máx 50)
+  productSortMode?: ProductSortMode; // 'manual' | 'az' | 'price_asc' | 'price_desc'
+  productOrder?: Record<string, string[]>; // Ordem manual dos produtos por categoria
   shortcuts?: Record<string, string>; // Atalhos do teclado customizados no painel
+  addonGroups?: AddonGroup[]; // Grupos de adicionais na escolha do produto (máx 30)
+  combos?: Record<string, ComboComponentItem[]>; // Composição dos combos: { idDoProdutoCombo: [{ productId, quantity }] } (máx 100)
+}
+
+export function isComboProduct(
+  productOrId?: Pick<Product, 'id'> | string | null,
+  settings?: StoreSettings | null
+): boolean {
+  if (!productOrId || !settings?.combos) return false;
+  const id = typeof productOrId === 'string' ? productOrId.trim() : String(productOrId.id || '').trim();
+  if (!id) return false;
+  const items = settings.combos[id];
+  return Array.isArray(items) && items.length > 0;
+}
+
+export function getComboComponentItems(
+  productOrId?: Pick<Product, 'id'> | string | null,
+  settings?: StoreSettings | null
+): ComboComponentItem[] {
+  if (!productOrId || !settings?.combos) return [];
+  const id = typeof productOrId === 'string' ? productOrId.trim() : String(productOrId.id || '').trim();
+  if (!id) return [];
+  const items = settings.combos[id];
+  return Array.isArray(items) ? items : [];
+}
+
+export function formatComboComponentProductName(product: Pick<Product, 'name' | 'volume'>): string {
+  const name = String(product.name || '').trim();
+  const vol = String(product.volume || '').trim();
+  if (!vol || name.toLowerCase().includes(vol.toLowerCase())) {
+    return name;
+  }
+  return `${name} ${vol}`.trim();
+}
+
+export function formatComboComponentLabel(product: Pick<Product, 'name' | 'volume'>, quantity: number): string {
+  const qty = Math.max(1, Math.floor(Number(quantity) || 1));
+  return `${qty} ${formatComboComponentProductName(product)}`;
+}
+
+export function formatOrderItemComboLine(ci: OrderItemComboComponent): string {
+  const qty = Math.max(1, Math.floor(Number(ci.quantity) || 1));
+  return `↳ ${qty}× ${String(ci.name || '').trim()}`;
+}
+
+export interface ComboCalculatedMetrics {
+  isCombo: boolean;
+  availableStock: number;
+  separatePrice: number;
+  discount: number;
+  costPrice: number;
+  marginPercent: number;
+  itemsSummaryText: string;
+  orderComboItems: OrderItemComboComponent[];
+  resolvedItems: Array<{
+    productId: string;
+    quantity: number;
+    product?: Product;
+    displayName: string;
+  }>;
+}
+
+export function calculateComboMetrics(
+  comboProduct: Pick<Product, 'id' | 'price' | 'promoPrice' | 'promoEndsAt'>,
+  settings?: StoreSettings | null,
+  allProducts?: Product[]
+): ComboCalculatedMetrics {
+  const comboId = String(comboProduct?.id || '').trim();
+  const rawItems = getComboComponentItems(comboId, settings);
+  if (rawItems.length === 0) {
+    return {
+      isCombo: false,
+      availableStock: 0,
+      separatePrice: 0,
+      discount: 0,
+      costPrice: 0,
+      marginPercent: 0,
+      itemsSummaryText: '',
+      orderComboItems: [],
+      resolvedItems: [],
+    };
+  }
+
+  const productMap = new Map<string, Product>();
+  if (Array.isArray(allProducts)) {
+    for (const p of allProducts) {
+      if (p && p.id) productMap.set(String(p.id), p);
+    }
+  }
+
+  let minStock = Infinity;
+  let separatePrice = 0;
+  let costPrice = 0;
+  const resolvedItems: ComboCalculatedMetrics['resolvedItems'] = [];
+
+  for (const item of rawItems) {
+    const pid = String(item?.productId || '').trim();
+    const qty = Math.floor(Number(item?.quantity) || 0);
+    if (!pid || qty < 1 || pid === comboId || isComboProduct(pid, settings)) {
+      minStock = 0;
+      continue;
+    }
+    const comp = productMap.get(pid);
+    if (!comp || comp.active === false) {
+      minStock = 0;
+      resolvedItems.push({
+        productId: pid,
+        quantity: qty,
+        product: comp,
+        displayName: comp ? formatComboComponentProductName(comp) : 'Produto indisponível',
+      });
+      continue;
+    }
+
+    const compStock = Math.max(0, Math.floor(Number(comp.stock) || 0));
+    const availForComp = Math.floor(compStock / qty);
+    if (availForComp < minStock) {
+      minStock = availForComp;
+    }
+
+    const compEffectivePrice = getEffectiveProductPrice(comp);
+    separatePrice += compEffectivePrice * qty;
+    costPrice += (Number(comp.costPrice) || 0) * qty;
+
+    resolvedItems.push({
+      productId: pid,
+      quantity: qty,
+      product: comp,
+      displayName: formatComboComponentProductName(comp),
+    });
+  }
+
+  if (!Number.isFinite(minStock) || minStock < 0) {
+    minStock = 0;
+  }
+
+  separatePrice = Math.round(separatePrice * 100) / 100;
+  costPrice = Math.round(costPrice * 100) / 100;
+  const comboEffectivePrice = getEffectiveProductPrice(comboProduct);
+  const discount = Math.max(0, Math.round((separatePrice - comboEffectivePrice) * 100) / 100);
+  const marginPercent =
+    comboEffectivePrice > 0
+      ? Math.round(((comboEffectivePrice - costPrice) / comboEffectivePrice) * 1000) / 10
+      : 0;
+
+  const itemsSummaryText = resolvedItems
+    .map((ri) => `${ri.quantity} ${ri.displayName}`)
+    .join(' • ');
+
+  const orderComboItems: OrderItemComboComponent[] = resolvedItems.map((ri) => ({
+    productId: ri.productId,
+    name: ri.displayName,
+    quantity: ri.quantity,
+  }));
+
+  return {
+    isCombo: true,
+    availableStock: minStock,
+    separatePrice,
+    discount,
+    costPrice,
+    marginPercent,
+    itemsSummaryText,
+    orderComboItems,
+    resolvedItems,
+  };
+}
+
+export function getProductAddonGroups(
+  product?: Pick<Product, 'id' | 'category'> | null,
+  settings?: StoreSettings | null
+): AddonGroup[] {
+  if (!product || !Array.isArray(settings?.addonGroups) || settings!.addonGroups.length === 0) {
+    return [];
+  }
+  const prodId = String(product.id || '').trim();
+  const prodCat = String(product.category || '').trim();
+
+  return settings!.addonGroups.filter((group) => {
+    if (!group || group.active === false) return false;
+    const activeOptions = Array.isArray(group.options)
+      ? group.options.filter((opt) => opt && opt.active !== false && String(opt.name || '').trim().length > 0)
+      : [];
+    if (activeOptions.length === 0) return false;
+
+    const matchesCategory =
+      Boolean(prodCat) &&
+      Array.isArray(group.categoryIds) &&
+      group.categoryIds.some((cid) => String(cid || '').trim() === prodCat);
+    const matchesProduct =
+      Boolean(prodId) &&
+      Array.isArray(group.productIds) &&
+      group.productIds.some((pid) => String(pid || '').trim() === prodId);
+
+    return matchesCategory || matchesProduct;
+  });
+}
+
+export function buildOrderItemAddonsSignature(addons?: OrderItemAddon[] | null): string {
+  if (!Array.isArray(addons) || addons.length === 0) return '';
+  return addons
+    .filter((a) => a && Number(a.quantity) > 0)
+    .map((a) => {
+      const gKey = String(a.groupId || a.groupName || '').trim();
+      const oKey = String(a.optionId || a.optionName || '').trim();
+      const qty = Math.max(1, Math.floor(Number(a.quantity) || 1));
+      const price = Math.round((Number(a.price) || 0) * 100);
+      return `${gKey}:${oKey}:${qty}:${price}`;
+    })
+    .sort()
+    .join('|');
+}
+
+export function formatOrderItemAddonLine(addon: OrderItemAddon): string {
+  const qty = Math.max(1, Math.floor(Number(addon.quantity) || 1));
+  const unitPrice = Number(addon.price) || 0;
+  const lineTotal = Math.round(unitPrice * qty * 100) / 100;
+  const prefix = qty > 1 ? `+ ${qty}x ${addon.optionName}` : `+ ${addon.optionName}`;
+  if (lineTotal > 0) {
+    return `${prefix} R$ ${lineTotal.toFixed(2).replace('.', ',')}`;
+  }
+  return `${prefix} (grátis)`;
+}
+
+export const PRIORITY_CATEGORY_IDS = [
+  'cervejas',
+  'destilados',
+  'vinhos',
+  'nao_alcoolicos',
+  'gelo_carvao',
+  'petiscos',
+] as const;
+
+export function slugifyCategoryId(raw: string): string {
+  return String(raw || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40);
+}
+
+export function formatCategoryLabel(category: string): string {
+  switch (category) {
+    case 'combos':
+      return 'Combos';
+    case 'cervejas':
+      return 'Cervejas';
+    case 'destilados':
+      return 'Destilados';
+    case 'nao_alcoolicos':
+      return 'Não Alcoólicos';
+    case 'vinhos':
+      return 'Vinhos';
+    case 'gelo_carvao':
+      return 'Gelo & Carvão';
+    case 'petiscos':
+      return 'Petiscos';
+    case 'outros':
+      return 'Outros';
+    default:
+      return category;
+  }
+}
+
+export function buildInitialCategoriesFromProducts(
+  products?: Array<Pick<Product, 'category'>>
+): StoreCategoryItem[] {
+  const existingIds = new Set<string>();
+  if (Array.isArray(products)) {
+    for (const p of products) {
+      const cat = typeof p?.category === 'string' ? p.category.trim() : '';
+      if (cat) existingIds.add(cat);
+    }
+  }
+
+  // Fallback to default priority categories if no products exist yet
+  if (existingIds.size === 0) {
+    return PRIORITY_CATEGORY_IDS.map((id) => ({
+      id,
+      name: formatCategoryLabel(id),
+    }));
+  }
+
+  const orderedIds: string[] = [];
+  const prioritySet = new Set<string>(PRIORITY_CATEGORY_IDS);
+
+  for (const pid of PRIORITY_CATEGORY_IDS) {
+    if (existingIds.has(pid)) {
+      orderedIds.push(pid);
+    }
+  }
+
+  const others = Array.from(existingIds)
+    .filter((id) => !prioritySet.has(id))
+    .sort((a, b) => formatCategoryLabel(a).localeCompare(formatCategoryLabel(b), 'pt-BR', { sensitivity: 'base' }));
+
+  orderedIds.push(...others);
+
+  return orderedIds.slice(0, 50).map((id) => ({
+    id,
+    name: formatCategoryLabel(id).slice(0, 40),
+  }));
+}
+
+export function reconcileStoreCategoriesWithProducts(
+  categories: StoreCategoryItem[],
+  products?: Array<Pick<Product, 'category'>>
+): StoreCategoryItem[] {
+  if (!Array.isArray(categories) || categories.length === 0) {
+    return buildInitialCategoriesFromProducts(products);
+  }
+  if (!Array.isArray(products) || products.length === 0) {
+    return categories;
+  }
+
+  const productCategories = new Set<string>();
+  for (const p of products) {
+    const cat = typeof p?.category === 'string' ? p.category.trim() : '';
+    if (cat) productCategories.add(cat);
+  }
+
+  if (productCategories.size === 0) return categories;
+
+  const explicitIds = new Set(categories.map((c) => String(c.id || '').trim()));
+  const result: StoreCategoryItem[] = [];
+  const seenResultIds = new Set<string>();
+
+  for (const c of categories) {
+    let exactId = String(c.id || '').trim();
+    if (!exactId) continue;
+
+    // If c.id was previously slugified (e.g. "cigarro") while products have "Cigarro", restore exact ID
+    if (!productCategories.has(exactId)) {
+      const cSlug = slugifyCategoryId(exactId);
+      for (const prodCat of productCategories) {
+        if (
+          !explicitIds.has(prodCat) &&
+          !seenResultIds.has(prodCat) &&
+          (prodCat.toLowerCase() === exactId.toLowerCase() || slugifyCategoryId(prodCat) === cSlug)
+        ) {
+          exactId = prodCat;
+          break;
+        }
+      }
+    }
+
+    if (!seenResultIds.has(exactId)) {
+      seenResultIds.add(exactId);
+      result.push({
+        id: exactId,
+        name: String(c.name || formatCategoryLabel(exactId)).trim().slice(0, 40),
+      });
+    }
+  }
+
+  return result;
+}
+
+export function resolveStoreCategories(
+  settings?: StoreSettings | null,
+  products?: Array<Pick<Product, 'category'>>
+): StoreCategoryItem[] {
+  if (Array.isArray(settings?.categories) && settings!.categories.length > 0) {
+    return reconcileStoreCategoriesWithProducts(settings!.categories, products);
+  }
+  return buildInitialCategoriesFromProducts(products);
+}
+
+export function getCategoryDisplayName(
+  categoryId: string,
+  settings?: StoreSettings | null,
+  products?: Array<Pick<Product, 'category'>>
+): string {
+  const trimmed = String(categoryId || '').trim();
+  if (!trimmed || trimmed === 'outros') return 'Outros';
+  const cats = resolveStoreCategories(settings, products);
+  const found = cats.find((c) => c.id === trimmed);
+  if (found && found.name) return found.name;
+  return formatCategoryLabel(trimmed);
 }
 
 export function sortProductsByPreference(
@@ -322,23 +760,106 @@ export function sortProductsByPreference(
   return [...preferred, ...rest];
 }
 
-export function formatCategoryLabel(category: string): string {
-  switch (category) {
-    case 'cervejas':
-      return 'Cervejas';
-    case 'destilados':
-      return 'Destilados';
-    case 'nao_alcoolicos':
-      return 'Não Alcoólicos';
-    case 'vinhos':
-      return 'Vinhos';
-    case 'gelo_carvao':
-      return 'Gelo & Carvão';
-    case 'petiscos':
-      return 'Petiscos';
-    default:
-      return category;
+export function sortProductsByModeOnly(
+  list: Product[],
+  settings?: StoreSettings | null,
+  allProductsForCategories?: Array<Pick<Product, 'category'>>
+): Product[] {
+  if (list.length <= 1) return [...list];
+  const mode: ProductSortMode = settings?.productSortMode || 'manual';
+  const copy = [...list];
+
+  if (mode === 'az') {
+    return copy.sort((a, b) =>
+      a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' })
+    );
   }
+
+  if (mode === 'price_asc') {
+    return copy.sort((a, b) => {
+      const diff = getEffectiveProductPrice(a) - getEffectiveProductPrice(b);
+      if (Math.abs(diff) > 0.0001) return diff;
+      return a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' });
+    });
+  }
+
+  if (mode === 'price_desc') {
+    return copy.sort((a, b) => {
+      const diff = getEffectiveProductPrice(b) - getEffectiveProductPrice(a);
+      if (Math.abs(diff) > 0.0001) return diff;
+      return a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' });
+    });
+  }
+
+  // mode === 'manual'
+  const cats = resolveStoreCategories(settings, allProductsForCategories || list);
+  const catRank = new Map<string, number>();
+  cats.forEach((c, idx) => catRank.set(c.id, idx));
+
+  const productOrderMap = settings?.productOrder || {};
+  const rankByCatAndProd = new Map<string, Map<string, number>>();
+  for (const [catId, prodIds] of Object.entries(productOrderMap)) {
+    if (Array.isArray(prodIds)) {
+      const m = new Map<string, number>();
+      prodIds.forEach((pid, idx) => {
+        if (typeof pid === 'string' && !m.has(pid)) {
+          m.set(pid, idx);
+        }
+      });
+      rankByCatAndProd.set(catId, m);
+    }
+  }
+
+  const originalIndex = new Map<string, number>();
+  list.forEach((p, idx) => originalIndex.set(p.id, idx));
+
+  return copy.sort((a, b) => {
+    if (a.category !== b.category) {
+      const ca = catRank.has(a.category) ? catRank.get(a.category)! : 999999;
+      const cb = catRank.has(b.category) ? catRank.get(b.category)! : 999999;
+      if (ca !== cb) return ca - cb;
+    }
+    const catMap = rankByCatAndProd.get(a.category);
+    if (catMap) {
+      const ra = catMap.has(a.id) ? catMap.get(a.id)! : 999999;
+      const rb = catMap.has(b.id) ? catMap.get(b.id)! : 999999;
+      if (ra !== rb) return ra - rb;
+    }
+    return (originalIndex.get(a.id) ?? 0) - (originalIndex.get(b.id) ?? 0);
+  });
+}
+
+export function sortProductsForStore(
+  list: Product[],
+  settings?: StoreSettings | null,
+  allProductsForCategories?: Array<Pick<Product, 'category'>>
+): Product[] {
+  if (list.length <= 1) return [...list];
+
+  const featuredIds = settings?.featuredProductIds;
+  const rankMap = new Map<string, number>();
+  if (Array.isArray(featuredIds)) {
+    for (const id of featuredIds) {
+      if (typeof id === 'string' && !rankMap.has(id)) {
+        rankMap.set(id, rankMap.size);
+        if (rankMap.size >= 50) break;
+      }
+    }
+  }
+
+  const preferred: Product[] = [];
+  const rest: Product[] = [];
+  for (const p of list) {
+    if (rankMap.has(p.id)) {
+      preferred.push(p);
+    } else {
+      rest.push(p);
+    }
+  }
+
+  preferred.sort((a, b) => (rankMap.get(a.id) ?? 0) - (rankMap.get(b.id) ?? 0));
+  const sortedRest = sortProductsByModeOnly(rest, settings, allProductsForCategories);
+  return [...preferred, ...sortedRest];
 }
 
 export interface AppState {

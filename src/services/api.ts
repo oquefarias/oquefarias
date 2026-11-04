@@ -823,7 +823,7 @@ class ApiService {
     return updated;
   }
 
-  public async saveProduct(product: Product): Promise<void> {
+  public async saveProduct(product: Product): Promise<Product> {
     const isEdit = this.state.products.some((p) => p.id === product.id);
     const url = isEdit ? `/api/products/${product.id}` : '/api/products';
     const method = isEdit ? 'PUT' : 'POST';
@@ -849,7 +849,9 @@ class ApiService {
       throw new Error(message);
     }
 
+    const saved: Product = await res.json();
     await this.reloadProducts();
+    return saved;
   }
 
   public async adjustStock(productId: string, delta: number, unit: 'unit' | 'case' = 'unit'): Promise<void> {
@@ -898,7 +900,13 @@ class ApiService {
       throw new Error(message);
     }
 
+    if (this.state.settings.combos && productId in this.state.settings.combos) {
+      const nextCombos = { ...this.state.settings.combos };
+      delete nextCombos[productId];
+      this.state.settings = { ...this.state.settings, combos: nextCombos };
+    }
     this.state.products = this.state.products.filter((p) => p.id !== productId);
+    await this.reloadProducts();
     this.notifyListeners();
   }
 
@@ -1167,7 +1175,12 @@ class ApiService {
   public async validateCoupon(
     code: string,
     subtotal: number,
-    items?: Array<{ productId: string; quantity: number; saleUnit?: 'unit' | 'case' }>
+    items?: Array<{
+      productId: string;
+      quantity: number;
+      saleUnit?: 'unit' | 'case';
+      addons?: Array<{ groupId?: string; optionId?: string; quantity: number }>;
+    }>
   ): Promise<CouponValidationResult> {
     const res = await fetch('/api/coupons/validate', {
       method: 'POST',
@@ -1303,7 +1316,7 @@ class ApiService {
     return this.state.settings;
   }
 
-  public async updateSettings(settings: Partial<StoreSettings>): Promise<void> {
+  public async updateSettings(settings: Partial<StoreSettings>): Promise<StoreSettings> {
     const res = await fetch('/api/settings', {
       method: 'PUT',
       headers: this.getAdminHeaders(),
@@ -1328,7 +1341,45 @@ class ApiService {
     const updated: StoreSettings = await res.json();
     this.state.settings = updated;
     soundService.setSoundEnabled(updated.soundEnabled);
+    if ('combos' in settings) {
+      await this.reloadProducts();
+    }
     this.notifyListeners();
+    return updated;
+  }
+
+  public async removeAdminCategory(
+    id: string,
+    moveTo?: string
+  ): Promise<{ settings: StoreSettings; movedCount: number }> {
+    const res = await fetch('/api/admin/categories/remove', {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ id, moveTo }),
+    });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
+    if (!res.ok) {
+      let message = 'Não foi possível remover a categoria.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      this.notifyError(message);
+      throw new Error(message);
+    }
+
+    const data: { settings: StoreSettings; movedCount: number } = await res.json();
+    if (data?.settings) {
+      this.state.settings = data.settings;
+    }
+    await this.reloadProducts();
+    this.notifyListeners();
+    return data;
   }
 
   // ================= MESAS E COMANDAS =================

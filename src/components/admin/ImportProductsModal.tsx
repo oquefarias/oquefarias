@@ -9,12 +9,13 @@ import {
   Loader2,
   RefreshCw,
 } from 'lucide-react';
-import { Product, ProductImportItem, ProductImportResult } from '../../types';
+import { Product, ProductImportItem, ProductImportResult, StoreSettings, isComboProduct } from '../../types';
 import { api } from '../../services/api';
 
 interface ImportProductsModalProps {
   isOpen: boolean;
   existingProducts: Product[];
+  settings?: StoreSettings;
   onClose: () => void;
   onImported: () => void;
 }
@@ -292,6 +293,7 @@ interface PreviewRow {
 export const ImportProductsModal: React.FC<ImportProductsModalProps> = ({
   isOpen,
   existingProducts,
+  settings,
   onClose,
   onImported,
 }) => {
@@ -424,11 +426,20 @@ export const ImportProductsModal: React.FC<ImportProductsModalProps> = ({
 
     const existingNames = new Set<string>();
     const existingSkus = new Set<string>();
+    const comboNames = new Set<string>();
+    const comboSkus = new Set<string>();
     for (const p of existingProducts) {
       const n = normalizeLookupKey(p.name);
-      if (n) existingNames.add(n);
       const s = normalizeLookupKey(p.sku);
-      if (s) existingSkus.add(s);
+      const isCombo = isComboProduct(p.id, settings);
+      if (n) {
+        existingNames.add(n);
+        if (isCombo) comboNames.add(n);
+      }
+      if (s) {
+        existingSkus.add(s);
+        if (isCombo) comboSkus.add(s);
+      }
     }
 
     const seenNamesInSheet = new Set<string>();
@@ -495,7 +506,11 @@ export const ImportProductsModal: React.FC<ImportProductsModalProps> = ({
       const nameKey = normalizeLookupKey(name);
       const skuKey = sku ? normalizeLookupKey(sku) : '';
 
+      const matchesCombo =
+        comboNames.has(nameKey) || (skuKey !== '' && comboSkus.has(skuKey));
+
       const alreadyExists =
+        matchesCombo ||
         existingNames.has(nameKey) ||
         (skuKey !== '' && existingSkus.has(skuKey)) ||
         seenNamesInSheet.has(nameKey) ||
@@ -518,7 +533,9 @@ export const ImportProductsModal: React.FC<ImportProductsModalProps> = ({
           volume,
           active,
           status: 'existing',
-          statusLabel: 'Já existe (mesmo nome ou código)',
+          statusLabel: matchesCombo
+            ? 'Combo (sempre pulado na planilha)'
+            : 'Já existe (mesmo nome ou código)',
         };
       }
 
@@ -538,7 +555,7 @@ export const ImportProductsModal: React.FC<ImportProductsModalProps> = ({
         statusLabel: 'Novo',
       };
     });
-  }, [rawRows, columnMap, existingProducts]);
+  }, [rawRows, columnMap, existingProducts, settings]);
 
   const counts = useMemo(() => {
     let newCount = 0;

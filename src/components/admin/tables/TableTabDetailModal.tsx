@@ -12,7 +12,10 @@ import {
   getEffectiveProductPrice,
   hasProductCase,
   formatStockWithCases,
-  sortProductsByPreference,
+  resolveStoreCategories,
+  sortProductsForStore,
+  getProductAddonGroups,
+  isComboProduct,
 } from '../../../types';
 import { api } from '../../../services/api';
 import {
@@ -182,11 +185,41 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
     return () => window.clearTimeout(timer);
   }, [lastLaunchedItemKey, tabDetail]);
 
-  // Filter products for launching items (with owner's preferred products first)
+  const storeCategories = useMemo(
+    () => resolveStoreCategories(settings, products),
+    [settings, products]
+  );
+
+  const knownCategoryIds = useMemo(
+    () => new Set(storeCategories.map((c) => c.id)),
+    [storeCategories]
+  );
+
+  const categoryPills = useMemo(() => {
+    const activeProds = products.filter((p) => p.active);
+    const pills: { id: string; label: string }[] = [{ id: 'todas', label: 'Todos' }];
+    for (const cat of storeCategories) {
+      if (activeProds.some((p) => p.category === cat.id)) {
+        pills.push({ id: cat.id, label: cat.name });
+      }
+    }
+    if (activeProds.some((p) => !p.category || !knownCategoryIds.has(p.category))) {
+      pills.push({ id: 'outros', label: 'Outros' });
+    }
+    return pills;
+  }, [products, storeCategories, knownCategoryIds]);
+
+  // Filter products for launching items (with owner's preferred products first + store sort order)
   const filteredProducts = useMemo(() => {
     const matching = products.filter((p) => {
       if (!p.active) return false;
-      if (categoryFilter !== 'todas' && p.category !== categoryFilter) return false;
+      if (categoryFilter !== 'todas') {
+        if (categoryFilter === 'outros') {
+          if (p.category && knownCategoryIds.has(p.category)) return false;
+        } else if (p.category !== categoryFilter) {
+          return false;
+        }
+      }
       if (prodSearch.trim()) {
         const q = prodSearch.toLowerCase();
         const matchesName = p.name.toLowerCase().includes(q);
@@ -195,8 +228,8 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
       }
       return true;
     });
-    return sortProductsByPreference(matching, settings?.featuredProductIds);
-  }, [products, categoryFilter, prodSearch, settings?.featuredProductIds]);
+    return sortProductsForStore(matching, settings, products);
+  }, [products, categoryFilter, prodSearch, settings, knownCategoryIds]);
 
   // Other open tabs for transfer (only primary tables with open tabs, excluding joined tables)
   const otherOpenTables = useMemo(() => {
@@ -905,15 +938,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
 
                 {/* Category Pills */}
                 <div className="flex items-center gap-1 overflow-x-auto pb-1 text-[11px]">
-                  {[
-                    { id: 'todas', label: 'Todos' },
-                    { id: 'cervejas', label: 'Cervejas' },
-                    { id: 'destilados', label: 'Destilados' },
-                    { id: 'vinhos', label: 'Vinhos' },
-                    { id: 'nao_alcoolicos', label: 'Não Alcoólicos' },
-                    { id: 'gelo_carvao', label: 'Gelo & Carvão' },
-                    { id: 'petiscos', label: 'Petiscos' },
-                  ].map((c) => (
+                  {categoryPills.map((c) => (
                     <button
                       key={c.id}
                       onClick={() => setCategoryFilter(c.id as any)}
@@ -941,25 +966,29 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                     const isPromo = isProductPromoActive(p);
                     const effectivePrice = getEffectiveProductPrice(p);
                     const hasCase = hasProductCase(p);
+                    const isCombo = isComboProduct(p.id, settings);
                     const isOutOfStock = p.stock <= 0;
+                    const hasAddons = getProductAddonGroups(p, settings).length > 0;
 
                     return (
                       <div
                         key={p.id}
                         onClick={() => {
-                          if (!isOutOfStock) {
+                          if (!isOutOfStock && !isCombo) {
                             setSelectedProduct(p);
                             setItemSaleUnit('unit');
                             setItemQuantity(1);
                             setAddItemError('');
                           }
                         }}
-                        className={`p-2.5 rounded-2xl border transition-all cursor-pointer flex items-center justify-between gap-3 ${
-                          isSelected
-                            ? 'border-amber-500 bg-amber-500/10 shadow-xs'
+                        className={`p-2.5 rounded-2xl border transition-all flex items-center justify-between gap-3 ${
+                          isCombo
+                            ? 'opacity-55 bg-neutral-50 border-neutral-200 cursor-not-allowed'
+                            : isSelected
+                            ? 'border-amber-500 bg-amber-500/10 shadow-xs cursor-pointer'
                             : isOutOfStock
                             ? 'opacity-40 bg-neutral-50 border-neutral-200 cursor-not-allowed'
-                            : 'border-neutral-200 bg-white hover:border-neutral-300 hover:bg-neutral-50/50'
+                            : 'border-neutral-200 bg-white hover:border-neutral-300 hover:bg-neutral-50/50 cursor-pointer'
                         }`}
                       >
                         <div className="flex items-center gap-3 min-w-0">
@@ -975,10 +1004,15 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                             </div>
                           )}
                           <div className="min-w-0">
-                            <div className="flex items-center gap-1.5">
+                            <div className="flex items-center gap-1.5 flex-wrap">
                               <span className="text-xs font-bold text-neutral-900 truncate">
                                 {p.name}
                               </span>
+                              {isCombo && (
+                                <span className="px-1.5 py-0.2 bg-amber-100 text-amber-900 border border-amber-300 text-[9px] font-black rounded uppercase shrink-0">
+                                  Combo
+                                </span>
+                              )}
                               {p.isCold && <Snowflake className="w-3 h-3 text-sky-500 shrink-0" />}
                               {isPromo && (
                                 <span className="px-1 py-0.2 bg-red-100 text-red-700 text-[9px] font-black rounded uppercase shrink-0">
@@ -986,13 +1020,26 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                                 </span>
                               )}
                             </div>
-                            <div className="flex items-center gap-2 text-[10px] text-neutral-400 mt-0.5 flex-wrap">
-                              <span>{p.volume}</span>
-                              <span>•</span>
-                              <span className={p.stock <= p.minStock ? 'text-amber-600 font-bold' : ''}>
-                                Estoque: {formatStockWithCases(p.stock, p.caseSize)}
+                            {isCombo ? (
+                              <span className="inline-block mt-0.5 text-[10px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md">
+                                Combo: venda no balcão ou na loja
                               </span>
-                            </div>
+                            ) : (
+                              <>
+                                <div className="flex items-center gap-2 text-[10px] text-neutral-400 mt-0.5 flex-wrap">
+                                  <span>{p.volume}</span>
+                                  <span>•</span>
+                                  <span className={p.stock <= p.minStock ? 'text-amber-600 font-bold' : ''}>
+                                    Estoque: {formatStockWithCases(p.stock, p.caseSize)}
+                                  </span>
+                                </div>
+                                {hasAddons && (
+                                  <span className="inline-block mt-0.5 text-[10px] font-semibold text-neutral-500">
+                                    adicionais só no balcão e na loja
+                                  </span>
+                                )}
+                              </>
+                            )}
                           </div>
                         </div>
 
@@ -1059,6 +1106,11 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                             {selectedProduct.name}
                             {isCase ? ` — Caixa c/${selectedProduct.caseSize}` : ''}
                           </span>
+                          {getProductAddonGroups(selectedProduct, settings).length > 0 && (
+                            <span className="inline-block mt-0.5 text-[10px] font-semibold text-neutral-500">
+                              adicionais só no balcão e na loja
+                            </span>
+                          )}
                         </div>
                         <div className="flex items-center gap-2 shrink-0">
                           <span className="text-sm font-black text-amber-600">

@@ -14,11 +14,21 @@ import {
   getEffectiveProductPrice,
   getPromoDiscountPercent,
   hasProductCase,
-  sortProductsByPreference,
+  resolveStoreCategories,
+  sortProductsForStore,
+  OrderItemAddon,
+  getProductAddonGroups,
+  buildOrderItemAddonsSignature,
+  formatOrderItemAddonLine,
+  OrderItemComboComponent,
+  isComboProduct,
+  calculateComboMetrics,
+  formatOrderItemComboLine,
 } from '../../types';
 import { api, CouponValidationResult, CustomerDeliveryQuoteResult } from '../../services/api';
 import { CustomerAuthModal } from './CustomerAuthModal';
 import { AddressPinMap } from '../AddressPinMap';
+import { ProductAddonsModal } from '../ProductAddonsModal';
 import { 
   Beer, 
   Wine, 
@@ -63,9 +73,13 @@ interface CustomerStorefrontProps {
 }
 
 interface CartItem {
+  lineId: string;
   product: Product;
   quantity: number;
   saleUnit: SaleUnit;
+  addons?: OrderItemAddon[];
+  addonsTotal?: number;
+  comboItems?: OrderItemComboComponent[];
 }
 
 export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products, settings, deliveryAreas }) => {
@@ -75,6 +89,10 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [cart, setCart] = useState<CartItem[]>([]);
   const [selectedUnits, setSelectedUnits] = useState<Record<string, SaleUnit>>({});
   const [isCartOpen, setIsCartOpen] = useState<boolean>(false);
+  const [addonModalState, setAddonModalState] = useState<{
+    product: Product;
+    saleUnit: SaleUnit;
+  } | null>(null);
 
   // Customer Account state
   const [currentCustomer, setCurrentCustomer] = useState<CustomerProfile | null>(() => api.getCurrentCustomer());
@@ -529,17 +547,36 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     });
   }, [products, showOutOfStock]);
 
+  const storeCategories = useMemo(
+    () => resolveStoreCategories(settings, products),
+    [settings, products]
+  );
+
+  const knownCategoryIds = useMemo(
+    () => new Set(storeCategories.map((c) => c.id)),
+    [storeCategories]
+  );
+
+  const baseVisibleProducts = useMemo(() => {
+    return onlyCold ? storeVisibleProducts.filter((p) => p.isCold) : storeVisibleProducts;
+  }, [storeVisibleProducts, onlyCold]);
+
   // Active promotional products for the "🔥 Promoções" section
   const promoProducts = useMemo(() => {
     const activePromos = storeVisibleProducts.filter((p) => isProductPromoActive(p));
-    return sortProductsByPreference(activePromos, settings.featuredProductIds);
-  }, [storeVisibleProducts, settings.featuredProductIds]);
+    return sortProductsForStore(activePromos, settings, storeVisibleProducts);
+  }, [storeVisibleProducts, settings]);
 
-  // Filter products and place preferred products (settings.featuredProductIds) first in any list
+  // Filter products and place preferred products (settings.featuredProductIds) first, followed by store sort mode/order
   const filteredProducts = useMemo(() => {
-    const matching = storeVisibleProducts.filter((p) => {
-      if (selectedCategory !== 'todas' && p.category !== selectedCategory) return false;
-      if (onlyCold && !p.isCold) return false;
+    const matching = baseVisibleProducts.filter((p) => {
+      if (selectedCategory !== 'todas') {
+        if (selectedCategory === 'outros') {
+          if (p.category && knownCategoryIds.has(p.category)) return false;
+        } else if (p.category !== selectedCategory) {
+          return false;
+        }
+      }
       if (searchQuery.trim()) {
         const query = searchQuery.toLowerCase();
         return (
@@ -551,8 +588,34 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       return true;
     });
 
-    return sortProductsByPreference(matching, settings.featuredProductIds);
-  }, [storeVisibleProducts, selectedCategory, onlyCold, searchQuery, settings.featuredProductIds]);
+    return sortProductsForStore(matching, settings, storeVisibleProducts);
+  }, [baseVisibleProducts, selectedCategory, searchQuery, settings, storeVisibleProducts, knownCategoryIds]);
+
+  const groupedCategorySections = useMemo(() => {
+    if (selectedCategory !== 'todas' || searchQuery.trim() !== '') return [];
+    const sections: { id: string; name: string; items: Product[] }[] = [];
+    for (const cat of storeCategories) {
+      const catProducts = baseVisibleProducts.filter((p) => p.category === cat.id);
+      if (catProducts.length > 0) {
+        sections.push({
+          id: cat.id,
+          name: cat.name,
+          items: sortProductsForStore(catProducts, settings, storeVisibleProducts),
+        });
+      }
+    }
+    const otherProducts = baseVisibleProducts.filter(
+      (p) => !p.category || !knownCategoryIds.has(p.category)
+    );
+    if (otherProducts.length > 0) {
+      sections.push({
+        id: 'outros',
+        name: 'Outros',
+        items: sortProductsForStore(otherProducts, settings, storeVisibleProducts),
+      });
+    }
+    return sections;
+  }, [selectedCategory, searchQuery, storeCategories, baseVisibleProducts, knownCategoryIds, settings, storeVisibleProducts]);
 
   const getSelectedUnit = (product: Product): SaleUnit => {
     if (!hasProductCase(product)) return 'unit';
@@ -560,11 +623,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return selectedUnits[product.id] || 'unit';
   };
 
-  const getCartItemUnitPrice = (product: Product, saleUnit: SaleUnit): number => {
-    if (saleUnit === 'case' && hasProductCase(product)) {
-      return Number(product.casePrice);
-    }
-    return getEffectiveProductPrice(product);
+  const getCartItemUnitPrice = (product: Product, saleUnit: SaleUnit, addonsTotal = 0): number => {
+    const base =
+      saleUnit === 'case' && hasProductCase(product)
+        ? Number(product.casePrice)
+        : getEffectiveProductPrice(product);
+    return Math.round((base + (Number(addonsTotal) || 0)) * 100) / 100;
   };
 
   const getCartTotalUnitsForProduct = (productId: string, cartList: CartItem[] = cart): number => {
@@ -577,11 +641,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       }, 0);
   };
 
-  // Cart math (using casePrice for 'case' and effective promotional price for 'unit')
+  // Cart math (using casePrice for 'case', effective promotional price for 'unit', plus addonsTotal)
   const cartSubtotal = useMemo(() => {
     return cart.reduce((sum, item) => {
       const currentProd = products.find((p) => p.id === item.product.id) || item.product;
-      return sum + getCartItemUnitPrice(currentProd, item.saleUnit) * item.quantity;
+      return sum + getCartItemUnitPrice(currentProd, item.saleUnit, item.addonsTotal) * item.quantity;
     }, 0);
   }, [cart, products]);
 
@@ -686,6 +750,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         productId: i.product.id,
         quantity: i.quantity,
         saleUnit: i.saleUnit,
+        addons: i.addons?.map((a) => ({
+          groupId: a.groupId,
+          optionId: a.optionId,
+          quantity: a.quantity,
+        })),
       }));
       const res = await api.validateCoupon(couponInput.trim(), cartSubtotal, itemsPayload);
       setAppliedCoupon(res);
@@ -704,38 +773,95 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     setCouponError('');
   };
 
-  const addToCart = (product: Product, unitOverride?: SaleUnit) => {
-    const saleUnit: SaleUnit = unitOverride || getSelectedUnit(product);
+  const appendCartLine = (
+    product: Product,
+    saleUnit: SaleUnit,
+    qtyToAdd: number,
+    addons?: OrderItemAddon[],
+    addonsTotal?: number
+  ) => {
     const isCase = saleUnit === 'case' && hasProductCase(product);
     const unitsPerSale = isCase ? Number(product.caseSize) : 1;
+    const addonsSig = buildOrderItemAddonsSignature(addons);
+    const lineId = `${product.id}::${saleUnit}::${addonsSig}`;
 
     setCart((prev) => {
       const usedUnits = getCartTotalUnitsForProduct(product.id, prev);
-      if (usedUnits + unitsPerSale > product.stock) return prev;
+      if (usedUnits + unitsPerSale * qtyToAdd > product.stock) return prev;
 
-      const existing = prev.find((i) => i.product.id === product.id && i.saleUnit === saleUnit);
+      const existing = prev.find((i) => i.lineId === lineId);
       if (existing) {
         return prev.map((i) =>
-          i.product.id === product.id && i.saleUnit === saleUnit
-            ? { ...i, quantity: i.quantity + 1 }
-            : i
+          i.lineId === lineId ? { ...i, quantity: i.quantity + qtyToAdd } : i
         );
       }
-      return [...prev, { product, quantity: 1, saleUnit }];
+      const isCombo = isComboProduct(product.id, settings);
+      const comboItems = isCombo
+        ? calculateComboMetrics(product, settings, products).orderComboItems
+        : undefined;
+
+      return [
+        ...prev,
+        {
+          lineId,
+          product,
+          quantity: qtyToAdd,
+          saleUnit,
+          addons: addons && addons.length > 0 ? addons : undefined,
+          addonsTotal: addons && addons.length > 0 ? addonsTotal : undefined,
+          comboItems: comboItems && comboItems.length > 0 ? comboItems : undefined,
+        },
+      ];
+    });
+  };
+
+  const addToCart = (product: Product, unitOverride?: SaleUnit) => {
+    const saleUnit: SaleUnit = unitOverride || getSelectedUnit(product);
+    const applicableGroups = getProductAddonGroups(product, settings);
+    if (applicableGroups.length > 0) {
+      setAddonModalState({ product, saleUnit });
+      return;
+    }
+    appendCartLine(product, saleUnit, 1);
+  };
+
+  const changeCartLineQuantity = (lineId: string, delta: number) => {
+    setCart((prev) => {
+      const existing = prev.find((i) => i.lineId === lineId);
+      if (!existing) return prev;
+      const currentProd = products.find((p) => p.id === existing.product.id) || existing.product;
+      const isCase = existing.saleUnit === 'case' && hasProductCase(currentProd);
+      const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
+
+      if (delta > 0) {
+        const usedUnits = getCartTotalUnitsForProduct(currentProd.id, prev);
+        if (usedUnits + unitsPerSale * delta > currentProd.stock) return prev;
+      }
+
+      const nextQty = existing.quantity + delta;
+      const next =
+        nextQty <= 0
+          ? prev.filter((i) => i.lineId !== lineId)
+          : prev.map((i) => (i.lineId === lineId ? { ...i, quantity: nextQty } : i));
+
+      if (next.length === 0) {
+        setCheckoutClientRequestId(crypto.randomUUID());
+      }
+      return next;
     });
   };
 
   const removeFromCart = (productId: string, saleUnit: SaleUnit = 'unit') => {
     setCart((prev) => {
-      const existing = prev.find((i) => i.product.id === productId && i.saleUnit === saleUnit);
-      if (!existing) return prev;
+      // Find the last matching line for this product + saleUnit
+      const matchingLines = prev.filter((i) => i.product.id === productId && i.saleUnit === saleUnit);
+      if (matchingLines.length === 0) return prev;
+      const targetLine = matchingLines[matchingLines.length - 1];
       const next =
-        existing.quantity <= 1
-          ? prev.filter((i) => !(i.product.id === productId && i.saleUnit === saleUnit))
+        targetLine.quantity <= 1
+          ? prev.filter((i) => i.lineId !== targetLine.lineId)
           : prev.map((i) =>
-              i.product.id === productId && i.saleUnit === saleUnit
-                ? { ...i, quantity: i.quantity - 1 }
-                : i
+              i.lineId === targetLine.lineId ? { ...i, quantity: i.quantity - 1 } : i
             );
       if (next.length === 0) {
         setCheckoutClientRequestId(crypto.randomUUID());
@@ -745,8 +871,9 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   };
 
   const getCartQuantity = (productId: string, saleUnit: SaleUnit = 'unit') => {
-    const item = cart.find((i) => i.product.id === productId && i.saleUnit === saleUnit);
-    return item ? item.quantity : 0;
+    return cart
+      .filter((i) => i.product.id === productId && i.saleUnit === saleUnit)
+      .reduce((sum, i) => sum + i.quantity, 0);
   };
 
   const formatCurrency = (val: number) => {
@@ -839,7 +966,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         items: cart.map((i) => {
           const currentProd = products.find((p) => p.id === i.product.id) || i.product;
           const isCase = i.saleUnit === 'case' && hasProductCase(currentProd);
-          const effPrice = isCase ? Number(currentProd.casePrice) : getEffectiveProductPrice(currentProd);
+          const effPrice = getCartItemUnitPrice(currentProd, i.saleUnit, i.addonsTotal);
           const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
           return {
             productId: currentProd.id,
@@ -852,6 +979,19 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             saleUnit: isCase ? 'case' : 'unit',
             unitsPerSale,
             isCold: currentProd.isCold,
+            addons:
+              i.addons && i.addons.length > 0
+                ? i.addons.map((a) => ({
+                    groupId: a.groupId,
+                    optionId: a.optionId,
+                    groupName: a.groupName,
+                    optionName: a.optionName,
+                    price: a.price,
+                    quantity: a.quantity,
+                  }))
+                : undefined,
+            addonsTotal: i.addonsTotal,
+            comboItems: i.comboItems && i.comboItems.length > 0 ? i.comboItems : undefined,
           };
         }),
         subtotal: cartSubtotal,
@@ -922,7 +1062,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
               } else if (isCase && avail > 0) {
                 // Convert to available loose units if a full case is no longer available
                 remainingByProd.set(fp.id, 0);
-                nextCart.push({ product: fp, quantity: avail, saleUnit: 'unit' });
+                const sig = buildOrderItemAddonsSignature(item.addons);
+                nextCart.push({
+                  ...item,
+                  lineId: `${fp.id}::unit::${sig}`,
+                  product: fp,
+                  quantity: avail,
+                  saleUnit: 'unit',
+                });
               }
               stockWarnings.push(`Só restam ${fp.stock} unidades de ${fp.name}`);
             }
@@ -953,36 +1100,46 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   };
 
   const categories = useMemo(() => {
-    const base = [
-      { id: 'todas', label: 'Todas as Bebidas', icon: Sparkles },
-      { id: 'cervejas', label: 'Cervejas', icon: Beer },
-      { id: 'destilados', label: 'Destilados & Drinks', icon: Wine },
-      { id: 'nao_alcoolicos', label: 'Refrigerantes & Sucos', icon: Coffee },
-      { id: 'vinhos', label: 'Vinhos & Espumantes', icon: Wine },
-      { id: 'gelo_carvao', label: 'Gelo & Carvão', icon: Flame },
-      { id: 'petiscos', label: 'Petiscos & Copos', icon: Package },
-    ];
-    const baseIds = new Set(base.map((b) => b.id));
-    const availableCategories = new Set<string>();
-    const extras = new Set<string>();
-
-    storeVisibleProducts.forEach((p) => {
-      if (p.category) {
-        availableCategories.add(p.category);
-        if (!baseIds.has(p.category)) {
-          extras.add(p.category);
-        }
+    const getCategoryIcon = (catId: string) => {
+      switch (catId) {
+        case 'cervejas':
+          return Beer;
+        case 'destilados':
+        case 'vinhos':
+          return Wine;
+        case 'nao_alcoolicos':
+          return Coffee;
+        case 'gelo_carvao':
+          return Flame;
+        default:
+          return Package;
       }
-    });
+    };
 
-    const visibleBase = base.filter(
-      (cat) => cat.id === 'todas' || availableCategories.has(cat.id)
-    );
-    return [
-      ...visibleBase,
-      ...Array.from(extras).map((c) => ({ id: c, label: c, icon: Package })),
+    const list: { id: string; label: string; icon: any }[] = [
+      { id: 'todas', label: 'Todas as Bebidas', icon: Sparkles },
     ];
-  }, [storeVisibleProducts]);
+
+    for (const cat of storeCategories) {
+      if (baseVisibleProducts.some((p) => p.category === cat.id)) {
+        list.push({
+          id: cat.id,
+          label: cat.name,
+          icon: getCategoryIcon(cat.id),
+        });
+      }
+    }
+
+    if (baseVisibleProducts.some((p) => !p.category || !knownCategoryIds.has(p.category))) {
+      list.push({
+        id: 'outros',
+        label: 'Outros',
+        icon: Package,
+      });
+    }
+
+    return list;
+  }, [storeCategories, baseVisibleProducts, knownCategoryIds]);
 
   // If the currently selected category becomes empty, switch back to 'todas'
   useEffect(() => {
@@ -1035,6 +1192,16 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         ? `${it.quantity} cx ${it.name}${it.volume ? ` ${it.volume}` : ''} (c/${it.unitsPerSale})`
         : `${it.quantity}x ${it.name}${it.volume ? ` ${it.volume}` : ''}`;
       lines.push(`- ${label} - R$ ${itemTotal}`);
+      if (Array.isArray(it.comboItems) && it.comboItems.length > 0) {
+        for (const ci of it.comboItems) {
+          lines.push(`   ${formatOrderItemComboLine(ci)}`);
+        }
+      }
+      if (Array.isArray(it.addons) && it.addons.length > 0) {
+        for (const addon of it.addons) {
+          lines.push(`   ${formatOrderItemAddonLine(addon)}`);
+        }
+      }
     }
     lines.push('');
     lines.push(`🛒 Valor dos itens: R$ ${Number(order.subtotal).toFixed(2)}`);
@@ -1213,7 +1380,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   const isCase = it.saleUnit === 'case' && (it.unitsPerSale || 1) > 1;
                   const wasPromo = !isCase && it.originalPrice !== undefined && it.originalPrice > it.price;
                   return (
-                    <div key={idx} className="flex justify-between items-center py-1 border-b border-neutral-100 last:border-0">
+                    <div key={idx} className="flex justify-between items-start py-1.5 border-b border-neutral-100 last:border-0">
                       <div>
                         <span className="font-bold text-neutral-800">
                           {isCase ? `${it.quantity} cx ` : `${it.quantity}x `}
@@ -1228,6 +1395,24 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                           </span>
                         )}
                         <span className="text-neutral-400 block">{it.volume} {it.isCold ? '• Gelada ❄️' : ''}</span>
+                        {Array.isArray(it.comboItems) && it.comboItems.length > 0 && (
+                          <div className="mt-1 space-y-0.5 pl-2 border-l-2 border-amber-300">
+                            {it.comboItems.map((ci, cIdx) => (
+                              <div key={cIdx} className="text-[11px] font-semibold text-neutral-600">
+                                {formatOrderItemComboLine(ci)}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {Array.isArray(it.addons) && it.addons.length > 0 && (
+                          <div className="mt-1 space-y-0.5 pl-2 border-l-2 border-amber-300">
+                            {it.addons.map((addon, aIdx) => (
+                              <div key={aIdx} className="text-[11px] font-semibold text-neutral-600">
+                                {formatOrderItemAddonLine(addon)}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                       <div className="text-right">
                         {wasPromo && it.originalPrice && (
@@ -1506,7 +1691,9 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
           <div className="flex gap-4 sm:gap-5 overflow-x-auto pb-2 snap-x snap-mandatory">
             {promoProducts.map((product) => {
-              const hasCase = hasProductCase(product);
+              const isCombo = isComboProduct(product.id, settings);
+              const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
+              const hasCase = !isCombo && hasProductCase(product);
               const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
               const activeUnit = getSelectedUnit(product);
               const isCaseSelected = activeUnit === 'case' && hasCase;
@@ -1568,11 +1755,16 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
                     <div className="p-4 pb-2">
                       <span className="text-[11px] font-bold text-neutral-400 uppercase tracking-wider">
-                        {product.volume}
+                        {isCombo ? 'Combo' : product.volume}
                       </span>
                       <h3 className="font-black text-base text-neutral-900 leading-snug line-clamp-2 mt-0.5">
                         {product.name}
                       </h3>
+                      {isCombo && comboMetrics?.itemsSummaryText && (
+                        <p className="text-xs text-neutral-600 font-medium mt-1 leading-snug">
+                          {comboMetrics.itemsSummaryText}
+                        </p>
+                      )}
                       {formattedEndDate && (
                         <p className="mt-1.5 text-[11px] font-bold text-red-700 bg-red-50 border border-red-200 px-2 py-0.5 rounded-lg inline-block">
                           Termina em {formattedEndDate}
@@ -1770,10 +1962,236 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
           <h3 className="text-base font-bold text-neutral-800">Nenhum produto encontrado</h3>
           <p className="text-xs text-neutral-500 mt-1">Tente buscar por outro termo ou limpar os filtros.</p>
         </div>
+      ) : selectedCategory === 'todas' && searchQuery.trim() === '' ? (
+        <div className="space-y-8">
+          {groupedCategorySections.map((section) => (
+            <section key={section.id} className="space-y-3.5">
+              <div className="flex items-center justify-between border-b border-neutral-200 pb-2">
+                <h2 className="text-base sm:text-lg font-black text-neutral-900 tracking-tight">
+                  {section.name}
+                </h2>
+                <span className="text-xs font-bold text-neutral-400">
+                  {section.items.length} {section.items.length === 1 ? 'item' : 'itens'}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-6">
+                {section.items.map((product) => {
+                  const isCombo = isComboProduct(product.id, settings);
+                  const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
+                  const hasCase = !isCombo && hasProductCase(product);
+                  const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
+                  const activeUnit = getSelectedUnit(product);
+                  const isCaseSelected = activeUnit === 'case' && hasCase;
+                  const unitsPerSale = isCaseSelected ? Number(product.caseSize) : 1;
+                  const qty = getCartQuantity(product.id, activeUnit);
+                  const usedUnits = getCartTotalUnitsForProduct(product.id);
+                  const canAddMore = usedUnits + unitsPerSale <= product.stock;
+                  const isOutOfStock = product.stock <= 0;
+                  const promoActive = isProductPromoActive(product);
+                  const discountPct = promoActive ? getPromoDiscountPercent(product) : 0;
+                  const effPrice = getEffectiveProductPrice(product);
+                  const displayPrice = isCaseSelected ? Number(product.casePrice) : effPrice;
+                  const hasComboSavings =
+                    Boolean(isCombo && comboMetrics && comboMetrics.separatePrice > effPrice);
+
+                  return (
+                    <div
+                      key={product.id}
+                      className={`bg-white rounded-3xl border shadow-xs hover:shadow-md transition-all overflow-hidden flex flex-col group ${
+                        promoActive ? 'border-red-200' : 'border-neutral-200'
+                      }`}
+                    >
+                      <div className="relative aspect-square bg-neutral-100 overflow-hidden">
+                        {product.image ? (
+                          <img
+                            src={product.image}
+                            alt={product.name}
+                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                            loading="lazy"
+                          />
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center text-neutral-300">
+                            <Package className="w-12 h-12" />
+                          </div>
+                        )}
+                        {product.isCold && (
+                          <div className="absolute top-2 left-2 bg-sky-500/95 backdrop-blur-xs text-white text-[10px] font-black px-2 py-0.5 rounded-full shadow-sm flex items-center gap-1">
+                            <span>❄️</span>
+                            <span>GELADA</span>
+                          </div>
+                        )}
+                        {promoActive && (
+                          <div className="absolute top-2 right-2 bg-red-600 text-white text-[11px] font-black px-2 py-0.5 rounded-full shadow-md">
+                            -{discountPct}%
+                          </div>
+                        )}
+                        {isOutOfStock && (
+                          <div className="absolute inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center">
+                            <span className="bg-red-500 text-white text-xs font-black px-3 py-1 rounded-full uppercase">
+                              Esgotado
+                            </span>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="p-3 sm:p-4 flex-1 flex flex-col justify-between">
+                        <div>
+                          <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
+                            {isCombo ? 'Combo' : product.volume}
+                          </span>
+                          <h3 className="font-bold text-sm text-neutral-900 leading-snug line-clamp-2 mt-0.5">
+                            {product.name}
+                          </h3>
+                          {isCombo && comboMetrics?.itemsSummaryText ? (
+                            <p className="text-xs text-neutral-600 font-medium mt-1 leading-snug">
+                              {comboMetrics.itemsSummaryText}
+                            </p>
+                          ) : (
+                            <p className="text-xs text-neutral-500 line-clamp-1 mt-1">
+                              {product.description}
+                            </p>
+                          )}
+
+                          {hasCase && (
+                            <div className="mt-2.5 space-y-1">
+                              <div className="grid grid-cols-2 gap-1 p-1 bg-neutral-100 rounded-xl border border-neutral-200">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setSelectedUnits((prev) => ({ ...prev, [product.id]: 'unit' }))
+                                  }
+                                  className={`py-1.5 px-1 rounded-lg text-[10px] font-bold transition-all leading-tight text-center cursor-pointer ${
+                                    !isCaseSelected
+                                      ? 'bg-white text-neutral-900 shadow-2xs'
+                                      : 'text-neutral-600 hover:text-neutral-900'
+                                  }`}
+                                >
+                                  <span className="block">Unidade</span>
+                                  <span className={`text-[10px] font-black ${promoActive ? 'text-red-600' : 'text-neutral-900'}`}>
+                                    {formatCurrency(effPrice)}
+                                  </span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={caseUnavailable}
+                                  onClick={() =>
+                                    setSelectedUnits((prev) => ({ ...prev, [product.id]: 'case' }))
+                                  }
+                                  className={`py-1.5 px-1 rounded-lg text-[10px] font-bold transition-all leading-tight text-center ${
+                                    caseUnavailable
+                                      ? 'opacity-40 cursor-not-allowed text-neutral-400'
+                                      : isCaseSelected
+                                      ? 'bg-amber-500 text-neutral-950 shadow-2xs cursor-pointer'
+                                      : 'text-neutral-600 hover:text-neutral-900 cursor-pointer'
+                                  }`}
+                                >
+                                  <span className="block">Caixa c/{product.caseSize}</span>
+                                  <span className="text-[10px] font-black">
+                                    {formatCurrency(Number(product.casePrice))}
+                                  </span>
+                                </button>
+                              </div>
+                              {caseUnavailable && !isOutOfStock && (
+                                <p className="text-[10px] text-neutral-400 font-semibold text-center">
+                                  sem caixa fechada no estoque
+                                </p>
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="mt-3 pt-2.5 border-t border-neutral-100 flex flex-col gap-2">
+                          <div>
+                            {isCaseSelected ? (
+                              <>
+                                <span className="text-[10px] text-amber-700 block font-bold">
+                                  Caixa c/{product.caseSize} un.
+                                </span>
+                                <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
+                                  {formatCurrency(displayPrice)}
+                                </span>
+                              </>
+                            ) : promoActive ? (
+                              <>
+                                <span className="text-[11px] text-neutral-400 line-through block font-medium">
+                                  De {formatCurrency(product.price)}
+                                </span>
+                                <span className="text-base sm:text-lg font-black text-red-600 block leading-tight">
+                                  Por {formatCurrency(effPrice)}
+                                </span>
+                              </>
+                            ) : hasComboSavings && comboMetrics ? (
+                              <>
+                                <span className="text-[11px] text-neutral-400 line-through block font-medium">
+                                  De {formatCurrency(comboMetrics.separatePrice)}
+                                </span>
+                                <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
+                                  por {formatCurrency(effPrice)}
+                                </span>
+                              </>
+                            ) : (
+                              <>
+                                <span className="text-[10px] text-neutral-400 block font-medium">Preço</span>
+                                <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
+                                  {formatCurrency(product.price)}
+                                </span>
+                              </>
+                            )}
+                          </div>
+
+                          {isOutOfStock ? (
+                            <button
+                              type="button"
+                              disabled
+                              className="w-full py-2 px-3 bg-neutral-200 text-neutral-500 text-xs font-bold rounded-xl cursor-not-allowed text-center"
+                            >
+                              Esgotado
+                            </button>
+                          ) : qty === 0 ? (
+                            <button
+                              type="button"
+                              disabled={!canAddMore}
+                              onClick={() => addToCart(product, activeUnit)}
+                              className="w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-white text-xs font-bold rounded-xl transition-all shadow-sm shadow-amber-500/20 active:scale-95 cursor-pointer"
+                            >
+                              <Plus className="w-3.5 h-3.5 shrink-0" />
+                              <span>Adicionar</span>
+                            </button>
+                          ) : (
+                            <div className="w-full flex items-center justify-between gap-1.5 bg-neutral-100 p-1 rounded-xl">
+                              <button
+                                type="button"
+                                onClick={() => removeFromCart(product.id, activeUnit)}
+                                className="w-8 h-8 shrink-0 bg-white hover:bg-neutral-200 text-neutral-800 rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
+                              >
+                                <Minus className="w-3.5 h-3.5" />
+                              </button>
+                              <span className="flex-1 text-center font-black text-xs text-neutral-900">{qty}</span>
+                              <button
+                                type="button"
+                                onClick={() => addToCart(product, activeUnit)}
+                                disabled={!canAddMore}
+                                className="w-8 h-8 shrink-0 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
+                              >
+                                <Plus className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          ))}
+        </div>
       ) : (
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-6">
           {filteredProducts.map((product) => {
-            const hasCase = hasProductCase(product);
+            const isCombo = isComboProduct(product.id, settings);
+            const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
+            const hasCase = !isCombo && hasProductCase(product);
             const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
             const activeUnit = getSelectedUnit(product);
             const isCaseSelected = activeUnit === 'case' && hasCase;
@@ -1786,6 +2204,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             const discountPct = promoActive ? getPromoDiscountPercent(product) : 0;
             const effPrice = getEffectiveProductPrice(product);
             const displayPrice = isCaseSelected ? Number(product.casePrice) : effPrice;
+            const hasComboSavings =
+              Boolean(isCombo && comboMetrics && comboMetrics.separatePrice > effPrice);
 
             return (
               <div
@@ -1830,14 +2250,20 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 <div className="p-3 sm:p-4 flex-1 flex flex-col justify-between">
                   <div>
                     <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
-                      {product.volume}
+                      {isCombo ? 'Combo' : product.volume}
                     </span>
                     <h3 className="font-bold text-sm text-neutral-900 leading-snug line-clamp-2 mt-0.5">
                       {product.name}
                     </h3>
-                    <p className="text-xs text-neutral-500 line-clamp-1 mt-1">
-                      {product.description}
-                    </p>
+                    {isCombo && comboMetrics?.itemsSummaryText ? (
+                      <p className="text-xs text-neutral-600 font-medium mt-1 leading-snug">
+                        {comboMetrics.itemsSummaryText}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-neutral-500 line-clamp-1 mt-1">
+                        {product.description}
+                      </p>
+                    )}
 
                     {hasCase && (
                       <div className="mt-2.5 space-y-1">
@@ -1905,6 +2331,15 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                           </span>
                           <span className="text-base sm:text-lg font-black text-red-600 block leading-tight">
                             Por {formatCurrency(effPrice)}
+                          </span>
+                        </>
+                      ) : hasComboSavings && comboMetrics ? (
+                        <>
+                          <span className="text-[11px] text-neutral-400 line-through block font-medium">
+                            De {formatCurrency(comboMetrics.separatePrice)}
+                          </span>
+                          <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
+                            por {formatCurrency(effPrice)}
                           </span>
                         </>
                       ) : (
@@ -2053,23 +2488,23 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   const isCase = item.saleUnit === 'case' && hasProductCase(currentProd);
                   const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
                   const promoActive = !isCase && isProductPromoActive(currentProd);
-                  const effPrice = getCartItemUnitPrice(currentProd, item.saleUnit);
+                  const effPrice = getCartItemUnitPrice(currentProd, item.saleUnit, item.addonsTotal);
                   const usedUnits = getCartTotalUnitsForProduct(currentProd.id);
                   const canAddMore = usedUnits + unitsPerSale <= currentProd.stock;
 
                   return (
                     <div
-                      key={`${item.product.id}-${item.saleUnit}`}
-                      className="flex items-center justify-between gap-2.5 p-3 bg-neutral-50 rounded-2xl border border-neutral-200"
+                      key={item.lineId}
+                      className="flex items-start justify-between gap-2.5 p-3 bg-neutral-50 rounded-2xl border border-neutral-200"
                     >
                       {currentProd.image ? (
                         <img
                           src={currentProd.image}
                           alt={currentProd.name}
-                          className="w-11 h-11 rounded-xl object-cover shrink-0"
+                          className="w-11 h-11 rounded-xl object-cover shrink-0 mt-0.5"
                         />
                       ) : (
-                        <div className="w-11 h-11 rounded-xl bg-neutral-200 flex items-center justify-center text-neutral-400 shrink-0">
+                        <div className="w-11 h-11 rounded-xl bg-neutral-200 flex items-center justify-center text-neutral-400 shrink-0 mt-0.5">
                           <Package className="w-5 h-5" />
                         </div>
                       )}
@@ -2090,19 +2525,53 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                           {currentProd.volume} •{' '}
                           {promoActive ? (
                             <>
-                              <span className="line-through text-neutral-400 mr-1">{formatCurrency(currentProd.price)}</span>
+                              <span className="line-through text-neutral-400 mr-1">
+                                {formatCurrency(currentProd.price + (item.addonsTotal || 0))}
+                              </span>
                               <strong className="text-red-600">{formatCurrency(effPrice)}</strong>
                             </>
                           ) : (
                             formatCurrency(effPrice)
                           )}
                         </span>
+                        {(() => {
+                          const comboLines =
+                            Array.isArray(item.comboItems) && item.comboItems.length > 0
+                              ? item.comboItems
+                              : isComboProduct(currentProd.id, settings)
+                              ? calculateComboMetrics(currentProd, settings, products).orderComboItems
+                              : [];
+                          return comboLines.length > 0 ? (
+                            <div className="mt-1 space-y-0.5 pl-2 border-l-2 border-amber-400">
+                              {comboLines.map((ci, cIdx) => (
+                                <div
+                                  key={`${ci.productId}-${cIdx}`}
+                                  className="text-[11px] font-semibold text-neutral-600 leading-tight"
+                                >
+                                  {formatOrderItemComboLine(ci)}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null;
+                        })()}
+                        {Array.isArray(item.addons) && item.addons.length > 0 && (
+                          <div className="mt-1 space-y-0.5 pl-2 border-l-2 border-amber-400">
+                            {item.addons.map((addon, aIdx) => (
+                              <div
+                                key={`${addon.groupId || addon.groupName}-${addon.optionId || addon.optionName}-${aIdx}`}
+                                className="text-[11px] font-semibold text-neutral-600 leading-tight"
+                              >
+                                {formatOrderItemAddonLine(addon)}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-1 bg-white p-1 rounded-xl border border-neutral-200 shrink-0">
                         <button
                           type="button"
-                          onClick={() => removeFromCart(currentProd.id, item.saleUnit)}
+                          onClick={() => changeCartLineQuantity(item.lineId, -1)}
                           className="w-6 h-6 flex items-center justify-center text-neutral-600 hover:bg-neutral-100 rounded-lg"
                         >
                           <Minus className="w-3 h-3" />
@@ -2110,7 +2579,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                         <span className="w-5 text-center font-black text-xs text-neutral-900">{item.quantity}</span>
                         <button
                           type="button"
-                          onClick={() => addToCart(currentProd, item.saleUnit)}
+                          onClick={() => changeCartLineQuantity(item.lineId, 1)}
                           disabled={!canAddMore}
                           className="w-6 h-6 flex items-center justify-center text-neutral-600 hover:bg-neutral-100 rounded-lg disabled:opacity-30"
                         >
@@ -2118,7 +2587,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                         </button>
                       </div>
 
-                      <span className="font-bold text-xs text-neutral-900 shrink-0 text-right min-w-[3.75rem]">
+                      <span className="font-bold text-xs text-neutral-900 shrink-0 text-right min-w-[3.75rem] pt-1">
                         {formatCurrency(effPrice * item.quantity)}
                       </span>
                     </div>
@@ -2743,15 +3212,33 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                           </span>
                         </div>
                         <p className="text-xs text-neutral-500">
-                          {new Date(ord.createdAt).toLocaleString('pt-BR')} •{' '}
-                          {ord.items
-                            .map((i) =>
-                              i.saleUnit === 'case' && (i.unitsPerSale || 1) > 1
-                                ? `${i.quantity} cx ${i.name} (c/${i.unitsPerSale})`
-                                : `${i.quantity}x ${i.name}`
-                            )
-                            .join(', ')}
+                          {new Date(ord.createdAt).toLocaleString('pt-BR')}
                         </p>
+                        <div className="space-y-1 pt-0.5">
+                          {ord.items.map((i, idx) => (
+                            <div key={idx} className="text-xs text-neutral-700">
+                              <span className="font-semibold">
+                                {i.saleUnit === 'case' && (i.unitsPerSale || 1) > 1
+                                  ? `${i.quantity} cx ${i.name} (c/${i.unitsPerSale})`
+                                  : `${i.quantity}x ${i.name}`}
+                              </span>
+                              {Array.isArray(i.comboItems) && i.comboItems.length > 0 && (
+                                <div className="pl-2.5 text-[11px] text-neutral-500">
+                                  {i.comboItems.map((ci, cIdx) => (
+                                    <div key={cIdx}>{formatOrderItemComboLine(ci)}</div>
+                                  ))}
+                                </div>
+                              )}
+                              {Array.isArray(i.addons) && i.addons.length > 0 && (
+                                <div className="pl-2.5 text-[11px] text-neutral-500">
+                                  {i.addons.map((a, aIdx) => (
+                                    <div key={aIdx}>{formatOrderItemAddonLine(a)}</div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
                       </div>
                       <div className="text-right shrink-0">
                         <p className="font-black text-sm text-amber-600">{formatCurrency(ord.total)}</p>
@@ -2767,6 +3254,24 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             </div>
           </div>
         </div>
+      )}
+
+      {/* Product Addons Selection Modal / Mobile Drawer */}
+      {addonModalState && (
+        <ProductAddonsModal
+          product={addonModalState.product}
+          initialSaleUnit={addonModalState.saleUnit}
+          addonGroups={getProductAddonGroups(addonModalState.product, settings)}
+          availableStockUnits={Math.max(
+            0,
+            addonModalState.product.stock - getCartTotalUnitsForProduct(addonModalState.product.id)
+          )}
+          onClose={() => setAddonModalState(null)}
+          onConfirm={({ product, saleUnit, quantity, addons, addonsTotal }) => {
+            appendCartLine(product, saleUnit, quantity, addons, addonsTotal);
+            setAddonModalState(null);
+          }}
+        />
       )}
 
       {/* Customer Auth / Register Modal */}

@@ -12,22 +12,36 @@ import {
   SaleUnit,
   ShortcutAction,
   DEFAULT_SHORTCUTS,
+  ProductSortMode,
   hasProductCase,
   formatStockWithCases,
   isProductPromoActive,
   getEffectiveProductPrice,
   getPromoDiscountPercent,
   sortProductsByPreference,
+  sortProductsForStore,
+  resolveStoreCategories,
+  getCategoryDisplayName,
   formatCategoryLabel,
+  OrderItemAddon,
+  getProductAddonGroups,
+  buildOrderItemAddonsSignature,
+  formatOrderItemAddonLine,
+  OrderItemComboComponent,
+  isComboProduct,
+  calculateComboMetrics,
+  formatOrderItemComboLine,
 } from '../../types';
 import { api } from '../../services/api';
 import { soundService } from '../../utils/sound';
 import { PrintReceiptModal } from '../PrintReceiptModal';
+import { ProductAddonsModal } from '../ProductAddonsModal';
 import { QRCodeModal } from '../QRCodeModal';
 import { GoogleDeliveryRadiusMap } from './GoogleDeliveryRadiusMap';
 import { CustomerModal } from './CustomerModal';
 import { ImportProductsModal } from './ImportProductsModal';
 import { TablesManager } from './tables/TablesManager';
+import { StoreOrganizationSection } from './StoreOrganizationSection';
 import {
   calculateDistanceKm,
   buildSingleDeliveryRouteUrl,
@@ -114,6 +128,21 @@ const SHORTCUT_ACTION_ITEMS: Array<{
     action: 'fecharModal',
     label: 'Fechar janela / modal aberto',
     description: 'Fecha o modal aberto no momento sem limpar o que foi digitado nas outras telas',
+  },
+  {
+    action: 'newProduct',
+    label: 'Novo produto (Estoque)',
+    description: 'Abre o cadastro de novo produto',
+  },
+  {
+    action: 'saveProduct',
+    label: 'Salvar produto (no modal de cadastro)',
+    description: 'Salva o produto que está sendo cadastrado ou editado',
+  },
+  {
+    action: 'saveAndNewProduct',
+    label: 'Salvar e cadastrar outro (no modal de cadastro)',
+    description: 'Salva o produto e já abre outro em branco mantendo categoria, volume, caixa e gelada',
   },
 ];
 
@@ -376,11 +405,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   // Stock state
   const [stockSearch, setStockSearch] = useState<string>('');
-  const [stockCategoryFilter, setStockCategoryFilter] = useState<ProductCategory | 'todas'>('todas');
+  const [stockCategoryFilter, setStockCategoryFilter] = useState<ProductCategory | 'todas' | 'outros'>('todas');
+  const [stockSortBy, setStockSortBy] = useState<'az' | 'price' | 'stock' | 'category'>('az');
   const [onlyLowStock, setOnlyLowStock] = useState<boolean>(false);
   const [isProductModalOpen, setIsProductModalOpen] = useState<boolean>(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState<boolean>(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+  const [editingComboIdForModal, setEditingComboIdForModal] = useState<string | null>(null);
   const [stockRowUnits, setStockRowUnits] = useState<Record<string, SaleUnit>>({});
   const [stockAdjustModal, setStockAdjustModal] = useState<{
     product: Product;
@@ -391,16 +422,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     loading?: boolean;
   } | null>(null);
 
-  const customCategories = useMemo(() => {
-    const baseIds = new Set(['cervejas', 'destilados', 'nao_alcoolicos', 'vinhos', 'gelo_carvao', 'petiscos']);
-    const extras = new Set<string>();
-    products.forEach((p) => {
-      if (p.category && !baseIds.has(p.category)) {
-        extras.add(p.category);
-      }
-    });
-    return Array.from(extras);
-  }, [products]);
+  const storeCategories = useMemo(
+    () => resolveStoreCategories(settings, products),
+    [settings, products]
+  );
+
+  const storeCategoryIdSet = useMemo(
+    () => new Set(storeCategories.map((c) => c.id)),
+    [storeCategories]
+  );
+
+  const hasUnlistedCategoryProducts = useMemo(
+    () => products.some((p) => !storeCategoryIdSet.has(p.category)),
+    [products, storeCategoryIdSet]
+  );
 
   // Delivery Areas state
   const [isAreaModalOpen, setIsAreaModalOpen] = useState<boolean>(false);
@@ -422,7 +457,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [posSearch, setPosSearch] = useState<string>('');
   const [posCategory, setPosCategory] = useState<ProductCategory | 'todas'>('todas');
   const [posSelectedUnits, setPosSelectedUnits] = useState<Record<string, SaleUnit>>({});
-  const [posCart, setPosCart] = useState<Array<{ product: Product; quantity: number; saleUnit: SaleUnit }>>([]);
+  const [posCart, setPosCart] = useState<
+    Array<{
+      lineId: string;
+      product: Product;
+      quantity: number;
+      saleUnit: SaleUnit;
+      addons?: OrderItemAddon[];
+      addonsTotal?: number;
+      comboItems?: OrderItemComboComponent[];
+    }>
+  >([]);
+  const [posAddonModalState, setPosAddonModalState] = useState<{
+    product: Product;
+    saleUnit: SaleUnit;
+  } | null>(null);
   const [posCustomerName, setPosCustomerName] = useState<string>('Cliente Balcão');
   const [posPaymentMethod, setPosPaymentMethod] = useState<PaymentMethod>('dinheiro');
   const [posCashGiven, setPosCashGiven] = useState<string>('');
@@ -442,6 +491,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     ...settings,
     showOutOfStock: Boolean(settings.showOutOfStock),
     featuredProductIds: Array.isArray(settings.featuredProductIds) ? settings.featuredProductIds : [],
+    categories: resolveStoreCategories(settings, products),
+    productSortMode: settings.productSortMode || 'manual',
+    productOrder: settings.productOrder || {},
     shortcuts: { ...DEFAULT_SHORTCUTS, ...(settings.shortcuts || {}) },
   }));
   const [settingsSavedMessage, setSettingsSavedMessage] = useState<boolean>(false);
@@ -464,9 +516,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       ...settings,
       showOutOfStock: Boolean(settings.showOutOfStock),
       featuredProductIds: Array.isArray(settings.featuredProductIds) ? settings.featuredProductIds : [],
+      categories: resolveStoreCategories(settings, products),
+      productSortMode: settings.productSortMode || 'manual',
+      productOrder: settings.productOrder || {},
       shortcuts: { ...DEFAULT_SHORTCUTS, ...(settings.shortcuts || {}) },
     }));
-  }, [settings]);
+  }, [settings, products]);
 
   // Local optimistic state for instant order status changes without requiring page reload
   const [localOrders, setLocalOrders] = useState<Order[]>(orders);
@@ -596,7 +651,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     sku: '',
     description: '',
   });
+  const [initialProductFormSnapshot, setInitialProductFormSnapshot] = useState<string>('');
+  const [showDiscardProductConfirm, setShowDiscardProductConfirm] = useState<boolean>(false);
+  const [productModalSuccessNotice, setProductModalSuccessNotice] = useState<string>('');
   const [productModalError, setProductModalError] = useState<string>('');
+  const productFormRef = React.useRef<HTMLFormElement | null>(null);
+  const productNameInputRef = React.useRef<HTMLInputElement | null>(null);
+
+  const isProductFormDirty = useMemo(() => {
+    if (!isProductModalOpen || !initialProductFormSnapshot) return false;
+    return JSON.stringify(productForm) !== initialProductFormSnapshot;
+  }, [isProductModalOpen, productForm, initialProductFormSnapshot]);
 
   const formatCurrency = (val: number) => {
     return val.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
@@ -650,18 +715,49 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     return localOrders.filter(o => o.status === orderStatusFilter);
   }, [localOrders, orderStatusFilter]);
 
-  // Filtered stock list
+  // Filtered stock list (with admin-only view sorting: Nome A-Z / Preço / Estoque / Categoria)
   const filteredProducts = useMemo(() => {
-    return products.filter(p => {
-      if (stockCategoryFilter !== 'todas' && p.category !== stockCategoryFilter) return false;
+    const matching = products.filter((p) => {
+      if (stockCategoryFilter === 'outros') {
+        if (storeCategoryIdSet.has(p.category)) return false;
+      } else if (stockCategoryFilter !== 'todas' && p.category !== stockCategoryFilter) {
+        return false;
+      }
       if (onlyLowStock && p.stock > p.minStock) return false;
       if (stockSearch.trim()) {
         const q = stockSearch.toLowerCase();
-        return p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q) || p.volume.toLowerCase().includes(q);
+        return (
+          p.name.toLowerCase().includes(q) ||
+          p.sku.toLowerCase().includes(q) ||
+          p.volume.toLowerCase().includes(q)
+        );
       }
       return true;
     });
-  }, [products, stockCategoryFilter, onlyLowStock, stockSearch]);
+
+    const catOrderRank = new Map<string, number>();
+    storeCategories.forEach((c, idx) => catOrderRank.set(c.id, idx));
+
+    return [...matching].sort((a, b) => {
+      if (stockSortBy === 'price') {
+        const diff = getEffectiveProductPrice(a) - getEffectiveProductPrice(b);
+        if (Math.abs(diff) > 0.0001) return diff;
+        return a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' });
+      }
+      if (stockSortBy === 'stock') {
+        if (a.stock !== b.stock) return a.stock - b.stock;
+        return a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' });
+      }
+      if (stockSortBy === 'category') {
+        const ra = catOrderRank.has(a.category) ? catOrderRank.get(a.category)! : 999999;
+        const rb = catOrderRank.has(b.category) ? catOrderRank.get(b.category)! : 999999;
+        if (ra !== rb) return ra - rb;
+        return a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' });
+      }
+      // default 'az'
+      return a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' });
+    });
+  }, [products, stockCategoryFilter, onlyLowStock, stockSearch, stockSortBy, storeCategories, storeCategoryIdSet]);
 
   // Order status actions - Instant optimistic update without requiring page reload
   const handleUpdateStatus = async (orderId: string, newStatus: OrderStatus, notes?: string) => {
@@ -877,10 +973,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleOpenNewProduct = () => {
     setEditingProduct(null);
     setProductModalError('');
-    setProductForm({
+    setProductModalSuccessNotice('');
+    setShowDiscardProductConfirm(false);
+    const defaultCategory = storeCategories[0]?.id || 'cervejas';
+    const initialForm = {
       id: `prod-${Date.now()}`,
       name: '',
-      category: 'cervejas',
+      category: defaultCategory as ProductCategory,
       volume: 'Lata 350ml',
       price: 5.00,
       sellsCase: false,
@@ -894,15 +993,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       image: 'https://images.unsplash.com/photo-1535958636474-b021ee887b13?w=500&auto=format&fit=crop&q=80',
       sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
       description: '',
-    });
+    };
+    setProductForm(initialForm);
+    setInitialProductFormSnapshot(JSON.stringify(initialForm));
     setIsProductModalOpen(true);
+    window.setTimeout(() => {
+      productNameInputRef.current?.focus();
+    }, 50);
   };
 
   const handleOpenEditProduct = (p: Product) => {
+    if (isComboProduct(p.id, settings)) {
+      setEditingComboIdForModal(p.id);
+      return;
+    }
     setEditingProduct(p);
     setProductModalError('');
+    setProductModalSuccessNotice('');
+    setShowDiscardProductConfirm(false);
     const sellsCase = hasProductCase(p);
-    setProductForm({
+    const initialForm = {
       id: p.id,
       name: p.name,
       category: p.category,
@@ -919,13 +1029,66 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       image: p.image,
       sku: p.sku,
       description: p.description,
-    });
+    };
+    setProductForm(initialForm);
+    setInitialProductFormSnapshot(JSON.stringify(initialForm));
     setIsProductModalOpen(true);
+    window.setTimeout(() => {
+      productNameInputRef.current?.focus();
+    }, 50);
   };
 
-  const handleSaveProduct = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleDuplicateProduct = (p: Product) => {
+    setEditingProduct(null);
     setProductModalError('');
+    setProductModalSuccessNotice('');
+    setShowDiscardProductConfirm(false);
+    const sellsCase = hasProductCase(p);
+    const dupForm = {
+      id: `prod-${Date.now()}`,
+      name: `${p.name} (cópia)`,
+      category: p.category,
+      volume: p.volume,
+      price: p.price,
+      sellsCase,
+      caseSize: p.caseSize || 12,
+      casePrice: p.casePrice || 0,
+      costPrice: p.costPrice,
+      stock: 0,
+      minStock: p.minStock,
+      isCold: p.isCold,
+      active: p.active !== false,
+      image: p.image,
+      sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
+      description: p.description,
+    };
+    setProductForm(dupForm);
+    setInitialProductFormSnapshot(JSON.stringify(dupForm));
+    setIsProductModalOpen(true);
+    window.setTimeout(() => {
+      productNameInputRef.current?.focus();
+      productNameInputRef.current?.select();
+    }, 50);
+  };
+
+  const handleRequestCloseProductModal = () => {
+    if (isProductFormDirty) {
+      setShowDiscardProductConfirm(true);
+      return;
+    }
+    setShowDiscardProductConfirm(false);
+    setIsProductModalOpen(false);
+  };
+
+  const submitProductForm = async (mode: 'close' | 'new') => {
+    setProductModalError('');
+    setProductModalSuccessNotice('');
+
+    if (!productForm.name.trim()) {
+      setProductModalError('O nome do produto é obrigatório.');
+      productNameInputRef.current?.focus();
+      return;
+    }
 
     let caseSize: number | null = null;
     let casePrice: number | null = null;
@@ -948,15 +1111,98 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     const { sellsCase: _sellsCase, ...restForm } = productForm;
     const productToSave: Product = {
       ...restForm,
+      name: productForm.name.trim(),
       caseSize,
       casePrice,
       active: productForm.active !== false,
     };
     try {
       await api.saveProduct(productToSave);
-      setIsProductModalOpen(false);
+      if (mode === 'new') {
+        setEditingProduct(null);
+        setShowDiscardProductConfirm(false);
+        const nextBlankForm = {
+          id: `prod-${Date.now()}`,
+          name: '',
+          category: productForm.category,
+          volume: productForm.volume,
+          price: 0,
+          sellsCase: productForm.sellsCase,
+          caseSize: productForm.caseSize || 12,
+          casePrice: productForm.casePrice || 0,
+          costPrice: 0,
+          stock: 0,
+          minStock: productForm.minStock || 12,
+          isCold: productForm.isCold,
+          active: true,
+          image: productForm.image,
+          sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
+          description: '',
+        };
+        setProductForm(nextBlankForm);
+        setInitialProductFormSnapshot(JSON.stringify(nextBlankForm));
+        setProductModalSuccessNotice(`"${productToSave.name}" salvo! Cadastre o próximo produto.`);
+        window.setTimeout(() => {
+          productNameInputRef.current?.focus();
+        }, 40);
+      } else {
+        setShowDiscardProductConfirm(false);
+        setIsProductModalOpen(false);
+      }
     } catch (err: any) {
       setProductModalError(err?.message || 'Erro ao salvar produto.');
+    }
+  };
+
+  const handleSaveProduct = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await submitProductForm('close');
+  };
+
+  const handleProductFormKeyDown = (e: React.KeyboardEvent<HTMLFormElement>) => {
+    const combo = formatKeyboardEventCombo(e.nativeEvent);
+    const upperCombo = (combo || '').toUpperCase();
+    const saveKey = (activeShortcuts.saveProduct || 'Ctrl+S').toUpperCase();
+    const saveAndNewKey = (activeShortcuts.saveAndNewProduct || 'Ctrl+Enter').toUpperCase();
+
+    if (upperCombo === saveKey || e.key.toUpperCase() === 'F9') {
+      e.preventDefault();
+      e.stopPropagation();
+      submitProductForm('close');
+      return;
+    }
+
+    if (upperCombo === saveAndNewKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      submitProductForm('new');
+      return;
+    }
+
+    if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toUpperCase() || '';
+      if (tag === 'TEXTAREA' || tag === 'BUTTON') {
+        return;
+      }
+      if (tag === 'INPUT' || tag === 'SELECT') {
+        e.preventDefault();
+        const formEl = productFormRef.current;
+        if (!formEl) return;
+        const fields = Array.from(
+          formEl.querySelectorAll<HTMLElement>(
+            'input:not([type="hidden"]):not([type="file"]):not([disabled]), select:not([disabled]), textarea:not([disabled])'
+          )
+        ).filter((el) => el.offsetParent !== null);
+        const currentIndex = fields.indexOf(target!);
+        if (currentIndex >= 0 && currentIndex + 1 < fields.length) {
+          const nextField = fields[currentIndex + 1];
+          nextField.focus();
+          if (nextField instanceof HTMLInputElement && nextField.type !== 'checkbox') {
+            nextField.select();
+          }
+        }
+      }
     }
   };
 
@@ -1041,11 +1287,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   // PDV Actions
-  const getPosItemPrice = (product: Product, saleUnit: SaleUnit): number => {
-    if (saleUnit === 'case' && hasProductCase(product)) {
-      return Number(product.casePrice);
-    }
-    return getEffectiveProductPrice(product);
+  const getPosItemPrice = (product: Product, saleUnit: SaleUnit, addonsTotal: number = 0): number => {
+    const base =
+      saleUnit === 'case' && hasProductCase(product)
+        ? Number(product.casePrice)
+        : getEffectiveProductPrice(product);
+    return Math.round((base + (Number(addonsTotal) || 0)) * 100) / 100;
   };
 
   const getPosUnitsPerSale = (product: Product, saleUnit: SaleUnit): number => {
@@ -1055,42 +1302,90 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     return 1;
   };
 
-  const addToPosCart = (product: Product, saleUnit: SaleUnit = 'unit') => {
+  const appendPosCartLine = (
+    product: Product,
+    saleUnit: SaleUnit = 'unit',
+    qtyToAdd: number = 1,
+    addons?: OrderItemAddon[],
+    addonsTotal: number = 0
+  ) => {
     const actualUnit: SaleUnit = saleUnit === 'case' && hasProductCase(product) ? 'case' : 'unit';
     const unitsPerSale = getPosUnitsPerSale(product, actualUnit);
+    const sig = buildOrderItemAddonsSignature(addons);
+    const lineId = `${product.id}::${actualUnit}::${sig}`;
 
     setPosCart(prev => {
       const currentTotalUnits = prev
         .filter(item => item.product.id === product.id)
         .reduce((sum, item) => sum + item.quantity * getPosUnitsPerSale(item.product, item.saleUnit), 0);
 
-      if (currentTotalUnits + unitsPerSale > product.stock) {
+      const maxAddableQty = Math.floor(Math.max(0, product.stock - currentTotalUnits) / unitsPerSale);
+      if (maxAddableQty <= 0) {
         return prev;
       }
+      const effectiveAddQty = Math.min(qtyToAdd, maxAddableQty);
 
-      const existing = prev.find(item => item.product.id === product.id && item.saleUnit === actualUnit);
+      const existing = prev.find(item => item.lineId === lineId);
       if (existing) {
         return prev.map(item =>
-          item.product.id === product.id && item.saleUnit === actualUnit
-            ? { ...item, quantity: item.quantity + 1 }
+          item.lineId === lineId
+            ? { ...item, quantity: item.quantity + effectiveAddQty }
             : item
         );
       }
-      return [...prev, { product, quantity: 1, saleUnit: actualUnit }];
+      const isCombo = isComboProduct(product.id, settings);
+      const comboItems = isCombo
+        ? calculateComboMetrics(product, settings, products).orderComboItems
+        : undefined;
+
+      return [
+        ...prev,
+        {
+          lineId,
+          product,
+          quantity: effectiveAddQty,
+          saleUnit: actualUnit,
+          addons: addons && addons.length > 0 ? addons : undefined,
+          addonsTotal: addonsTotal > 0 ? addonsTotal : undefined,
+          comboItems: comboItems && comboItems.length > 0 ? comboItems : undefined,
+        },
+      ];
     });
   };
 
-  const removeFromPosCart = (productId: string, saleUnit: SaleUnit = 'unit') => {
+  const addToPosCart = (product: Product, saleUnit: SaleUnit = 'unit') => {
+    const actualUnit: SaleUnit = saleUnit === 'case' && hasProductCase(product) ? 'case' : 'unit';
+    const applicableAddonGroups = getProductAddonGroups(product, settings);
+    if (applicableAddonGroups.length > 0) {
+      setPosAddonModalState({ product, saleUnit: actualUnit });
+      return;
+    }
+    appendPosCartLine(product, actualUnit, 1);
+  };
+
+  const changePosCartLineQuantity = (lineId: string, delta: number) => {
     setPosCart(prev => {
-      const existing = prev.find(item => item.product.id === productId && item.saleUnit === saleUnit);
+      const existing = prev.find(item => item.lineId === lineId);
       if (!existing) return prev;
+
+      if (delta > 0) {
+        const unitsPerSale = getPosUnitsPerSale(existing.product, existing.saleUnit);
+        const currentTotalUnits = prev
+          .filter(item => item.product.id === existing.product.id)
+          .reduce((sum, item) => sum + item.quantity * getPosUnitsPerSale(item.product, item.saleUnit), 0);
+        if (currentTotalUnits + delta * unitsPerSale > existing.product.stock) {
+          return prev;
+        }
+        return prev.map(item =>
+          item.lineId === lineId ? { ...item, quantity: item.quantity + delta } : item
+        );
+      }
+
       const next =
-        existing.quantity <= 1
-          ? prev.filter(item => !(item.product.id === productId && item.saleUnit === saleUnit))
+        existing.quantity + delta <= 0
+          ? prev.filter(item => item.lineId !== lineId)
           : prev.map(item =>
-              item.product.id === productId && item.saleUnit === saleUnit
-                ? { ...item, quantity: item.quantity - 1 }
-                : item
+              item.lineId === lineId ? { ...item, quantity: item.quantity + delta } : item
             );
       if (next.length === 0) {
         setPosClientRequestId(crypto.randomUUID());
@@ -1100,7 +1395,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const posSubtotal = useMemo(() => {
-    return posCart.reduce((sum, item) => sum + getPosItemPrice(item.product, item.saleUnit) * item.quantity, 0);
+    return posCart.reduce(
+      (sum, item) =>
+        sum + getPosItemPrice(item.product, item.saleUnit, item.addonsTotal || 0) * item.quantity,
+      0
+    );
   }, [posCart]);
 
   const posHasCashTyped = posCashGiven.trim() !== '';
@@ -1137,18 +1436,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         items: posCart.map(i => {
           const isCase = i.saleUnit === 'case' && hasProductCase(i.product);
           const unitsPerSale = isCase ? Number(i.product.caseSize) : 1;
-          const unitPrice = getPosItemPrice(i.product, i.saleUnit);
+          const baseUnitPrice = isCase
+            ? Number(i.product.casePrice)
+            : getEffectiveProductPrice(i.product);
+          const unitPrice = getPosItemPrice(i.product, i.saleUnit, i.addonsTotal || 0);
           return {
             productId: i.product.id,
             name: i.product.name,
             volume: i.product.volume,
             price: unitPrice,
-            originalPrice: isCase ? unitPrice : i.product.price,
+            originalPrice: (isCase ? baseUnitPrice : i.product.price) + (i.addonsTotal || 0),
             costPrice: i.product.costPrice * unitsPerSale,
             quantity: i.quantity,
             saleUnit: isCase ? 'case' : 'unit',
             unitsPerSale,
             isCold: i.product.isCold,
+            addons: i.addons && i.addons.length > 0 ? i.addons : undefined,
+            addonsTotal: i.addonsTotal || undefined,
+            comboItems: i.comboItems && i.comboItems.length > 0 ? i.comboItems : undefined,
           };
         }),
         subtotal: posSubtotal,
@@ -1312,6 +1617,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     return () => window.removeEventListener('keydown', handleRecordKey, true);
   }, [recordingShortcutAction, settingsForm.shortcuts]);
 
+  const openNewProductRef = React.useRef(handleOpenNewProduct);
+  openNewProductRef.current = handleOpenNewProduct;
+  const requestCloseProductModalRef = React.useRef(handleRequestCloseProductModal);
+  requestCloseProductModalRef.current = handleRequestCloseProductModal;
+  const submitProductFormRef = React.useRef(submitProductForm);
+  submitProductFormRef.current = submitProductForm;
+
   // Desktop Keyboard Shortcuts Listener (/control-panel)
   useEffect(() => {
     if (recordingShortcutAction) return;
@@ -1331,6 +1643,33 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       const finalizarKey = (activeShortcuts.finalizar || 'F9').toUpperCase();
       const buscaKey = (activeShortcuts.busca || '/').toUpperCase();
       const fecharKey = (activeShortcuts.fecharModal || 'Escape').toUpperCase();
+      const newProductKey = (activeShortcuts.newProduct || 'F6').toUpperCase();
+      const saveProductKey = (activeShortcuts.saveProduct || 'Ctrl+S').toUpperCase();
+      const saveAndNewKey = (activeShortcuts.saveAndNewProduct || 'Ctrl+Enter').toUpperCase();
+
+      // If Product Modal is open, handle Ctrl+S / F9 / Ctrl+Enter / Esc directly
+      if (isProductModalOpen) {
+        if (upperCombo === saveProductKey || e.key.toUpperCase() === 'F9') {
+          e.preventDefault();
+          e.stopPropagation();
+          submitProductFormRef.current('close');
+          return;
+        }
+        if (upperCombo === saveAndNewKey) {
+          e.preventDefault();
+          e.stopPropagation();
+          submitProductFormRef.current('new');
+          return;
+        }
+        const isFecharModal =
+          upperCombo === fecharKey || (fecharKey === 'ESC' && e.key === 'Escape');
+        if (isFecharModal) {
+          e.preventDefault();
+          e.stopPropagation();
+          requestCloseProductModalRef.current();
+          return;
+        }
+      }
 
       const target = e.target as HTMLElement | null;
       const tagName = target?.tagName?.toUpperCase() || '';
@@ -1340,22 +1679,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         tagName === 'SELECT' ||
         Boolean(target?.isContentEditable);
 
-      // Always preventDefault on F2, F3, F4, F8, F9 (and configured action equivalents when triggered)
-      if (['F2', 'F3', 'F4', 'F8', 'F9'].includes(e.key.toUpperCase())) {
+      // Always preventDefault on F2, F3, F4, F6, F8, F9 (and configured action equivalents when triggered)
+      if (['F2', 'F3', 'F4', 'F6', 'F8', 'F9'].includes(e.key.toUpperCase())) {
         e.preventDefault();
       }
 
       const isPdvShortcut = upperCombo === pdvKey;
       const isFinalizarShortcut = upperCombo === finalizarKey;
+      const isNewProductShortcut = upperCombo === newProductKey;
       const isFecharShortcut =
         upperCombo === fecharKey || (fecharKey === 'ESC' && e.key === 'Escape');
 
-      // Rule 3b: Do not fire shortcuts when cursor is inside a text field (input, textarea, select), EXCEPT F2 (pdv), F9 (finalizar), and Esc (fecharModal)
+      // Rule 3b: Do not fire shortcuts when cursor is inside a text field (input, textarea, select), EXCEPT F2 (pdv), F6 (newProduct), F9 (finalizar), and Esc (fecharModal)
       const allowedInInput =
         isPdvShortcut ||
         isFinalizarShortcut ||
+        isNewProductShortcut ||
         isFecharShortcut ||
         e.key.toUpperCase() === 'F2' ||
+        e.key.toUpperCase() === 'F6' ||
         e.key.toUpperCase() === 'F9' ||
         e.key === 'Escape';
 
@@ -1417,7 +1759,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         }
         if (isProductModalOpen) {
           e.preventDefault();
-          setIsProductModalOpen(false);
+          requestCloseProductModalRef.current();
           return;
         }
         if (isAreaModalOpen) {
@@ -1430,6 +1772,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           setIsImportModalOpen(false);
           return;
         }
+        return;
+      }
+
+      if (isNewProductShortcut) {
+        e.preventDefault();
+        setActiveTab('estoque');
+        openNewProductRef.current();
         return;
       }
 
@@ -2024,7 +2373,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           const isCase = it.saleUnit === 'case';
                           const wasPromo = !isCase && it.originalPrice !== undefined && it.originalPrice > it.price;
                           return (
-                            <div key={idx} className="flex justify-between items-center py-1 border-b border-neutral-100 last:border-0">
+                            <div key={idx} className="flex justify-between items-start py-1 border-b border-neutral-100 last:border-0">
                               <div>
                                 {isCase ? (
                                   <>
@@ -2048,8 +2397,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                     PROMO ({formatCurrency(it.price)} un)
                                   </span>
                                 )}
+                                {it.comboItems && it.comboItems.length > 0 && (
+                                  <div className="mt-0.5 space-y-0.5 pl-2">
+                                    {it.comboItems.map((ci, cIdx) => (
+                                      <p key={cIdx} className="text-[11px] font-semibold text-neutral-600">
+                                        {formatOrderItemComboLine(ci)}
+                                      </p>
+                                    ))}
+                                  </div>
+                                )}
+                                {it.addons && it.addons.length > 0 && (
+                                  <div className="mt-0.5 space-y-0.5 pl-2">
+                                    {it.addons.map((addon, aIdx) => (
+                                      <p key={aIdx} className="text-[11px] font-semibold text-neutral-600">
+                                        {formatOrderItemAddonLine(addon)}
+                                      </p>
+                                    ))}
+                                  </div>
+                                )}
                               </div>
-                              <div className="text-right">
+                              <div className="text-right shrink-0">
                                 {wasPromo && it.originalPrice && (
                                   <span className="text-[10px] text-neutral-400 line-through mr-1.5">
                                     {formatCurrency(it.originalPrice * it.quantity)}
@@ -2773,109 +3140,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           </div>
 
-          {/* Ordem de preferência na loja block */}
-          <div className="bg-white p-5 rounded-3xl border border-amber-200 shadow-xs space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <ArrowUp className="w-5 h-5 text-amber-600" />
-                <h3 className="font-black text-sm sm:text-base text-neutral-900">
-                  Ordem de preferência na loja ({featuredProductsList.length}/50)
-                </h3>
-              </div>
-              <span className="text-xs text-neutral-500">
-                Esses produtos aparecem antes dos outros na loja, na busca e na categoria deles
-              </span>
-            </div>
-
-            {featuredProductsList.length === 0 ? (
-              <div className="p-4 rounded-2xl bg-amber-50/50 border border-dashed border-amber-200 text-xs text-neutral-500 text-center">
-                Nenhum produto na ordem de preferência. Clique em <strong>"Mostrar primeiro"</strong> em qualquer produto abaixo para que ele apareça antes dos outros.
-              </div>
-            ) : (
-              <div className="divide-y divide-neutral-100 border border-neutral-200 rounded-2xl overflow-hidden">
-                {featuredProductsList.map((fp, idx) => {
-                  const isHiddenByStock = !settings.showOutOfStock && fp.stock < 1;
-                  return (
-                    <div
-                      key={`featured-admin-${fp.id}`}
-                      className="p-3 bg-white hover:bg-neutral-50 flex items-center justify-between gap-3 text-xs"
-                    >
-                      <div className="flex items-center gap-3 min-w-0">
-                        <span className="w-6 h-6 rounded-lg bg-amber-500 text-neutral-950 font-black flex items-center justify-center shrink-0">
-                          {idx + 1}º
-                        </span>
-                        {fp.image ? (
-                          <img
-                            src={fp.image}
-                            alt={fp.name}
-                            className="w-9 h-9 rounded-lg object-cover border border-neutral-200 shrink-0"
-                          />
-                        ) : (
-                          <div className="w-9 h-9 rounded-lg bg-neutral-100 flex items-center justify-center text-neutral-400 shrink-0">
-                            <Package className="w-4 h-4" />
-                          </div>
-                        )}
-                        <div className="min-w-0">
-                          <div className="font-bold text-neutral-900 truncate flex items-center gap-1.5 flex-wrap">
-                            <span>{fp.name}</span>
-                            <span className="px-1.5 py-0.5 rounded bg-neutral-100 border border-neutral-200 text-neutral-600 text-[10px] font-bold">
-                              {formatCategoryLabel(fp.category)}
-                            </span>
-                            {!fp.active && (
-                              <span className="px-1.5 py-0.5 rounded bg-neutral-200 text-neutral-700 text-[10px] font-bold">
-                                Oculto da loja
-                              </span>
-                            )}
-                            {fp.active && isHiddenByStock && (
-                              <span className="px-1.5 py-0.5 rounded bg-red-100 text-red-700 text-[10px] font-bold">
-                                Esgotado (oculto na loja)
-                              </span>
-                            )}
-                          </div>
-                          <span className="text-[11px] text-neutral-500">
-                            {fp.volume} • {formatCurrency(getEffectiveProductPrice(fp))} • Estoque: {fp.stock} un
-                          </span>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          type="button"
-                          disabled={idx === 0}
-                          onClick={() => handleMoveFeaturedProduct(idx, -1)}
-                          className="w-7 h-7 rounded-lg bg-neutral-100 hover:bg-neutral-200 disabled:opacity-40 text-neutral-800 font-black flex items-center justify-center cursor-pointer"
-                          title="Subir posição (↑)"
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          disabled={idx === featuredProductsList.length - 1}
-                          onClick={() => handleMoveFeaturedProduct(idx, 1)}
-                          className="w-7 h-7 rounded-lg bg-neutral-100 hover:bg-neutral-200 disabled:opacity-40 text-neutral-800 font-black flex items-center justify-center cursor-pointer"
-                          title="Descer posição (↓)"
-                        >
-                          ↓
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveFeaturedProduct(fp.id)}
-                          className="w-7 h-7 rounded-lg bg-red-50 hover:bg-red-100 text-red-700 font-black flex items-center justify-center cursor-pointer ml-1"
-                          title="Remover da ordem de preferência (✕)"
-                        >
-                          ✕
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+          {/* Categorias, Combos, Ordem de Preferência e Organizar Loja (@dnd-kit) */}
+          <StoreOrganizationSection
+            products={products}
+            settings={settings}
+            onSettingsUpdated={(next) => setSettingsForm((prev) => ({ ...prev, ...next }))}
+            externalEditingComboId={editingComboIdForModal}
+            onClearExternalEditingComboId={() => setEditingComboIdForModal(null)}
+          />
 
           <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
-            <div className="flex items-center gap-2 w-full sm:max-w-md">
-              <div className="relative flex-1">
+            <div className="flex flex-wrap items-center gap-2 w-full sm:max-w-xl">
+              <div className="relative flex-1 min-w-[180px]">
                 <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
                 <input
                   type="text"
@@ -2885,6 +3161,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   onChange={(e) => setStockSearch(e.target.value)}
                   className="w-full pl-9 pr-3 py-2.5 bg-white border border-neutral-200 rounded-xl text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
                 />
+              </div>
+
+              <div className="flex items-center gap-1.5 bg-white px-3 py-2 rounded-xl border border-neutral-200 text-xs">
+                <span className="font-bold text-neutral-500 whitespace-nowrap">Ordenar por:</span>
+                <select
+                  value={stockSortBy}
+                  onChange={(e) => setStockSortBy(e.target.value as 'az' | 'price' | 'stock' | 'category')}
+                  className="bg-transparent font-bold text-neutral-900 focus:outline-none cursor-pointer"
+                >
+                  <option value="az">Nome A–Z</option>
+                  <option value="price">Preço</option>
+                  <option value="stock">Estoque</option>
+                  <option value="category">Categoria</option>
+                </select>
               </div>
 
               <button
@@ -2915,7 +3205,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs shadow-xs transition-colors cursor-pointer"
               >
                 <Plus className="w-4 h-4" />
-                <span>Novo Produto</span>
+                <span>Novo Produto ({formatShortcutDisplay(activeShortcuts.newProduct || 'F6')})</span>
               </button>
             </div>
           </div>
@@ -2923,19 +3213,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <div className="flex items-center gap-2 overflow-x-auto pb-2 scrollbar-none">
             {[
               { id: 'todas', label: 'Todas as Categorias' },
-              { id: 'cervejas', label: 'Cervejas' },
-              { id: 'destilados', label: 'Destilados' },
-              { id: 'nao_alcoolicos', label: 'Não Alcoólicos' },
-              { id: 'vinhos', label: 'Vinhos' },
-              { id: 'gelo_carvao', label: 'Gelo & Carvão' },
-              { id: 'petiscos', label: 'Petiscos' },
-              ...customCategories.map((c) => ({ id: c, label: c })),
-            ].map(cat => (
+              ...storeCategories.map((c) => ({ id: c.id, label: c.name })),
+              ...(hasUnlistedCategoryProducts ? [{ id: 'outros', label: 'Outros' }] : []),
+            ].map((cat) => (
               <button
                 key={cat.id}
-                onClick={() => setStockCategoryFilter(cat.id as ProductCategory | 'todas')}
+                onClick={() => setStockCategoryFilter(cat.id as ProductCategory | 'todas' | 'outros')}
                 className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors whitespace-nowrap ${
-                  stockCategoryFilter === cat.id ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-600 hover:bg-neutral-100 border border-neutral-200'
+                  stockCategoryFilter === cat.id
+                    ? 'bg-neutral-900 text-white'
+                    : 'bg-white text-neutral-600 hover:bg-neutral-100 border border-neutral-200'
                 }`}
               >
                 {cat.label}
@@ -2969,11 +3256,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </tr>
                   ) : (
                     filteredProducts.map(p => {
-                    const isLow = p.stock <= p.minStock;
+                    const isCombo = isComboProduct(p.id, settings);
+                    const comboMetrics = isCombo ? calculateComboMetrics(p, settings, products) : null;
+                    const displayStock = comboMetrics ? comboMetrics.availableStock : p.stock;
+                    const isLow = isCombo ? displayStock <= 0 : p.stock <= p.minStock;
                     const promoActive = isProductPromoActive(p);
                     const effectivePrice = getEffectiveProductPrice(p);
-                    const margin = effectivePrice > 0 ? ((effectivePrice - p.costPrice) / effectivePrice) * 100 : 0;
-                    const sellsCase = hasProductCase(p);
+                    const displayCostPrice = comboMetrics ? comboMetrics.costPrice : p.costPrice;
+                    const margin = comboMetrics
+                      ? comboMetrics.marginPercent
+                      : effectivePrice > 0
+                      ? ((effectivePrice - p.costPrice) / effectivePrice) * 100
+                      : 0;
+                    const sellsCase = !isCombo && hasProductCase(p);
                     const rowUnit: SaleUnit = sellsCase && stockRowUnits[p.id] === 'case' ? 'case' : 'unit';
 
                     return (
@@ -2994,6 +3289,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             <div>
                               <div className="flex items-center gap-2 flex-wrap">
                                 <span className="font-bold text-neutral-900 text-sm">{p.name}</span>
+                                {isCombo && (
+                                  <span className="px-1.5 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 text-[10px] font-black rounded uppercase tracking-wider">
+                                    Combo
+                                  </span>
+                                )}
                                 {promoActive && (
                                   <span className="px-1.5 py-0.5 bg-red-600 text-white text-[10px] font-black rounded uppercase tracking-wider">
                                     PROMO
@@ -3006,16 +3306,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                 )}
                               </div>
                               <div className="text-[11px] text-neutral-500">
-                                {p.volume} {p.isCold ? '• Gelada ❄️' : ''}
+                                {isCombo && comboMetrics?.itemsSummaryText
+                                  ? comboMetrics.itemsSummaryText
+                                  : `${p.volume} ${p.isCold ? '• Gelada ❄️' : ''}`}
                               </div>
                             </div>
                           </div>
                         </td>
                         <td className="py-3 px-4">
-                          <span className="font-semibold text-neutral-800 capitalize block">{p.category}</span>
+                          <span className="font-semibold text-neutral-800 block">
+                            {storeCategoryIdSet.has(p.category)
+                              ? getCategoryDisplayName(p.category, settings, products)
+                              : 'Outros'}
+                          </span>
                           <span className="text-[10px] font-mono text-neutral-400">{p.sku}</span>
                         </td>
-                        <td className="py-3 px-4 font-mono text-neutral-600">{formatCurrency(p.costPrice)}</td>
+                        <td className="py-3 px-4 font-mono text-neutral-600">
+                          {formatCurrency(displayCostPrice)}
+                        </td>
                         <td className="py-3 px-4 font-mono">
                           {promoActive ? (
                             <div>
@@ -3045,130 +3353,146 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <td className="py-3 px-4">
                           <div className="flex flex-col gap-0.5">
                             <div className="flex items-center gap-2">
-                              <span className={`font-black text-sm ${isLow ? 'text-red-600' : 'text-neutral-900'}`}>
-                                {formatStockWithCases(p.stock, p.caseSize)}
-                              </span>
-                              {isLow && (
-                                <span className="px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded">
-                                  Baixo (Min: {p.minStock})
+                              {isCombo ? (
+                                <span className={`font-black text-sm ${displayStock <= 0 ? 'text-red-600' : 'text-neutral-900'}`}>
+                                  Disponível: {displayStock}
                                 </span>
+                              ) : (
+                                <>
+                                  <span className={`font-black text-sm ${isLow ? 'text-red-600' : 'text-neutral-900'}`}>
+                                    {formatStockWithCases(p.stock, p.caseSize)}
+                                  </span>
+                                  {isLow && (
+                                    <span className="px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded">
+                                      Baixo (Min: {p.minStock})
+                                    </span>
+                                  )}
+                                </>
                               )}
                             </div>
                           </div>
                         </td>
                         <td className="py-3 px-4">
-                          <div className="flex flex-col items-center gap-1.5">
-                            {sellsCase && (
-                              <div className="inline-flex bg-neutral-100 p-0.5 rounded-lg border border-neutral-200 text-[10px]">
+                          {isCombo ? (
+                            <div className="flex items-center justify-center">
+                              <span className="px-2.5 py-1 rounded-lg bg-neutral-100 border border-neutral-200 text-neutral-500 text-[10px] font-bold">
+                                Estoque dos itens
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="flex flex-col items-center gap-1.5">
+                              {sellsCase && (
+                                <div className="inline-flex bg-neutral-100 p-0.5 rounded-lg border border-neutral-200 text-[10px]">
+                                  <button
+                                    type="button"
+                                    onClick={() => setStockRowUnits(prev => ({ ...prev, [p.id]: 'unit' }))}
+                                    className={`px-2 py-0.5 rounded-md font-bold transition-colors cursor-pointer ${
+                                      rowUnit === 'unit'
+                                        ? 'bg-white text-neutral-900 shadow-2xs'
+                                        : 'text-neutral-500 hover:text-neutral-800'
+                                    }`}
+                                  >
+                                    Unidades
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setStockRowUnits(prev => ({ ...prev, [p.id]: 'case' }))}
+                                    className={`px-2 py-0.5 rounded-md font-bold transition-colors cursor-pointer ${
+                                      rowUnit === 'case'
+                                        ? 'bg-amber-500 text-neutral-950 shadow-2xs'
+                                        : 'text-neutral-500 hover:text-neutral-800'
+                                    }`}
+                                  >
+                                    Caixas (c/{p.caseSize})
+                                  </button>
+                                </div>
+                              )}
+                              <div className="flex items-center justify-center gap-1">
+                                {rowUnit === 'case' ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleAdjustStock(p.id, -5, 'case')}
+                                      className="px-1.5 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
+                                      title={`Remover 5 caixas (${5 * (p.caseSize || 1)} un)`}
+                                    >
+                                      -5cx
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleAdjustStock(p.id, -1, 'case')}
+                                      className="px-1.5 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
+                                      title={`Remover 1 caixa (${p.caseSize} un)`}
+                                    >
+                                      -1cx
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleAdjustStock(p.id, 1, 'case')}
+                                      className="px-1.5 h-6 bg-amber-100 hover:bg-amber-200 text-amber-900 rounded font-bold text-[10px] cursor-pointer"
+                                      title={`Adicionar 1 caixa (${p.caseSize} un)`}
+                                    >
+                                      +1cx
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleAdjustStock(p.id, 5, 'case')}
+                                      className="px-1.5 h-6 bg-amber-500 hover:bg-amber-600 text-white rounded font-bold text-[10px] cursor-pointer"
+                                      title={`Adicionar 5 caixas (${5 * (p.caseSize || 1)} un)`}
+                                    >
+                                      +5cx
+                                    </button>
+                                  </>
+                                ) : (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleAdjustStock(p.id, -10, 'unit')}
+                                      className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
+                                    >
+                                      -10
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleAdjustStock(p.id, -1, 'unit')}
+                                      className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-xs cursor-pointer"
+                                    >
+                                      -1
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleAdjustStock(p.id, 1, 'unit')}
+                                      className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-xs cursor-pointer"
+                                    >
+                                      +1
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleAdjustStock(p.id, 10, 'unit')}
+                                      className="w-6 h-6 bg-amber-500 hover:bg-amber-600 text-white rounded font-bold text-[10px] cursor-pointer"
+                                    >
+                                      +10
+                                    </button>
+                                  </>
+                                )}
                                 <button
                                   type="button"
-                                  onClick={() => setStockRowUnits(prev => ({ ...prev, [p.id]: 'unit' }))}
-                                  className={`px-2 py-0.5 rounded-md font-bold transition-colors cursor-pointer ${
-                                    rowUnit === 'unit'
-                                      ? 'bg-white text-neutral-900 shadow-2xs'
-                                      : 'text-neutral-500 hover:text-neutral-800'
-                                  }`}
+                                  onClick={() =>
+                                    setStockAdjustModal({
+                                      product: p,
+                                      unit: rowUnit,
+                                      mode: 'add',
+                                      quantity: '1',
+                                    })
+                                  }
+                                  className="px-2 h-6 bg-neutral-900 hover:bg-neutral-800 text-white rounded font-bold text-[10px] cursor-pointer ml-0.5"
+                                  title="Digitar quantidade personalizada em unidades ou caixas"
                                 >
-                                  Unidades
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => setStockRowUnits(prev => ({ ...prev, [p.id]: 'case' }))}
-                                  className={`px-2 py-0.5 rounded-md font-bold transition-colors cursor-pointer ${
-                                    rowUnit === 'case'
-                                      ? 'bg-amber-500 text-neutral-950 shadow-2xs'
-                                      : 'text-neutral-500 hover:text-neutral-800'
-                                  }`}
-                                >
-                                  Caixas (c/{p.caseSize})
+                                  Digitar
                                 </button>
                               </div>
-                            )}
-                            <div className="flex items-center justify-center gap-1">
-                              {rowUnit === 'case' ? (
-                                <>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAdjustStock(p.id, -5, 'case')}
-                                    className="px-1.5 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
-                                    title={`Remover 5 caixas (${5 * (p.caseSize || 1)} un)`}
-                                  >
-                                    -5cx
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAdjustStock(p.id, -1, 'case')}
-                                    className="px-1.5 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
-                                    title={`Remover 1 caixa (${p.caseSize} un)`}
-                                  >
-                                    -1cx
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAdjustStock(p.id, 1, 'case')}
-                                    className="px-1.5 h-6 bg-amber-100 hover:bg-amber-200 text-amber-900 rounded font-bold text-[10px] cursor-pointer"
-                                    title={`Adicionar 1 caixa (${p.caseSize} un)`}
-                                  >
-                                    +1cx
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAdjustStock(p.id, 5, 'case')}
-                                    className="px-1.5 h-6 bg-amber-500 hover:bg-amber-600 text-white rounded font-bold text-[10px] cursor-pointer"
-                                    title={`Adicionar 5 caixas (${5 * (p.caseSize || 1)} un)`}
-                                  >
-                                    +5cx
-                                  </button>
-                                </>
-                              ) : (
-                                <>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAdjustStock(p.id, -10, 'unit')}
-                                    className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
-                                  >
-                                    -10
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAdjustStock(p.id, -1, 'unit')}
-                                    className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-xs cursor-pointer"
-                                  >
-                                    -1
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAdjustStock(p.id, 1, 'unit')}
-                                    className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-xs cursor-pointer"
-                                  >
-                                    +1
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAdjustStock(p.id, 10, 'unit')}
-                                    className="w-6 h-6 bg-amber-500 hover:bg-amber-600 text-white rounded font-bold text-[10px] cursor-pointer"
-                                  >
-                                    +10
-                                  </button>
-                                </>
-                              )}
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setStockAdjustModal({
-                                    product: p,
-                                    unit: rowUnit,
-                                    mode: 'add',
-                                    quantity: '1',
-                                  })
-                                }
-                                className="px-2 h-6 bg-neutral-900 hover:bg-neutral-800 text-white rounded font-bold text-[10px] cursor-pointer ml-0.5"
-                                title="Digitar quantidade personalizada em unidades ou caixas"
-                              >
-                                Digitar
-                              </button>
                             </div>
-                          </div>
+                          )}
                         </td>
                         <td className="py-3 px-4 text-right">
                           <div className="flex items-center justify-end gap-1.5 flex-wrap">
@@ -3218,17 +3542,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               )}
                             </button>
 
+                            {!isCombo && (
+                              <button
+                                type="button"
+                                onClick={() => handleDuplicateProduct(p)}
+                                className="px-2 py-1 text-neutral-600 hover:text-neutral-900 bg-white hover:bg-neutral-100 border border-neutral-200 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 transition-colors cursor-pointer"
+                                title="Duplicar produto"
+                              >
+                                <Copy className="w-3.5 h-3.5 text-neutral-500" />
+                                <span>Duplicar</span>
+                              </button>
+                            )}
+
                             <button
                               onClick={() => handleOpenEditProduct(p)}
                               className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 rounded-lg transition-colors"
-                              title="Editar produto"
+                              title={isCombo ? 'Editar combo' : 'Editar produto'}
                             >
                               <Edit2 className="w-3.5 h-3.5" />
                             </button>
                             <button
                               onClick={() => handleDeleteProduct(p.id)}
                               className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                              title="Excluir produto"
+                              title={isCombo ? 'Excluir combo' : 'Excluir produto'}
                             >
                               <Trash2 className="w-3.5 h-3.5" />
                             </button>
@@ -3411,17 +3747,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 className="px-3 py-2.5 bg-white border border-neutral-200 rounded-xl text-xs font-bold"
               >
                 <option value="todas">Todas Categorias</option>
-                <option value="cervejas">Cervejas</option>
-                <option value="destilados">Destilados</option>
-                <option value="nao_alcoolicos">Não Alcoólicos</option>
-                <option value="vinhos">Vinhos</option>
-                <option value="gelo_carvao">Gelo & Carvão</option>
-                <option value="petiscos">Petiscos</option>
-                {customCategories.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
+                {storeCategories.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
                   </option>
                 ))}
+                {hasUnlistedCategoryProducts && (
+                  <option value="outros">Outros</option>
+                )}
               </select>
             </div>
 
@@ -3433,18 +3766,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <p className="text-xs text-neutral-400 mt-1">Cadastre seus produtos na aba "Estoque" para realizar vendas no balcão.</p>
                 </div>
               ) : (
-                sortProductsByPreference(
-                  products.filter(p => {
-                    if (posCategory !== 'todas' && p.category !== posCategory) return false;
+                sortProductsForStore(
+                  products.filter((p) => {
+                    if (posCategory === 'outros') {
+                      if (storeCategoryIdSet.has(p.category)) return false;
+                    } else if (posCategory !== 'todas' && p.category !== posCategory) {
+                      return false;
+                    }
                     if (posSearch.trim()) {
                       const q = posSearch.toLowerCase();
-                      return p.name.toLowerCase().includes(q) || p.volume.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q);
+                      return (
+                        p.name.toLowerCase().includes(q) ||
+                        p.volume.toLowerCase().includes(q) ||
+                        p.sku.toLowerCase().includes(q)
+                      );
                     }
                     return true;
                   }),
-                  validFeaturedIds
+                  settings,
+                  products
                 ).map(product => {
-                    const sellsCase = hasProductCase(product);
+                    const isCombo = isComboProduct(product.id, settings);
+                    const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
+                    const sellsCase = !isCombo && hasProductCase(product);
                     const hasCaseStock = sellsCase && product.stock >= (product.caseSize || 2);
                     const selectedUnit: SaleUnit =
                       sellsCase && posSelectedUnits[product.id] === 'case' && hasCaseStock ? 'case' : 'unit';
@@ -3470,19 +3814,33 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       >
                         <div>
                           <div className="flex justify-between items-start gap-1">
-                            <span className="text-[10px] font-bold text-neutral-400 uppercase">{product.volume}</span>
+                            <span className="text-[10px] font-bold text-neutral-400 uppercase">
+                              {isCombo ? 'COMBO' : product.volume}
+                            </span>
                             <div className="flex items-center gap-1">
+                              {isCombo && (
+                                <span className="text-[9px] font-black px-1.5 py-0.2 rounded bg-amber-100 text-amber-900 border border-amber-300 uppercase">
+                                  Combo
+                                </span>
+                              )}
                               {promoActive && selectedUnit === 'unit' && (
                                 <span className="text-[9px] font-black px-1.5 py-0.2 rounded bg-red-600 text-white uppercase">
                                   PROMO
                                 </span>
                               )}
                               <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-neutral-100 text-neutral-600">
-                                Est: {formatStockWithCases(product.stock, product.caseSize)}
+                                {isCombo
+                                  ? `Disponível: ${product.stock}`
+                                  : `Est: ${formatStockWithCases(product.stock, product.caseSize)}`}
                               </span>
                             </div>
                           </div>
                           <h4 className="font-bold text-xs text-neutral-900 mt-1 line-clamp-2">{product.name}</h4>
+                          {isCombo && comboMetrics?.itemsSummaryText && (
+                            <p className="text-[10px] text-neutral-500 mt-0.5 line-clamp-2">
+                              {comboMetrics.itemsSummaryText}
+                            </p>
+                          )}
 
                           {sellsCase && (
                             <div className="mt-2 space-y-1">
@@ -3595,16 +3953,34 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 ) : (
                   posCart.map(item => {
                     const isCase = item.saleUnit === 'case' && hasProductCase(item.product);
-                    const effPrice = getPosItemPrice(item.product, item.saleUnit);
+                    const effPrice = getPosItemPrice(item.product, item.saleUnit, item.addonsTotal || 0);
                     return (
-                      <div key={`${item.product.id}-${item.saleUnit}`} className="flex items-center justify-between gap-2 p-2 bg-neutral-50 rounded-xl text-xs">
-                        <div className="flex-1 min-w-0 truncate">
+                      <div key={item.lineId} className="flex items-start justify-between gap-2 p-2 bg-neutral-50 rounded-xl text-xs">
+                        <div className="flex-1 min-w-0">
                           <div className="font-bold text-neutral-900 truncate">
                             {isCase
                               ? `${item.product.name} — Caixa c/${item.product.caseSize}`
                               : item.product.name}
                           </div>
-                          <div className="text-[10px] text-neutral-500">
+                          {item.comboItems && item.comboItems.length > 0 && (
+                            <div className="mt-0.5 space-y-0.5">
+                              {item.comboItems.map((ci, cIdx) => (
+                                <p key={cIdx} className="text-[10px] font-semibold text-neutral-600">
+                                  {formatOrderItemComboLine(ci)}
+                                </p>
+                              ))}
+                            </div>
+                          )}
+                          {item.addons && item.addons.length > 0 && (
+                            <div className="mt-0.5 space-y-0.5">
+                              {item.addons.map((addon, aIdx) => (
+                                <p key={aIdx} className="text-[10px] font-semibold text-neutral-600">
+                                  {formatOrderItemAddonLine(addon)}
+                                </p>
+                              ))}
+                            </div>
+                          )}
+                          <div className="text-[10px] text-neutral-500 mt-0.5">
                             {formatCurrency(effPrice)} {isCase ? `cx (${item.quantity * (item.product.caseSize || 1)} un)` : 'un'}
                           </div>
                         </div>
@@ -3612,7 +3988,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <div className="flex items-center gap-1 shrink-0">
                           <button
                             type="button"
-                            onClick={() => removeFromPosCart(item.product.id, item.saleUnit)}
+                            onClick={() => changePosCartLineQuantity(item.lineId, -1)}
                             className="w-10 h-10 min-w-[40px] min-h-[40px] sm:w-7 sm:h-7 sm:min-w-[28px] sm:min-h-[28px] shrink-0 flex items-center justify-center bg-white border border-neutral-200 rounded-lg text-neutral-700 hover:bg-neutral-200 font-black text-sm sm:text-xs"
                           >
                             -
@@ -3620,7 +3996,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           <span className="w-6 text-center font-black">{item.quantity}</span>
                           <button
                             type="button"
-                            onClick={() => addToPosCart(item.product, item.saleUnit)}
+                            onClick={() => changePosCartLineQuantity(item.lineId, 1)}
                             className="w-10 h-10 min-w-[40px] min-h-[40px] sm:w-7 sm:h-7 sm:min-w-[28px] sm:min-h-[28px] shrink-0 flex items-center justify-center bg-white border border-neutral-200 rounded-lg text-neutral-700 hover:bg-neutral-200 font-black text-sm sm:text-xs"
                           >
                             +
@@ -4169,9 +4545,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
             </div>
 
-            {/* EXIBIÇÃO DE ESTOQUE NA LOJA */}
-            <div className="pt-4 border-t border-neutral-100">
-              <h4 className="font-black text-sm text-neutral-900 mb-2">Vitrine & Estoque na Loja Online</h4>
+            {/* EXIBIÇÃO DE ESTOQUE & ORDEM DOS PRODUTOS NA LOJA */}
+            <div className="pt-4 border-t border-neutral-100 space-y-3">
+              <h4 className="font-black text-sm text-neutral-900">Vitrine & Estoque na Loja Online</h4>
               <label className="flex items-center justify-between gap-4 p-4 rounded-2xl bg-neutral-50 border border-neutral-200 cursor-pointer">
                 <div>
                   <span className="font-bold text-xs sm:text-sm text-neutral-900 block">
@@ -4193,6 +4569,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   className="w-5 h-5 rounded text-amber-500 focus:ring-amber-500 shrink-0 cursor-pointer"
                 />
               </label>
+
+              <div className="p-4 rounded-2xl bg-neutral-50 border border-neutral-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                <div>
+                  <label className="font-bold text-xs sm:text-sm text-neutral-900 block">
+                    Ordem dos produtos na loja
+                  </label>
+                  <span className="text-[11px] text-neutral-500 block mt-0.5">
+                    Produtos marcados como "Mostrar primeiro" aparecem no topo, seguidos desta ordenação (preço considera promoção ativa).
+                  </span>
+                </div>
+                <select
+                  value={settingsForm.productSortMode || 'manual'}
+                  onChange={(e) =>
+                    setSettingsForm({
+                      ...settingsForm,
+                      productSortMode: e.target.value as ProductSortMode,
+                    })
+                  }
+                  className="px-3 py-2 bg-white border border-neutral-300 rounded-xl font-bold text-neutral-900 shrink-0"
+                >
+                  <option value="manual">Manual (arrastar)</option>
+                  <option value="az">Ordem alfabética (A–Z)</option>
+                  <option value="price_asc">Menor preço primeiro</option>
+                  <option value="price_desc">Maior preço primeiro</option>
+                </select>
+              </div>
             </div>
 
             {/* ATALHOS DO TECLADO (DESKTOP) */}
@@ -4411,14 +4813,58 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 {editingProduct ? 'Editar Bebida / Produto' : 'Cadastrar Nova Bebida'}
               </h3>
               <button
-                onClick={() => setIsProductModalOpen(false)}
-                className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400"
+                type="button"
+                onClick={handleRequestCloseProductModal}
+                className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <form onSubmit={handleSaveProduct} className="p-6 space-y-4 text-xs">
+            <form
+              ref={productFormRef}
+              onSubmit={handleSaveProduct}
+              onKeyDown={handleProductFormKeyDown}
+              className="p-6 space-y-4 text-xs"
+            >
+              {showDiscardProductConfirm && (
+                <div className="p-4 rounded-2xl bg-amber-50 border border-amber-300 text-amber-950 space-y-3">
+                  <div className="flex items-center gap-2 font-black text-xs">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>Descartar alterações?</span>
+                  </div>
+                  <p className="text-[11px] text-amber-900 font-medium">
+                    Você alterou os dados deste produto. Se fechar agora, as alterações não salvas serão perdidas.
+                  </p>
+                  <div className="flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowDiscardProductConfirm(false)}
+                      className="px-3 py-1.5 rounded-xl bg-white hover:bg-neutral-100 text-neutral-800 border border-neutral-300 font-bold text-xs cursor-pointer"
+                    >
+                      Continuar editando
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowDiscardProductConfirm(false);
+                        setIsProductModalOpen(false);
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-black text-xs cursor-pointer"
+                    >
+                      Descartar
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {productModalSuccessNotice && (
+                <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 font-bold text-xs flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>{productModalSuccessNotice}</span>
+                </div>
+              )}
+
               {productModalError && (
                 <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 font-bold text-xs">
                   {productModalError}
@@ -4428,6 +4874,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div>
                 <label className="font-bold text-neutral-700 block mb-1">Nome do Produto *</label>
                 <input
+                  ref={productNameInputRef}
                   type="text"
                   required
                   placeholder="Ex: Cerveja Heineken Lata 350ml"
@@ -4445,17 +4892,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     onChange={(e) => setProductForm({ ...productForm, category: e.target.value as ProductCategory })}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-medium"
                   >
-                    <option value="cervejas">Cervejas</option>
-                    <option value="destilados">Destilados</option>
-                    <option value="nao_alcoolicos">Não Alcoólicos</option>
-                    <option value="vinhos">Vinhos</option>
-                    <option value="gelo_carvao">Gelo & Carvão</option>
-                    <option value="petiscos">Petiscos & Copos</option>
-                    {customCategories.map((c) => (
-                      <option key={c} value={c}>
-                        {c}
+                    {storeCategories.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
                       </option>
                     ))}
+                    {!storeCategoryIdSet.has(productForm.category) && productForm.category && (
+                      <option value={productForm.category}>
+                        {formatCategoryLabel(productForm.category)}
+                      </option>
+                    )}
                   </select>
                 </div>
 
@@ -4730,19 +5176,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 />
               </div>
 
-              <div className="pt-3 border-t border-neutral-200 flex justify-end gap-2">
+              <div className="pt-3 border-t border-neutral-200 flex flex-wrap items-center justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => setIsProductModalOpen(false)}
-                  className="px-4 py-2 font-medium text-neutral-600 hover:bg-neutral-100 rounded-xl"
+                  onClick={handleRequestCloseProductModal}
+                  className="px-4 py-2 font-medium text-neutral-600 hover:bg-neutral-100 rounded-xl cursor-pointer"
                 >
-                  Cancelar
+                  Cancelar ({formatShortcutDisplay(activeShortcuts.fecharModal || 'Escape')})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => submitProductForm('new')}
+                  className="px-4 py-2 bg-neutral-900 hover:bg-neutral-800 text-white font-bold rounded-xl shadow-xs inline-flex items-center gap-2 cursor-pointer"
+                >
+                  <span>Salvar e novo</span>
+                  <span className="px-1.5 py-0.5 rounded bg-neutral-700 text-amber-300 font-mono text-[10px]">
+                    {formatShortcutDisplay(activeShortcuts.saveAndNewProduct || 'Ctrl+Enter')}
+                  </span>
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl shadow-xs"
+                  className="px-5 py-2 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-xl shadow-xs inline-flex items-center gap-2 cursor-pointer"
                 >
-                  Salvar Produto
+                  <span>Salvar</span>
+                  <span className="px-1.5 py-0.5 rounded bg-amber-600/30 text-neutral-950 font-mono text-[10px]">
+                    {formatShortcutDisplay(activeShortcuts.saveProduct || 'Ctrl+S')}
+                  </span>
                 </button>
               </div>
             </form>
@@ -5366,6 +5825,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       <ImportProductsModal
         isOpen={isImportModalOpen}
         existingProducts={products}
+        settings={settings}
         onClose={() => setIsImportModalOpen(false)}
         onImported={() => api.reloadProducts()}
       />
@@ -5570,6 +6030,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* PDV Addon Selection Modal */}
+      {posAddonModalState && (
+        <ProductAddonsModal
+          product={posAddonModalState.product}
+          initialSaleUnit={posAddonModalState.saleUnit}
+          addonGroups={getProductAddonGroups(posAddonModalState.product, settings)}
+          availableStockUnits={(() => {
+            const currentTotalUnits = posCart
+              .filter(item => item.product.id === posAddonModalState.product.id)
+              .reduce((sum, item) => sum + item.quantity * getPosUnitsPerSale(item.product, item.saleUnit), 0);
+            return Math.max(0, posAddonModalState.product.stock - currentTotalUnits);
+          })()}
+          onClose={() => setPosAddonModalState(null)}
+          onConfirm={({ product: confirmedProduct, saleUnit: confirmedUnit, quantity, addons, addonsTotal }) => {
+            appendPosCartLine(
+              confirmedProduct,
+              confirmedUnit,
+              quantity,
+              addons,
+              addonsTotal
+            );
+            setPosAddonModalState(null);
+          }}
+        />
       )}
 
       {/* End Modals */}

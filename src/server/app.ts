@@ -25,6 +25,20 @@ import {
   TabStatus,
   LinkedTable,
   GeoPrecision,
+  StoreCategoryItem,
+  ProductSortMode,
+  AddonGroup,
+  AddonOption,
+  OrderItemAddon,
+  ComboComponentItem,
+  OrderItemComboComponent,
+  slugifyCategoryId,
+  buildInitialCategoriesFromProducts,
+  reconcileStoreCategoriesWithProducts,
+  getProductAddonGroups,
+  isComboProduct,
+  calculateComboMetrics,
+  formatComboComponentProductName,
 } from '../types/index.js';
 
 dotenv.config();
@@ -1112,6 +1126,9 @@ const DEFAULT_SERVER_SHORTCUTS: Record<string, string> = {
   finalizar: 'F9',
   busca: '/',
   fecharModal: 'Escape',
+  newProduct: 'F6',
+  saveProduct: 'Ctrl+S',
+  saveAndNewProduct: 'Ctrl+Enter',
 };
 
 const FORBIDDEN_SHORTCUT_KEYS = new Set([
@@ -1136,6 +1153,8 @@ function isForbiddenShortcutKey(key: string): boolean {
   if (FORBIDDEN_SHORTCUT_KEYS.has(upper)) return true;
   return false;
 }
+
+const VALID_PRODUCT_SORT_MODES = new Set<ProductSortMode>(['manual', 'az', 'price_asc', 'price_desc']);
 
 function sanitizePublicSettings(settings: StoreSettings): StoreSettings {
   const clean: StoreSettings = { ...initialSettings, ...(settings || {}) };
@@ -1168,6 +1187,72 @@ function sanitizePublicSettings(settings: StoreSettings): StoreSettings {
     clean.featuredProductIds = [];
   }
 
+  // Validate categories: ordered list of { id, name } (max 50; id exact trimmed up to 40 chars; name max 40 chars)
+  if (Array.isArray((settings as any)?.categories)) {
+    const seenCatIds = new Set<string>();
+    const validCategories: StoreCategoryItem[] = [];
+    for (const rawCat of (settings as any).categories) {
+      if (rawCat && typeof rawCat === 'object') {
+        const id = String(rawCat.id || '').trim().slice(0, 40);
+        const name = String(rawCat.name || '').trim().slice(0, 40);
+        const lowerId = id.toLowerCase();
+        if (
+          id.length >= 1 &&
+          id.length <= 40 &&
+          lowerId !== 'todas' &&
+          lowerId !== 'outros' &&
+          name.length >= 1 &&
+          !seenCatIds.has(id)
+        ) {
+          seenCatIds.add(id);
+          validCategories.push({ id, name });
+          if (validCategories.length >= 50) break;
+        }
+      }
+    }
+    clean.categories = validCategories;
+  } else {
+    clean.categories = [];
+  }
+
+  // Validate productSortMode ('manual' | 'az' | 'price_asc' | 'price_desc', default 'manual')
+  const rawSortMode = (settings as any)?.productSortMode;
+  clean.productSortMode =
+    typeof rawSortMode === 'string' && VALID_PRODUCT_SORT_MODES.has(rawSortMode as ProductSortMode)
+      ? (rawSortMode as ProductSortMode)
+      : 'manual';
+
+  // Validate productOrder ({ [categoryId]: string[] }, max 2000 product IDs total)
+  const rawProductOrder = (settings as any)?.productOrder;
+  const sanitizedProductOrder: Record<string, string[]> = {};
+  if (rawProductOrder && typeof rawProductOrder === 'object' && !Array.isArray(rawProductOrder)) {
+    let totalIdsCount = 0;
+    for (const [rawCatId, rawList] of Object.entries(rawProductOrder)) {
+      if (totalIdsCount >= 2000) break;
+      const catId = String(rawCatId || '').trim().slice(0, 40);
+      if (!catId || catId.length > 40) continue;
+      if (Array.isArray(rawList)) {
+        const seenProdIds = new Set<string>();
+        const catProdIds: string[] = [];
+        for (const item of rawList) {
+          if (totalIdsCount >= 2000) break;
+          if (typeof item === 'string') {
+            const pid = item.trim();
+            if (pid.length > 0 && pid.length <= 100 && !seenProdIds.has(pid)) {
+              seenProdIds.add(pid);
+              catProdIds.push(pid);
+              totalIdsCount++;
+            }
+          }
+        }
+        if (catProdIds.length > 0) {
+          sanitizedProductOrder[catId] = catProdIds;
+        }
+      }
+    }
+  }
+  clean.productOrder = sanitizedProductOrder;
+
   // Validate shortcuts (object mapping valid actions to valid non-reserved keys)
   const rawShortcuts = (settings as any)?.shortcuts;
   const sanitizedShortcuts: Record<string, string> = { ...DEFAULT_SERVER_SHORTCUTS };
@@ -1184,7 +1269,474 @@ function sanitizePublicSettings(settings: StoreSettings): StoreSettings {
   }
   clean.shortcuts = sanitizedShortcuts;
 
+  // Validate addonGroups (max 30 groups, max 20 options per group)
+  if (Array.isArray((settings as any)?.addonGroups)) {
+    const validGroups: AddonGroup[] = [];
+    const seenGroupIds = new Set<string>();
+    for (const rawGroup of (settings as any).addonGroups) {
+      if (!rawGroup || typeof rawGroup !== 'object') continue;
+      const gId = String(rawGroup.id || '').trim().slice(0, 60);
+      const gName = String(rawGroup.name || '').trim().slice(0, 60);
+      if (!gId || !gName || seenGroupIds.has(gId)) continue;
+      seenGroupIds.add(gId);
+
+      const gActive = rawGroup.active === false ? false : true;
+      const rawMin = Number(rawGroup.min);
+      const gMin =
+        !Number.isNaN(rawMin) && rawMin >= 0
+          ? Math.min(10, Math.floor(rawMin))
+          : 0;
+      const rawMax = Number(rawGroup.max);
+      const gMax =
+        !Number.isNaN(rawMax) && rawMax >= 1
+          ? Math.max(Math.max(1, gMin), Math.min(10, Math.floor(rawMax)))
+          : Math.max(1, gMin);
+
+      const validOptions: AddonOption[] = [];
+      const seenOptIds = new Set<string>();
+      if (Array.isArray(rawGroup.options)) {
+        for (const rawOpt of rawGroup.options) {
+          if (!rawOpt || typeof rawOpt !== 'object') continue;
+          const oId = String(rawOpt.id || '').trim().slice(0, 60);
+          const oName = String(rawOpt.name || '').trim().slice(0, 60);
+          if (!oId || !oName || seenOptIds.has(oId)) continue;
+          seenOptIds.add(oId);
+
+          const rawPrice = Number(rawOpt.price);
+          const oPrice =
+            !Number.isNaN(rawPrice) && rawPrice >= 0
+              ? Math.round(rawPrice * 100) / 100
+              : 0;
+          const oActive = rawOpt.active === false ? false : true;
+
+          validOptions.push({
+            id: oId,
+            name: oName,
+            price: oPrice,
+            active: oActive,
+          });
+          if (validOptions.length >= 20) break;
+        }
+      }
+
+      const categoryIds: string[] = [];
+      const seenCatIdSet = new Set<string>();
+      if (Array.isArray(rawGroup.categoryIds)) {
+        for (const rawCid of rawGroup.categoryIds) {
+          if (typeof rawCid === 'string') {
+            const cid = rawCid.trim().slice(0, 40);
+            if (cid && !seenCatIdSet.has(cid)) {
+              seenCatIdSet.add(cid);
+              categoryIds.push(cid);
+              if (categoryIds.length >= 50) break;
+            }
+          }
+        }
+      }
+
+      const productIds: string[] = [];
+      const seenProdIdSet = new Set<string>();
+      if (Array.isArray(rawGroup.productIds)) {
+        for (const rawPid of rawGroup.productIds) {
+          if (typeof rawPid === 'string') {
+            const pid = rawPid.trim().slice(0, 100);
+            if (pid && !seenProdIdSet.has(pid)) {
+              seenProdIdSet.add(pid);
+              productIds.push(pid);
+              if (productIds.length >= 500) break;
+            }
+          }
+        }
+      }
+
+      validGroups.push({
+        id: gId,
+        name: gName,
+        active: gActive,
+        min: gMin,
+        max: gMax,
+        options: validOptions,
+        categoryIds,
+        productIds,
+      });
+
+      if (validGroups.length >= 30) break;
+    }
+    clean.addonGroups = validGroups;
+  } else {
+    clean.addonGroups = [];
+  }
+
+  // Validate combos: { [idDoProdutoCombo]: Array<{ productId, quantity }> }
+  // Max 100 combos, max 15 items per combo, integer quantity 1..99, no self-reference, no combo inside combo
+  const rawCombos = (settings as any)?.combos;
+  const sanitizedCombos: Record<string, ComboComponentItem[]> = {};
+  if (rawCombos && typeof rawCombos === 'object' && !Array.isArray(rawCombos)) {
+    const candidateComboIds = new Set<string>();
+    for (const [rawComboId, rawList] of Object.entries(rawCombos)) {
+      const cid = String(rawComboId || '').trim().slice(0, 100);
+      if (cid && Array.isArray(rawList) && rawList.length > 0) {
+        candidateComboIds.add(cid);
+      }
+    }
+
+    let comboCount = 0;
+    for (const [rawComboId, rawList] of Object.entries(rawCombos)) {
+      if (comboCount >= 100) break;
+      const comboId = String(rawComboId || '').trim().slice(0, 100);
+      if (!comboId || !Array.isArray(rawList) || rawList.length === 0) continue;
+
+      const validItems: ComboComponentItem[] = [];
+      const seenItemIds = new Set<string>();
+      for (const rawItem of rawList) {
+        if (validItems.length >= 15) break;
+        if (!rawItem || typeof rawItem !== 'object') continue;
+        const pid = String((rawItem as any).productId || '').trim().slice(0, 100);
+        const rawQty = (rawItem as any).quantity;
+        if (
+          rawQty === null ||
+          rawQty === undefined ||
+          typeof rawQty === 'boolean' ||
+          (typeof rawQty === 'string' && rawQty.trim() === '')
+        ) {
+          continue;
+        }
+        const qty = Number(rawQty);
+        if (!pid || pid === comboId || candidateComboIds.has(pid)) continue;
+        if (!Number.isInteger(qty) || qty < 1 || qty > 99) continue;
+        if (seenItemIds.has(pid)) continue;
+        seenItemIds.add(pid);
+        validItems.push({ productId: pid, quantity: qty });
+      }
+
+      if (validItems.length > 0) {
+        sanitizedCombos[comboId] = validItems;
+        comboCount++;
+      }
+    }
+  }
+  clean.combos = sanitizedCombos;
+
   return clean;
+}
+
+function validateIncomingCombos(
+  rawCombos: unknown,
+  existingProductIds: Set<string>
+): { error?: string; combos: Record<string, ComboComponentItem[]> } {
+  if (rawCombos === undefined || rawCombos === null) {
+    return { combos: {} };
+  }
+  if (typeof rawCombos !== 'object' || Array.isArray(rawCombos)) {
+    return { error: 'Formato inválido de combos.', combos: {} };
+  }
+
+  const entries = Object.entries(rawCombos as Record<string, unknown>);
+  if (entries.length > 100) {
+    return { error: 'Limite máximo de 100 combos excedido.', combos: {} };
+  }
+
+  const activeComboIds = new Set<string>();
+  for (const [rawComboId, rawList] of entries) {
+    const cid = String(rawComboId || '').trim();
+    if (!cid) continue;
+    if (Array.isArray(rawList) && rawList.length > 0) {
+      activeComboIds.add(cid);
+    }
+  }
+
+  const result: Record<string, ComboComponentItem[]> = {};
+  for (const [rawComboId, rawList] of entries) {
+    const comboId = String(rawComboId || '').trim();
+    if (!comboId) continue;
+    if (!Array.isArray(rawList)) {
+      return { error: `A composição do combo "${comboId}" deve ser uma lista de itens.`, combos: {} };
+    }
+    if (rawList.length === 0) {
+      continue;
+    }
+    if (!existingProductIds.has(comboId)) {
+      return { error: `O produto do combo (${comboId}) não existe no cadastro.`, combos: {} };
+    }
+    if (rawList.length > 15) {
+      return { error: 'Um combo pode ter no máximo 15 itens.', combos: {} };
+    }
+
+    const validItems: ComboComponentItem[] = [];
+    const seenItemIds = new Set<string>();
+
+    for (const rawItem of rawList) {
+      if (!rawItem || typeof rawItem !== 'object') {
+        return { error: 'Item inválido na composição do combo.', combos: {} };
+      }
+      const pid = String((rawItem as any).productId || '').trim();
+      const rawQty = (rawItem as any).quantity;
+
+      if (!pid || !existingProductIds.has(pid)) {
+        return { error: 'Produto inexistente informado na composição do combo.', combos: {} };
+      }
+      if (pid === comboId) {
+        return { error: 'Um combo não pode conter a si mesmo.', combos: {} };
+      }
+      if (activeComboIds.has(pid)) {
+        return { error: 'Um combo não pode conter outro combo.', combos: {} };
+      }
+      if (
+        rawQty === null ||
+        rawQty === undefined ||
+        typeof rawQty === 'boolean' ||
+        (typeof rawQty === 'string' && rawQty.trim() === '')
+      ) {
+        return { error: 'Quantidade inválida no combo (use inteiro de 1 a 99).', combos: {} };
+      }
+      const qty = Number(rawQty);
+      if (!Number.isInteger(qty) || qty < 1 || qty > 99) {
+        return { error: 'Quantidade inválida no combo (use inteiro de 1 a 99).', combos: {} };
+      }
+      if (seenItemIds.has(pid)) {
+        return { error: 'Produto repetido na composição do mesmo combo.', combos: {} };
+      }
+      seenItemIds.add(pid);
+      validItems.push({ productId: pid, quantity: qty });
+    }
+
+    result[comboId] = validItems;
+  }
+
+  return { combos: result };
+}
+
+function applyCombosStockAndCost(products: Product[], settings: StoreSettings): Product[] {
+  if (!settings?.combos || Object.keys(settings.combos).length === 0) {
+    return products;
+  }
+  return products.map((p) => {
+    if (!isComboProduct(p.id, settings)) return p;
+    const metrics = calculateComboMetrics(p, settings, products);
+    return {
+      ...p,
+      stock: metrics.availableStock,
+      costPrice: metrics.costPrice,
+      caseSize: null,
+      casePrice: null,
+    };
+  });
+}
+
+function extractOrderStockItems(order: Order): { id: string; qty: number }[] {
+  const unitsMap = new Map<string, number>();
+  for (const it of order.items || []) {
+    const itemQty = Math.max(1, Math.floor(Number(it.quantity) || 1));
+    if (Array.isArray(it.comboItems) && it.comboItems.length > 0) {
+      for (const ci of it.comboItems) {
+        const compId = String(ci?.productId || '').trim();
+        const compQty = Math.max(1, Math.floor(Number(ci?.quantity) || 1));
+        if (compId) {
+          unitsMap.set(compId, (unitsMap.get(compId) || 0) + itemQty * compQty);
+        }
+      }
+    } else if (it.productId) {
+      const unitsPerSale =
+        it.unitsPerSale && Number(it.unitsPerSale) > 0 ? Math.floor(Number(it.unitsPerSale)) : 1;
+      unitsMap.set(it.productId, (unitsMap.get(it.productId) || 0) + itemQty * unitsPerSale);
+    }
+  }
+  return Array.from(unitsMap.entries()).map(([id, qty]) => ({ id, qty }));
+}
+
+function reconcileSettingsCategoriesAndOrders(
+  settings: StoreSettings,
+  products: Array<{ id?: string; category?: string }>
+): { settings: StoreSettings; changed: boolean } {
+  let changed = false;
+  const currentCategories = settings.categories || [];
+
+  if (currentCategories.length === 0) {
+    settings.categories = buildInitialCategoriesFromProducts(products as any);
+    return { settings, changed: true };
+  }
+
+  const reconciled = reconcileStoreCategoriesWithProducts(currentCategories, products as any);
+  const idMap = new Map<string, string>();
+  currentCategories.forEach((oldCat, idx) => {
+    const newCat = reconciled[idx];
+    if (newCat && oldCat.id !== newCat.id) {
+      idMap.set(oldCat.id, newCat.id);
+      changed = true;
+    }
+  });
+
+  if (reconciled.length !== currentCategories.length) {
+    changed = true;
+  }
+
+  if (changed) {
+    settings.categories = reconciled;
+
+    if (settings.productOrder && idMap.size > 0) {
+      const nextOrder: Record<string, string[]> = {};
+      for (const [k, v] of Object.entries(settings.productOrder)) {
+        const mappedKey = idMap.get(k) || k;
+        nextOrder[mappedKey] = v;
+      }
+      settings.productOrder = nextOrder;
+    }
+
+    if (Array.isArray(settings.addonGroups) && idMap.size > 0) {
+      settings.addonGroups = settings.addonGroups.map((g) => ({
+        ...g,
+        categoryIds: (g.categoryIds || []).map((cid) => idMap.get(cid) || cid),
+      }));
+    }
+  }
+
+  return { settings, changed };
+}
+
+function validateAndCalculateItemAddons(
+  serverProduct: Product,
+  rawAddons: unknown,
+  dbSettings: StoreSettings
+): { error?: string; addons: OrderItemAddon[]; addonsTotal: number } {
+  if (rawAddons !== undefined && rawAddons !== null && !Array.isArray(rawAddons)) {
+    return {
+      error: `Formato inválido de adicionais para o produto "${serverProduct.name}".`,
+      addons: [],
+      addonsTotal: 0,
+    };
+  }
+
+  const incomingList = Array.isArray(rawAddons) ? rawAddons : [];
+  if (incomingList.length > 60) {
+    return {
+      error: `Quantidade excessiva de adicionais para o produto "${serverProduct.name}".`,
+      addons: [],
+      addonsTotal: 0,
+    };
+  }
+
+  const applicableGroups = getProductAddonGroups(serverProduct, dbSettings);
+  const applicableGroupById = new Map<string, AddonGroup>(
+    applicableGroups.map((g) => [g.id, g])
+  );
+
+  const qtyByGroupId = new Map<string, number>();
+  const mergedAddonsMap = new Map<string, OrderItemAddon>();
+
+  for (const rawItem of incomingList) {
+    if (!rawItem || typeof rawItem !== 'object') {
+      return {
+        error: `Adicional inválido informado para o produto "${serverProduct.name}".`,
+        addons: [],
+        addonsTotal: 0,
+      };
+    }
+
+    const groupId = String((rawItem as any).groupId || '').trim();
+    const optionId = String((rawItem as any).optionId || '').trim();
+    const rawQty = (rawItem as any).quantity;
+
+    if (!groupId || !optionId) {
+      return {
+        error: `Adicional incompleto informado para o produto "${serverProduct.name}".`,
+        addons: [],
+        addonsTotal: 0,
+      };
+    }
+
+    if (
+      rawQty === null ||
+      rawQty === undefined ||
+      typeof rawQty === 'boolean' ||
+      (typeof rawQty === 'string' && rawQty.trim() === '')
+    ) {
+      return {
+        error: `Quantidade inválida de adicional para o produto "${serverProduct.name}".`,
+        addons: [],
+        addonsTotal: 0,
+      };
+    }
+
+    const qtyNum = Number(rawQty);
+    if (!Number.isInteger(qtyNum) || qtyNum < 1 || qtyNum > 10) {
+      return {
+        error: `Quantidade inválida de adicional para o produto "${serverProduct.name}".`,
+        addons: [],
+        addonsTotal: 0,
+      };
+    }
+
+    const group = applicableGroupById.get(groupId);
+    if (!group) {
+      return {
+        error: `O grupo de adicional selecionado não é válido para o produto "${serverProduct.name}".`,
+        addons: [],
+        addonsTotal: 0,
+      };
+    }
+
+    const option = (group.options || []).find((opt) => opt && opt.id === optionId);
+    if (!option || option.active === false) {
+      return {
+        error: `A opção de adicional selecionada em "${group.name}" não está disponível para "${serverProduct.name}".`,
+        addons: [],
+        addonsTotal: 0,
+      };
+    }
+
+    const nextGroupQty = (qtyByGroupId.get(group.id) || 0) + qtyNum;
+    qtyByGroupId.set(group.id, nextGroupQty);
+
+    const mergeKey = `${group.id}::${option.id}`;
+    const existingAddon = mergedAddonsMap.get(mergeKey);
+    const optPrice = Math.max(0, Math.round((Number(option.price) || 0) * 100) / 100);
+
+    if (existingAddon) {
+      existingAddon.quantity += qtyNum;
+    } else {
+      mergedAddonsMap.set(mergeKey, {
+        groupId: group.id,
+        optionId: option.id,
+        groupName: group.name,
+        optionName: option.name,
+        price: optPrice,
+        quantity: qtyNum,
+      });
+    }
+  }
+
+  for (const group of applicableGroups) {
+    const selectedQty = qtyByGroupId.get(group.id) || 0;
+    const min = Math.max(0, Math.floor(Number(group.min) || 0));
+    const max = Math.max(Math.max(1, min), Math.floor(Number(group.max) || 1));
+
+    if (selectedQty < min) {
+      return {
+        error: `Em "${serverProduct.name}", o grupo "${group.name}" é obrigatório: escolha pelo menos ${min} ${min === 1 ? 'opção' : 'opções'}.`,
+        addons: [],
+        addonsTotal: 0,
+      };
+    }
+
+    if (selectedQty > max) {
+      return {
+        error: `Em "${serverProduct.name}", o grupo "${group.name}" permite no máximo ${max} ${max === 1 ? 'opção' : 'opções'}.`,
+        addons: [],
+        addonsTotal: 0,
+      };
+    }
+  }
+
+  const validatedAddons = Array.from(mergedAddonsMap.values());
+  const addonsTotal =
+    Math.round(
+      validatedAddons.reduce((sum, a) => sum + a.price * a.quantity, 0) * 100
+    ) / 100;
+
+  return {
+    addons: validatedAddons,
+    addonsTotal,
+  };
 }
 
 function diningTableFromDB(row: any): DiningTable {
@@ -2162,16 +2714,27 @@ export function createApp(): express.Express {
 
     let numSubtotal = Number(subtotal) || 0;
     if (Array.isArray(items) && items.length > 0) {
-      const { data: prodRows } = await supabase.from('products').select('*');
+      const [{ data: prodRows, error: prodErr }, { data: settingsRow, error: settingsErr }] = await Promise.all([
+        supabase.from('products').select('*'),
+        supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+      ]);
+      if (prodErr) return res.status(500).json({ error: prodErr.message });
+      if (settingsErr) return res.status(500).json({ error: settingsErr.message });
+
       if (prodRows) {
         const dbProds = prodRows.map(productFromDB);
+        const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
+        reconcileSettingsCategoriesAndOrders(dbSettings, dbProds);
+
         let calculatedSub = 0;
         for (const it of items) {
           const sp = dbProds.find((p) => p.id === (it.productId || it.id));
           if (sp && sp.active) {
             const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
             const isCase = it.saleUnit === 'case' && sp.caseSize && sp.caseSize >= 2 && sp.casePrice && sp.casePrice > 0;
-            const unitPrice = isCase ? Number(sp.casePrice) : getEffectivePrice(sp);
+            const baseUnitPrice = isCase ? Number(sp.casePrice) : getEffectivePrice(sp);
+            const addonCalc = validateAndCalculateItemAddons(sp, it.addons, dbSettings);
+            const unitPrice = Math.round((baseUnitPrice + (addonCalc.error ? 0 : addonCalc.addonsTotal)) * 100) / 100;
             calculatedSub += unitPrice * qty;
           }
         }
@@ -2301,27 +2864,47 @@ export function createApp(): express.Express {
 
     try {
       const [prodRes, areasRes, settingsRes] = await Promise.all([
-        supabase.from('products').select('*').eq('active', true),
+        supabase.from('products').select('*'),
         supabase.from('delivery_areas').select('*').eq('active', true),
         supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
       ]);
 
       if (prodRes.error) return res.status(500).json({ error: prodRes.error.message });
       if (areasRes.error) return res.status(500).json({ error: areasRes.error.message });
+      if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
+
+      const allProductRows = (prodRes.data || []).map(productFromDB);
+      const deliveryAreas = (areasRes.data || []).map(deliveryAreaFromDB);
 
       let settings = sanitizePublicSettings(initialSettings);
+      let shouldPersistSettings = false;
       if (settingsRes.data && settingsRes.data.data) {
         settings = sanitizePublicSettings(settingsRes.data.data);
       } else {
-        await supabase.from('store_settings').upsert({
-          id: 'default',
-          data: sanitizePublicSettings(initialSettings),
-          updated_at: new Date().toISOString(),
-        });
+        shouldPersistSettings = true;
       }
 
-      const products = (prodRes.data || []).map(productFromDB).map(sanitizePublicProduct);
-      const deliveryAreas = (areasRes.data || []).map(deliveryAreaFromDB);
+      const reconciled = reconcileSettingsCategoriesAndOrders(settings, allProductRows as any);
+      settings = reconciled.settings;
+      if (reconciled.changed) {
+        shouldPersistSettings = true;
+      }
+
+      const productsWithCombos = applyCombosStockAndCost(allProductRows, settings);
+      const products = productsWithCombos
+        .filter((p) => p.active !== false)
+        .map(sanitizePublicProduct);
+
+      if (shouldPersistSettings) {
+        const { error: persistErr } = await supabase.from('store_settings').upsert({
+          id: 'default',
+          data: settings,
+          updated_at: new Date().toISOString(),
+        });
+        if (persistErr) {
+          console.error('[Supabase Error] store_settings persist in /state:', persistErr.message);
+        }
+      }
 
       return res.json({
         products,
@@ -2358,17 +2941,34 @@ export function createApp(): express.Express {
       if (custRes.error) return res.status(500).json({ error: custRes.error.message });
       if (orderRes.error) return res.status(500).json({ error: orderRes.error.message });
       if (couponsRes.error) return res.status(500).json({ error: couponsRes.error.message });
+      if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
+
+      const mappedProducts = (prodRes.data || []).map(productFromDB);
 
       let settings = sanitizePublicSettings(initialSettings);
       if (settingsRes.data && settingsRes.data.data) {
         settings = sanitizePublicSettings(settingsRes.data.data);
       }
 
+      const reconciled = reconcileSettingsCategoriesAndOrders(settings, mappedProducts);
+      settings = reconciled.settings;
+      if (reconciled.changed) {
+        const { error: persistErr } = await supabase.from('store_settings').upsert({
+          id: 'default',
+          data: settings,
+          updated_at: new Date().toISOString(),
+        });
+        if (persistErr) {
+          console.error('[Supabase Error] store_settings persist in /admin/state:', persistErr.message);
+        }
+      }
+
+      const productsWithCombos = applyCombosStockAndCost(mappedProducts, settings);
       const customers = (custRes.data || []).map(customerFromDB);
       const customerById = new Map<string, CustomerProfile>(customers.map((c) => [c.id, c]));
 
       return res.json({
-        products: (prodRes.data || []).map(productFromDB),
+        products: productsWithCombos,
         orders: (orderRes.data || []).map((r: any) => orderFromDB(r, customerById)),
         deliveryAreas: (areasRes.data || []).map(deliveryAreaFromDB),
         customers,
@@ -2421,15 +3021,20 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado.' });
 
-    const { data, error } = await supabase.from('products').select('*').order('name');
+    const [{ data, error }, { data: settingsRow, error: settingsErr }] = await Promise.all([
+      supabase.from('products').select('*').order('name'),
+      supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+    ]);
     if (error) return res.status(500).json({ error: error.message });
+    if (settingsErr) return res.status(500).json({ error: settingsErr.message });
 
     const authHeader = req.headers.authorization;
     const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
     const signed = token ? verifySignedToken(token) : null;
     const isAdmin = signed?.role === 'admin';
 
-    const mapped = (data || []).map(productFromDB);
+    const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
+    const mapped = applyCombosStockAndCost((data || []).map(productFromDB), dbSettings);
     res.json(isAdmin ? mapped : mapped.filter((p) => p.active).map(sanitizePublicProduct));
   });
 
@@ -2463,7 +3068,26 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
-    res.status(201).json(data ? productFromDB(data) : normalizedProduct);
+    let savedProduct = data ? productFromDB(data) : normalizedProduct;
+    const { data: settingsRow, error: settingsErr } = await supabase
+      .from('store_settings')
+      .select('data')
+      .eq('id', 'default')
+      .maybeSingle();
+    if (settingsErr) {
+      console.error('[Supabase Error] store_settings in POST /products:', settingsErr.message);
+      return res.status(500).json({ error: settingsErr.message });
+    }
+    const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
+    if (isComboProduct(savedProduct.id, dbSettings)) {
+      const { data: allRows, error: allErr } = await supabase.from('products').select('*');
+      if (allErr) return res.status(500).json({ error: allErr.message });
+      const withCombos = applyCombosStockAndCost((allRows || []).map(productFromDB), dbSettings);
+      const found = withCombos.find((p) => p.id === savedProduct.id);
+      if (found) savedProduct = found;
+    }
+
+    res.status(201).json(savedProduct);
   });
 
   // Requirement: Em PUT /api/products/:id NUNCA altere a coluna stock (ignore stock do corpo)
@@ -2518,7 +3142,26 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error?.message || 'Produto não encontrado.' });
     }
 
-    res.json(productFromDB(data));
+    let updatedProduct = productFromDB(data);
+    const { data: settingsRow, error: settingsErr } = await supabase
+      .from('store_settings')
+      .select('data')
+      .eq('id', 'default')
+      .maybeSingle();
+    if (settingsErr) {
+      console.error('[Supabase Error] store_settings in PUT /products/:id:', settingsErr.message);
+      return res.status(500).json({ error: settingsErr.message });
+    }
+    const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
+    if (isComboProduct(updatedProduct.id, dbSettings)) {
+      const { data: allRows, error: allErr } = await supabase.from('products').select('*');
+      if (allErr) return res.status(500).json({ error: allErr.message });
+      const withCombos = applyCombosStockAndCost((allRows || []).map(productFromDB), dbSettings);
+      const found = withCombos.find((p) => p.id === updatedProduct.id);
+      if (found) updatedProduct = found;
+    }
+
+    res.json(updatedProduct);
   });
 
   // Requirement: Rotas exclusivas para gerenciar promoção do produto (sem mexer em price nem stock)
@@ -2597,6 +3240,7 @@ export function createApp(): express.Express {
 
   // Requirement: Alteração de estoque manual via POST /api/products/:id/stock (decrement_stock para delta negativo e restore_stock para positivo)
   // Aceita unit: 'unit' | 'case'. Em caixas, o servidor multiplica delta × case_size.
+  // O estoque de um combo não pode ser editado diretamente.
   router.post('/products/:id/stock', requireAdmin, async (req, res) => {
     const { id } = req.params;
     const rawDelta = Math.trunc(Number(req.body?.delta) || 0);
@@ -2604,14 +3248,21 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
-    const { data: existingRow, error: prodErr } = await supabase
-      .from('products')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    const [{ data: existingRow, error: prodErr }, { data: settingsRow, error: settingsErr }] = await Promise.all([
+      supabase.from('products').select('*').eq('id', id).maybeSingle(),
+      supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+    ]);
 
     if (prodErr) return res.status(500).json({ error: prodErr.message });
+    if (settingsErr) return res.status(500).json({ error: settingsErr.message });
     if (!existingRow) return res.status(404).json({ error: 'Produto não encontrado.' });
+
+    const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
+    if (isComboProduct(id, dbSettings)) {
+      return res.status(400).json({
+        error: 'O campo de estoque do combo não pode ser editado (o estoque é dos itens).',
+      });
+    }
 
     if (rawDelta === 0) {
       return res.json(productFromDB(existingRow));
@@ -2663,6 +3314,27 @@ export function createApp(): express.Express {
     if (error) {
       console.error('[Supabase Error] products delete:', error.message);
       return res.status(500).json({ error: error.message });
+    }
+
+    // If deleted product was a combo in store_settings, remove its combo entry
+    const { data: settingsRow, error: settingsErr } = await supabase
+      .from('store_settings')
+      .select('data')
+      .eq('id', 'default')
+      .maybeSingle();
+    if (!settingsErr && settingsRow?.data) {
+      const cleanSettings = sanitizePublicSettings(settingsRow.data);
+      if (cleanSettings.combos && cleanSettings.combos[id]) {
+        delete cleanSettings.combos[id];
+        const { error: saveSetErr } = await supabase.from('store_settings').upsert({
+          id: 'default',
+          data: cleanSettings,
+          updated_at: new Date().toISOString(),
+        });
+        if (saveSetErr) {
+          console.error('[Supabase Error] store_settings cleanup after combo delete:', saveSetErr.message);
+        }
+      }
     }
 
     res.json({ success: true });
@@ -2765,11 +3437,20 @@ export function createApp(): express.Express {
       return true;
     };
 
-    const { data: existingRows, error: fetchErr } = await supabase.from('products').select('*');
+    const [{ data: existingRows, error: fetchErr }, { data: settingsRow, error: settingsErr }] = await Promise.all([
+      supabase.from('products').select('*'),
+      supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+    ]);
     if (fetchErr) {
       console.error('[Supabase Error] products import fetch existing:', fetchErr.message);
       return res.status(500).json({ error: fetchErr.message });
     }
+    if (settingsErr) {
+      console.error('[Supabase Error] store_settings fetch in products import:', settingsErr.message);
+      return res.status(500).json({ error: settingsErr.message });
+    }
+
+    const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
 
     const byName = new Map<string, any>();
     const bySku = new Map<string, any>();
@@ -2834,6 +3515,11 @@ export function createApp(): express.Express {
       const existing = (skuKey ? bySku.get(skuKey) : undefined) || byName.get(nameKey);
 
       if (existing) {
+        // Requirement 5.d: Importação de planilha: não mexa em combos (se o nome ou SKU bater com um combo, pule mesmo no modo "atualizar")
+        if (existing.id && isComboProduct(String(existing.id), dbSettings)) {
+          skipped++;
+          continue;
+        }
         if (duplicateMode === 'skip') {
           skipped++;
         } else {
@@ -3220,9 +3906,12 @@ export function createApp(): express.Express {
     ]);
 
     if (prodRes.error) return res.status(500).json({ error: prodRes.error.message });
+    if (areasRes.error) return res.status(500).json({ error: areasRes.error.message });
+    if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
     const dbProducts = (prodRes.data || []).map(productFromDB);
     const dbAreas = (areasRes.data || []).map(deliveryAreaFromDB);
     const dbSettings = settingsRes.data?.data ? sanitizePublicSettings(settingsRes.data.data) : initialSettings;
+    reconcileSettingsCategoriesAndOrders(dbSettings, dbProducts);
 
     const maxRadiusKm = Number(dbSettings.deliveryRadiusKm) || 5;
     let customerId: string | undefined = undefined;
@@ -3326,6 +4015,8 @@ export function createApp(): express.Express {
     let recalculatedSubtotal = 0;
     const validatedItems: OrderItem[] = [];
     const unitsByProductId = new Map<string, number>();
+    const comboCheckList: Array<{ comboProduct: Product; comboDef: ComboComponentItem[] }> = [];
+    const nonComboCheckList: Product[] = [];
 
     for (const item of rawOrder.items) {
       const serverProduct = dbProducts.find((p) => p.id === item.productId);
@@ -3340,12 +4031,18 @@ export function createApp(): express.Express {
         return res.status(400).json({ error: 'Quantidade inválida.' });
       }
       const saleUnit = item.saleUnit === 'case' ? 'case' : 'unit';
+      const isCombo = isComboProduct(serverProduct.id, dbSettings);
 
       let unitsPerSale = 1;
       let effectivePrice = getEffectivePrice(serverProduct);
       let originalPrice = serverProduct.price;
 
       if (saleUnit === 'case') {
+        if (isCombo) {
+          return res.status(400).json({
+            error: 'Este produto não é vendido em caixa fechada.',
+          });
+        }
         const hasCase =
           serverProduct.caseSize !== null &&
           serverProduct.caseSize !== undefined &&
@@ -3367,32 +4064,116 @@ export function createApp(): express.Express {
         originalPrice = Number(serverProduct.casePrice);
       }
 
-      const unitsForThisLine = requestedQty * unitsPerSale;
-      const totalUnitsForProduct = (unitsByProductId.get(serverProduct.id) || 0) + unitsForThisLine;
+      const addonsValidation = validateAndCalculateItemAddons(
+        serverProduct,
+        item.addons,
+        dbSettings
+      );
+      if (addonsValidation.error) {
+        return res.status(400).json({ error: addonsValidation.error });
+      }
 
+      let itemCostPrice = (Number(serverProduct.costPrice) || 0) * unitsPerSale;
+      let itemComboComponents: OrderItemComboComponent[] | undefined = undefined;
+
+      if (isCombo) {
+        const comboDef = dbSettings.combos?.[serverProduct.id] || [];
+        if (comboDef.length === 0) {
+          return res.status(400).json({
+            error: `O combo "${serverProduct.name}" não possui itens configurados.`,
+          });
+        }
+
+        let comboCostSum = 0;
+        const resolvedComboItems: OrderItemComboComponent[] = [];
+
+        for (const ci of comboDef) {
+          const comp = dbProducts.find((p) => p.id === ci.productId);
+          const compQty = Math.max(1, Math.floor(Number(ci.quantity) || 1));
+
+          if (!comp || !comp.active) {
+            return res.status(409).json({
+              error: `Estoque insuficiente para o combo ${serverProduct.name}: falta ${comp ? comp.name : ci.productId}`,
+            });
+          }
+
+          const neededForComp = requestedQty * compQty;
+          unitsByProductId.set(comp.id, (unitsByProductId.get(comp.id) || 0) + neededForComp);
+
+          comboCostSum += (Number(comp.costPrice) || 0) * compQty;
+          resolvedComboItems.push({
+            productId: comp.id,
+            name: formatComboComponentProductName(comp),
+            quantity: compQty,
+          });
+        }
+
+        itemCostPrice = Math.round(comboCostSum * 100) / 100;
+        itemComboComponents = resolvedComboItems;
+        comboCheckList.push({ comboProduct: serverProduct, comboDef });
+      } else {
+        const unitsForThisLine = requestedQty * unitsPerSale;
+        const totalUnitsForProduct = (unitsByProductId.get(serverProduct.id) || 0) + unitsForThisLine;
+        unitsByProductId.set(serverProduct.id, totalUnitsForProduct);
+        nonComboCheckList.push(serverProduct);
+      }
+
+      const finalUnitPrice = Math.round((effectivePrice + addonsValidation.addonsTotal) * 100) / 100;
+      const finalOriginalPrice = Math.round((originalPrice + addonsValidation.addonsTotal) * 100) / 100;
+      const itemTotal = Math.round(finalUnitPrice * requestedQty * 100) / 100;
+      recalculatedSubtotal = Math.round((recalculatedSubtotal + itemTotal) * 100) / 100;
+
+      const validatedOrderItem: OrderItem = {
+        productId: serverProduct.id,
+        name: serverProduct.name,
+        volume: serverProduct.volume,
+        price: finalUnitPrice,
+        originalPrice: finalOriginalPrice,
+        costPrice: itemCostPrice,
+        quantity: requestedQty,
+        saleUnit,
+        unitsPerSale,
+        isCold: serverProduct.isCold,
+      };
+
+      if (itemComboComponents && itemComboComponents.length > 0) {
+        validatedOrderItem.comboItems = itemComboComponents;
+      }
+
+      if (addonsValidation.addons.length > 0) {
+        validatedOrderItem.addons = addonsValidation.addons.map((a) => ({
+          groupName: a.groupName,
+          optionName: a.optionName,
+          price: a.price,
+          quantity: a.quantity,
+        }));
+        validatedOrderItem.addonsTotal = addonsValidation.addonsTotal;
+      }
+
+      validatedItems.push(validatedOrderItem);
+    }
+
+    // Check total accumulated stock for all combo components first (summing across all combos and loose items in the order)
+    for (const { comboProduct, comboDef } of comboCheckList) {
+      for (const ci of comboDef) {
+        const comp = dbProducts.find((p) => p.id === ci.productId);
+        const totalNeededForComp = unitsByProductId.get(ci.productId) || 0;
+        if (!comp || !comp.active || comp.stock < totalNeededForComp) {
+          return res.status(409).json({
+            error: `Estoque insuficiente para o combo ${comboProduct.name}: falta ${comp ? comp.name : ci.productId}`,
+          });
+        }
+      }
+    }
+
+    // Check total accumulated stock for regular (non-combo) items
+    for (const serverProduct of nonComboCheckList) {
+      const totalUnitsForProduct = unitsByProductId.get(serverProduct.id) || 0;
       if (serverProduct.stock < totalUnitsForProduct) {
         return res.status(409).json({
           error: `Estoque insuficiente para "${serverProduct.name}". Disponível em estoque: ${serverProduct.stock} un.`,
         });
       }
-
-      unitsByProductId.set(serverProduct.id, totalUnitsForProduct);
-
-      const itemTotal = effectivePrice * requestedQty;
-      recalculatedSubtotal += itemTotal;
-
-      validatedItems.push({
-        productId: serverProduct.id,
-        name: serverProduct.name,
-        volume: serverProduct.volume,
-        price: effectivePrice,
-        originalPrice,
-        costPrice: (Number(serverProduct.costPrice) || 0) * unitsPerSale,
-        quantity: requestedQty,
-        saleUnit,
-        unitsPerSale,
-        isCold: serverProduct.isCold,
-      });
     }
 
     const stockPayload: { id: string; qty: number }[] = Array.from(unitsByProductId.entries()).map(
@@ -3503,8 +4284,18 @@ export function createApp(): express.Express {
       let prodName = 'um dos produtos selecionados';
       const match = decStockErr.message?.match(/ESTOQUE_INSUFICIENTE:([^\s,]+)/);
       if (match && match[1]) {
-        const offending = dbProducts.find((p) => p.id === match[1]);
+        const offendingId = match[1];
+        const offending = dbProducts.find((p) => p.id === offendingId);
         if (offending) prodName = offending.name;
+
+        const matchingCombo = comboCheckList.find((c) =>
+          c.comboDef.some((ci) => ci.productId === offendingId)
+        );
+        if (matchingCombo) {
+          return res.status(409).json({
+            error: `Estoque insuficiente para o combo ${matchingCombo.comboProduct.name}: falta ${prodName}`,
+          });
+        }
       }
       return res.status(409).json({ error: `Estoque insuficiente para "${prodName}".` });
     }
@@ -3615,6 +4406,7 @@ export function createApp(): express.Express {
   });
 
   // Requirement: Ao mudar o status de um pedido para cancelado, devolva o estoque com restore_stock; se sair de cancelado para outro status, baixe de novo com decrement_stock.
+  // Para combos, use comboItems gravado no item do pedido.
   router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
     const { id } = req.params;
     const { status: newStatus, notes: incomingNotes } = req.body || {};
@@ -3685,17 +4477,8 @@ export function createApp(): express.Express {
       return res.status(409).json({ error: 'Este pedido já foi alterado por outra pessoa. Atualize a tela.' });
     }
 
-    // 2. Adjust stock ONLY after conditional status transition succeeded
-    const unitsMap = new Map<string, number>();
-    for (const it of existingOrder.items || []) {
-      const qty = Math.max(1, Number(it.quantity) || 1);
-      const unitsPerSale = it.unitsPerSale && Number(it.unitsPerSale) > 0 ? Number(it.unitsPerSale) : 1;
-      unitsMap.set(it.productId, (unitsMap.get(it.productId) || 0) + qty * unitsPerSale);
-    }
-    const stockItems = Array.from(unitsMap.entries()).map(([prodId, qty]) => ({
-      id: prodId,
-      qty,
-    }));
+    // 2. Adjust stock ONLY after conditional status transition succeeded (using saved comboItems for combos)
+    const stockItems = extractOrderStockItems(existingOrder);
 
     if (stockItems.length > 0) {
       if (oldStatus !== 'cancelado' && newStatus === 'cancelado') {
@@ -3754,16 +4537,7 @@ export function createApp(): express.Express {
     if (existingRow) {
       const existingOrder = orderFromDB(existingRow);
       if (existingOrder.status !== 'cancelado') {
-        const unitsMap = new Map<string, number>();
-        for (const it of existingOrder.items || []) {
-          const qty = Math.max(1, Number(it.quantity) || 1);
-          const unitsPerSale = it.unitsPerSale && Number(it.unitsPerSale) > 0 ? Number(it.unitsPerSale) : 1;
-          unitsMap.set(it.productId, (unitsMap.get(it.productId) || 0) + qty * unitsPerSale);
-        }
-        const stockItems = Array.from(unitsMap.entries()).map(([prodId, qty]) => ({
-          id: prodId,
-          qty,
-        }));
+        const stockItems = extractOrderStockItems(existingOrder);
         if (stockItems.length > 0) {
           const { error: restErr } = await supabase.rpc('restore_stock', { p_items: stockItems });
           if (restErr) {
@@ -3784,7 +4558,7 @@ export function createApp(): express.Express {
   });
 
   // ---------------------------------------------------------------------------
-  // SETTINGS ROUTES
+  // SETTINGS & CATEGORIES ROUTES
   // ---------------------------------------------------------------------------
   router.get('/settings', async (_req, res) => {
     const supabase = getSupabase();
@@ -3796,6 +4570,14 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
     const settings = data?.data ? sanitizePublicSettings(data.data) : sanitizePublicSettings(initialSettings);
+    if (!settings.categories || settings.categories.length === 0) {
+      const { data: prodRows, error: prodErr } = await supabase.from('products').select('category');
+      if (prodErr) {
+        console.error('[Supabase Error] products categories get:', prodErr.message);
+        return res.status(500).json({ error: prodErr.message });
+      }
+      settings.categories = buildInitialCategoriesFromProducts((prodRows || []) as any);
+    }
     res.json(settings);
   });
 
@@ -3809,19 +4591,64 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: fetchError.message });
     }
     const current = existingData?.data || initialSettings;
+
+    const { data: allProdRows, error: prodError } = await supabase
+      .from('products')
+      .select('id, category');
+    if (prodError) {
+      console.error('[Supabase Error] products check in settings update:', prodError.message);
+      return res.status(500).json({ error: prodError.message });
+    }
+
+    const existingIds = new Set((allProdRows || []).map((r: any) => String(r.id)));
+
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'combos')) {
+      const comboValidation = validateIncomingCombos(req.body.combos, existingIds);
+      if (comboValidation.error) {
+        return res.status(400).json({ error: comboValidation.error });
+      }
+    }
+
     const cleanSettings = sanitizePublicSettings({ ...current, ...req.body });
 
+    if (!cleanSettings.categories || cleanSettings.categories.length === 0) {
+      cleanSettings.categories = buildInitialCategoriesFromProducts((allProdRows || []) as any);
+    }
+
     if (cleanSettings.featuredProductIds && cleanSettings.featuredProductIds.length > 0) {
-      const { data: prodRows, error: prodError } = await supabase
-        .from('products')
-        .select('id')
-        .in('id', cleanSettings.featuredProductIds);
-      if (prodError) {
-        console.error('[Supabase Error] products check in settings update:', prodError.message);
-        return res.status(500).json({ error: prodError.message });
+      cleanSettings.featuredProductIds = cleanSettings.featuredProductIds.filter((id) => existingIds.has(id));
+    }
+
+    if (cleanSettings.productOrder && typeof cleanSettings.productOrder === 'object') {
+      const filteredOrder: Record<string, string[]> = {};
+      let totalCount = 0;
+      for (const [catId, list] of Object.entries(cleanSettings.productOrder)) {
+        if (!Array.isArray(list) || totalCount >= 2000) continue;
+        const validList: string[] = [];
+        for (const pid of list) {
+          if (totalCount >= 2000) break;
+          if (existingIds.has(pid)) {
+            validList.push(pid);
+            totalCount++;
+          }
+        }
+        if (validList.length > 0) {
+          filteredOrder[catId] = validList;
+        }
       }
-      const existingIds = new Set((prodRows || []).map((r: any) => String(r.id)));
-      cleanSettings.featuredProductIds = cleanSettings.featuredProductIds.filter(id => existingIds.has(id));
+      cleanSettings.productOrder = filteredOrder;
+    }
+
+    if (cleanSettings.combos && typeof cleanSettings.combos === 'object') {
+      const filteredCombos: Record<string, ComboComponentItem[]> = {};
+      for (const [comboId, items] of Object.entries(cleanSettings.combos)) {
+        if (!existingIds.has(comboId)) continue;
+        const validItems = items.filter((it) => existingIds.has(it.productId));
+        if (validItems.length > 0 && validItems.length === items.length) {
+          filteredCombos[comboId] = validItems;
+        }
+      }
+      cleanSettings.combos = filteredCombos;
     }
 
     const { error } = await supabase.from('store_settings').upsert({
@@ -3836,6 +4663,107 @@ export function createApp(): express.Express {
     }
 
     res.json(cleanSettings);
+  });
+
+  router.post('/admin/categories/remove', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const rawId = req.body?.id;
+    const rawMoveTo = req.body?.moveTo;
+    const catId = String(rawId ?? '').trim();
+    const moveToId = rawMoveTo ? String(rawMoveTo).trim() : '';
+
+    if (!catId) {
+      return res.status(400).json({ error: 'ID da categoria inválido.' });
+    }
+
+    const [{ data: settingsRow, error: settingsErr }, { data: allProds, error: prodsErr }] = await Promise.all([
+      supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+      supabase.from('products').select('id, category'),
+    ]);
+
+    if (settingsErr) {
+      console.error('[Supabase Error] store_settings fetch in categories/remove:', settingsErr.message);
+      return res.status(500).json({ error: settingsErr.message });
+    }
+    if (prodsErr) {
+      console.error('[Supabase Error] products fetch in categories/remove:', prodsErr.message);
+      return res.status(500).json({ error: prodsErr.message });
+    }
+
+    const cleanSettings = sanitizePublicSettings(settingsRow?.data || initialSettings);
+    if (!cleanSettings.categories || cleanSettings.categories.length === 0) {
+      cleanSettings.categories = buildInitialCategoriesFromProducts((allProds || []) as any);
+    }
+
+    if (!cleanSettings.categories.some((c) => c.id === catId)) {
+      return res.status(400).json({ error: 'Categoria não encontrada.' });
+    }
+
+    const productsInCategory = (allProds || []).filter((p: any) => String(p.category) === catId);
+    const remainingCategories = cleanSettings.categories.filter((c) => c.id !== catId);
+
+    if (remainingCategories.length === 0) {
+      return res.status(400).json({ error: 'A loja precisa ter pelo menos uma categoria cadastrada.' });
+    }
+
+    if (productsInCategory.length > 0) {
+      if (!moveToId || moveToId === catId) {
+        return res.status(400).json({
+          error: 'Escolha uma categoria de destino para mover os produtos desta categoria.',
+        });
+      }
+      const targetExists = remainingCategories.some((c) => c.id === moveToId);
+      if (!targetExists) {
+        return res.status(400).json({ error: 'A categoria de destino informada não existe.' });
+      }
+
+      const { error: moveError } = await supabase
+        .from('products')
+        .update({
+          category: moveToId,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('category', catId);
+
+      if (moveError) {
+        console.error('[Supabase Error] products update category in categories/remove:', moveError.message);
+        return res.status(500).json({ error: moveError.message });
+      }
+    }
+
+    // Remove category from settings.categories only after moving products succeeded
+    cleanSettings.categories = remainingCategories;
+
+    // Clean up productOrder for removed category (and merge into moveToId if applicable)
+    if (cleanSettings.productOrder && cleanSettings.productOrder[catId]) {
+      const oldOrderIds = cleanSettings.productOrder[catId] || [];
+      if (moveToId && productsInCategory.length > 0) {
+        const destOrder = cleanSettings.productOrder[moveToId] || [];
+        const merged = Array.from(new Set([...destOrder, ...oldOrderIds]));
+        cleanSettings.productOrder[moveToId] = merged;
+      }
+      delete cleanSettings.productOrder[catId];
+    }
+
+    const sanitizedFinal = sanitizePublicSettings(cleanSettings);
+
+    const { error: saveSettingsErr } = await supabase.from('store_settings').upsert({
+      id: 'default',
+      data: sanitizedFinal,
+      updated_at: new Date().toISOString(),
+    });
+
+    if (saveSettingsErr) {
+      console.error('[Supabase Error] store_settings update in categories/remove:', saveSettingsErr.message);
+      return res.status(500).json({ error: saveSettingsErr.message });
+    }
+
+    return res.json({
+      settings: sanitizedFinal,
+      movedCount: productsInCategory.length,
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -4324,16 +5252,21 @@ export function createApp(): express.Express {
       return res.status(400).json({ error: 'A comanda não está aberta para novos itens.' });
     }
 
-    // Fetch product to calculate current effective price
-    const { data: prodData, error: prodErr } = await supabase
-      .from('products')
-      .select('*')
-      .eq('id', product_id)
-      .maybeSingle();
+    // Fetch product and store_settings to verify product is not a combo and calculate effective price
+    const [{ data: prodData, error: prodErr }, { data: settingsRow, error: settingsErr }] = await Promise.all([
+      supabase.from('products').select('*').eq('id', product_id).maybeSingle(),
+      supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+    ]);
 
     if (prodErr) return res.status(500).json({ error: prodErr.message });
+    if (settingsErr) return res.status(500).json({ error: settingsErr.message });
     if (!prodData || prodData.active === false) {
       return res.status(404).json({ error: 'Produto não encontrado ou inativo.' });
+    }
+
+    const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
+    if (isComboProduct(String(prodData.id), dbSettings)) {
+      return res.status(400).json({ error: 'Combo: venda no balcão ou na loja.' });
     }
 
     let unitPrice = getEffectivePrice(prodData);

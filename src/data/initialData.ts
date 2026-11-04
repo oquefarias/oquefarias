@@ -25,7 +25,12 @@ export const initialSettings: StoreSettings = {
   deliveryModel: 'both',
   showOutOfStock: false,
   featuredProductIds: [],
+  categories: [],
+  productSortMode: 'manual',
+  productOrder: {},
   shortcuts: { ...DEFAULT_SHORTCUTS },
+  addonGroups: [],
+  combos: {},
 };
 
 // All simulation data wiped clean for real depot operation
