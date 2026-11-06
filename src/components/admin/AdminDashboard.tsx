@@ -36,7 +36,11 @@ import {
   formatOrderItemComboLine,
   isProductHiddenFromStore,
 } from '../../types';
-import { api } from '../../services/api';
+import {
+  api,
+  isNetworkOrTimeoutError,
+  ORDER_NETWORK_EXHAUSTED_MESSAGE,
+} from '../../services/api';
 import { soundService } from '../../utils/sound';
 import { PrintReceiptModal } from '../PrintReceiptModal';
 import { ProductAddonsModal } from '../ProductAddonsModal';
@@ -52,6 +56,11 @@ import {
   buildSingleDeliveryRouteUrl,
   buildMultiStopDeliveryRoute,
 } from '../../utils/geo';
+import {
+  optimizeProductImageFile,
+  fetchAndOptimizeExistingProductImage,
+  formatBytesCompactPtBr,
+} from '../../utils/imageOptimizer';
 import QRCode from 'qrcode';
 import {
   Bell,
@@ -502,6 +511,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [posCashGiven, setPosCashGiven] = useState<string>('');
   const [posClientRequestId, setPosClientRequestId] = useState<string>(() => crypto.randomUUID());
   const [isSubmittingPos, setIsSubmittingPos] = useState<boolean>(false);
+  const [posSubmittingStatus, setPosSubmittingStatus] = useState<string>('');
+  const [posError, setPosError] = useState<string>('');
+  const [posCanRetry, setPosCanRetry] = useState<boolean>(false);
 
   // Order cancellation / reversal modal state
   const [cancelOrderModal, setCancelOrderModal] = useState<{
@@ -525,6 +537,138 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [settingsSavedMessage, setSettingsSavedMessage] = useState<boolean>(false);
   const [isUploadingLogo, setIsUploadingLogo] = useState<boolean>(false);
   const [isUploadingProductPhoto, setIsUploadingProductPhoto] = useState<boolean>(false);
+  const [productPhotoOptimizedSummary, setProductPhotoOptimizedSummary] = useState<string>('');
+  const [showProductPhotoHelp, setShowProductPhotoHelp] = useState<boolean>(false);
+
+  // Batch optimize existing product photos state
+  const [batchPhotoOpt, setBatchPhotoOpt] = useState<{
+    running: boolean;
+    current: number;
+    total: number;
+    beforeBytes: number;
+    afterBytes: number;
+    updatedCount: number;
+    summaryText: string;
+    errorText: string;
+  }>({
+    running: false,
+    current: 0,
+    total: 0,
+    beforeBytes: 0,
+    afterBytes: 0,
+    updatedCount: 0,
+    summaryText: '',
+    errorText: '',
+  });
+
+  const storedPhotoProducts = useMemo(() => {
+    return products.filter((p) => {
+      const url = p.imageUrl || p.image || '';
+      return url.startsWith('/api/products/') || url.startsWith('data:image/');
+    });
+  }, [products]);
+
+  const handleBatchOptimizeProductPhotos = async () => {
+    if (batchPhotoOpt.running) return;
+    const targets = products.filter((p) => {
+      const url = p.imageUrl || p.image || '';
+      return url.startsWith('/api/products/') || url.startsWith('data:image/');
+    });
+    if (targets.length === 0) {
+      setBatchPhotoOpt({
+        running: false,
+        current: 0,
+        total: 0,
+        beforeBytes: 0,
+        afterBytes: 0,
+        updatedCount: 0,
+        summaryText: 'Nenhuma foto salva no banco precisou ser otimizada.',
+        errorText: '',
+      });
+      return;
+    }
+
+    setBatchPhotoOpt({
+      running: true,
+      current: 0,
+      total: targets.length,
+      beforeBytes: 0,
+      afterBytes: 0,
+      updatedCount: 0,
+      summaryText: '',
+      errorText: '',
+    });
+
+    let totalBefore = 0;
+    let totalAfter = 0;
+    let updatedCount = 0;
+
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        const prod = targets[i];
+        setBatchPhotoOpt((prev) => ({
+          ...prev,
+          current: i + 1,
+        }));
+
+        const srcUrl = prod.imageUrl || `/api/products/${encodeURIComponent(prod.id)}/image`;
+        let optResult: Awaited<ReturnType<typeof fetchAndOptimizeExistingProductImage>> | null = null;
+        try {
+          optResult = await fetchAndOptimizeExistingProductImage(srcUrl);
+        } catch {
+          optResult = null;
+        }
+        if (!optResult) {
+          continue;
+        }
+
+        const beforeItemBytes = optResult.originalStorageBytes;
+        const afterCandidateBytes = optResult.newStorageBytes;
+        totalBefore += beforeItemBytes;
+
+        if (
+          optResult.optimized.bytes < optResult.originalDecodedBytes &&
+          afterCandidateBytes < beforeItemBytes
+        ) {
+          try {
+            await api.updateProductImage(prod.id, optResult.optimized.dataUrl);
+            totalAfter += afterCandidateBytes;
+            updatedCount += 1;
+          } catch {
+            totalAfter += beforeItemBytes;
+          }
+        } else {
+          totalAfter += beforeItemBytes;
+        }
+
+        setBatchPhotoOpt((prev) => ({
+          ...prev,
+          beforeBytes: totalBefore,
+          afterBytes: totalAfter,
+          updatedCount,
+        }));
+      }
+
+      await api.reloadProducts();
+
+      setBatchPhotoOpt({
+        running: false,
+        current: targets.length,
+        total: targets.length,
+        beforeBytes: totalBefore,
+        afterBytes: totalAfter,
+        updatedCount,
+        summaryText: `Antes: ${formatBytesCompactPtBr(totalBefore)} — Depois: ${formatBytesCompactPtBr(totalAfter)}`,
+        errorText: '',
+      });
+    } catch (err: any) {
+      setBatchPhotoOpt((prev) => ({
+        ...prev,
+        running: false,
+        errorText: err?.message || 'Erro ao otimizar fotos dos produtos.',
+      }));
+    }
+  };
 
   // Shortcuts UI states
   const [isShortcutsModalOpen, setIsShortcutsModalOpen] = useState<boolean>(false);
@@ -626,19 +770,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleProductPhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      setProductModalError('Por favor selecione um arquivo de imagem.');
-      return;
-    }
     setIsUploadingProductPhoto(true);
     try {
-      const compressed = await compressImageFile(file, 600, 0.88);
-      setProductForm(prev => ({ ...prev, image: compressed }));
-    } catch (err) {
+      const optimized = await optimizeProductImageFile(file);
+      setProductForm(prev => ({ ...prev, image: optimized.dataUrl }));
+      setProductPhotoOptimizedSummary(
+        `Foto otimizada: ${optimized.width}×${optimized.height}, ${optimized.kb} KB`
+      );
+      setProductModalError('');
+    } catch (err: any) {
       console.error('Erro ao processar imagem:', err);
-      setProductModalError('Erro ao carregar a foto do produto.');
+      setProductModalError(err?.message || 'Erro ao carregar a foto do produto.');
     } finally {
       setIsUploadingProductPhoto(false);
+      e.target.value = '';
     }
   };
 
@@ -1114,6 +1259,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setEditingProduct(null);
     setProductModalError('');
     setProductModalSuccessNotice('');
+    setProductPhotoOptimizedSummary('');
+    setShowProductPhotoHelp(false);
     setShowDiscardProductConfirm(false);
     const defaultCategory = storeCategories[0]?.id || 'cervejas';
     const initialForm = {
@@ -1133,7 +1280,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       isCold: true,
       active: true,
       appearsInDelivery: true,
-      image: 'https://images.unsplash.com/photo-1535958636474-b021ee887b13?w=500&auto=format&fit=crop&q=80',
+      image: '',
       sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
       description: '',
     };
@@ -1153,6 +1300,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setEditingProduct(p);
     setProductModalError('');
     setProductModalSuccessNotice('');
+    setProductPhotoOptimizedSummary('');
+    setShowProductPhotoHelp(false);
     setShowDiscardProductConfirm(false);
     const chConfig = settings.caseSaleChannels?.[p.id];
     const hasCasePrice = hasProductCase(p);
@@ -1174,7 +1323,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       isCold: p.isCold,
       active: p.active !== false,
       appearsInDelivery: !isProductHiddenFromStore(p.id, settings),
-      image: p.image,
+      image: p.imageUrl || p.image || '',
       sku: p.sku,
       description: p.description,
     };
@@ -1190,6 +1339,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setEditingProduct(null);
     setProductModalError('');
     setProductModalSuccessNotice('');
+    setProductPhotoOptimizedSummary('');
+    setShowProductPhotoHelp(false);
     setShowDiscardProductConfirm(false);
     const chConfig = settings.caseSaleChannels?.[p.id];
     const hasCasePrice = hasProductCase(p);
@@ -1211,7 +1362,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       isCold: p.isCold,
       active: p.active !== false,
       appearsInDelivery: !isProductHiddenFromStore(p.id, settings),
-      image: p.image,
+      image: p.imageUrl || p.image || '',
       sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
       description: p.description,
     };
@@ -1324,6 +1475,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       if (mode === 'new') {
         setEditingProduct(null);
         setShowDiscardProductConfirm(false);
+        setProductPhotoOptimizedSummary('');
         const nextBlankForm = {
           id: `prod-${Date.now()}`,
           name: '',
@@ -1341,7 +1493,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           isCold: productForm.isCold,
           active: true,
           appearsInDelivery: productForm.appearsInDelivery !== false,
-          image: productForm.image,
+          image: '',
           sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
           description: '',
         };
@@ -1635,6 +1787,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleFinishPosSale = async () => {
     if (posCart.length === 0 || isSubmittingPos || isPosCashShort) return;
     setIsSubmittingPos(true);
+    setPosError('');
+    setPosCanRetry(false);
+    setPosSubmittingStatus('');
     try {
       const shouldSendCash =
         posPaymentMethod === 'dinheiro' &&
@@ -1642,56 +1797,75 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         !Number.isNaN(posCashNum) &&
         Math.round(posCashNum * 100) >= Math.round(posSubtotal * 100);
 
-      const order = await api.createOrder({
-        source: 'balcao',
-        clientRequestId: posClientRequestId,
-        customer: {
-          name: posCustomerName.trim() || 'Cliente Balcão',
-          phone: '(Balcão)',
-          address: 'Venda Presencial no Depósito',
-          number: 'Balcão',
-          neighborhood: 'Loja Física',
+      const order = await api.createOrder(
+        {
+          source: 'balcao',
+          clientRequestId: posClientRequestId,
+          customer: {
+            name: posCustomerName.trim() || 'Cliente Balcão',
+            phone: '(Balcão)',
+            address: 'Venda Presencial no Depósito',
+            number: 'Balcão',
+            neighborhood: 'Loja Física',
+          },
+          deliveryType: 'retirada',
+          items: posCart.map(i => {
+            const isCase = i.saleUnit === 'case' && canSellProductCase(i.product, settings, 'local');
+            const unitsPerSale = isCase ? Number(i.product.caseSize) : 1;
+            const baseUnitPrice = isCase
+              ? Number(i.product.casePrice)
+              : getEffectiveProductPrice(i.product);
+            const unitPrice = getPosItemPrice(i.product, i.saleUnit, i.addonsTotal || 0);
+            return {
+              productId: i.product.id,
+              name: i.product.name,
+              volume: i.product.volume,
+              price: unitPrice,
+              originalPrice: (isCase ? baseUnitPrice : i.product.price) + (i.addonsTotal || 0),
+              costPrice: i.product.costPrice * unitsPerSale,
+              quantity: i.quantity,
+              saleUnit: isCase ? 'case' : 'unit',
+              unitsPerSale,
+              isCold: i.product.isCold,
+              addons: i.addons && i.addons.length > 0 ? i.addons : undefined,
+              addonsTotal: i.addonsTotal || undefined,
+              comboItems: i.comboItems && i.comboItems.length > 0 ? i.comboItems : undefined,
+            };
+          }),
+          subtotal: posSubtotal,
+          deliveryFee: 0,
+          total: posSubtotal,
+          paymentMethod: posPaymentMethod,
+          cashChangeFor: shouldSendCash ? Math.round(posCashNum * 100) / 100 : undefined,
         },
-        deliveryType: 'retirada',
-        items: posCart.map(i => {
-          const isCase = i.saleUnit === 'case' && canSellProductCase(i.product, settings, 'local');
-          const unitsPerSale = isCase ? Number(i.product.caseSize) : 1;
-          const baseUnitPrice = isCase
-            ? Number(i.product.casePrice)
-            : getEffectiveProductPrice(i.product);
-          const unitPrice = getPosItemPrice(i.product, i.saleUnit, i.addonsTotal || 0);
-          return {
-            productId: i.product.id,
-            name: i.product.name,
-            volume: i.product.volume,
-            price: unitPrice,
-            originalPrice: (isCase ? baseUnitPrice : i.product.price) + (i.addonsTotal || 0),
-            costPrice: i.product.costPrice * unitsPerSale,
-            quantity: i.quantity,
-            saleUnit: isCase ? 'case' : 'unit',
-            unitsPerSale,
-            isCold: i.product.isCold,
-            addons: i.addons && i.addons.length > 0 ? i.addons : undefined,
-            addonsTotal: i.addonsTotal || undefined,
-            comboItems: i.comboItems && i.comboItems.length > 0 ? i.comboItems : undefined,
-          };
-        }),
-        subtotal: posSubtotal,
-        deliveryFee: 0,
-        total: posSubtotal,
-        paymentMethod: posPaymentMethod,
-        cashChangeFor: shouldSendCash ? Math.round(posCashNum * 100) / 100 : undefined,
-      });
+        {
+          onStatusMessage: (msg) => setPosSubmittingStatus(msg),
+        }
+      );
 
-      await api.updateOrderStatus(order.id, 'concluido');
-      setSelectedReceiptOrder(order);
+      if (order.status !== 'concluido') {
+        await api.updateOrderStatus(order.id, 'concluido').catch(() => {});
+      }
+      setSelectedReceiptOrder({ ...order, status: 'concluido' });
 
       setPosCart([]);
       setPosCashGiven('');
       setPosCustomerName('Cliente Balcão');
+      setPosError('');
+      setPosCanRetry(false);
+      setPosSubmittingStatus('');
       setPosClientRequestId(crypto.randomUUID());
     } catch (err: any) {
       console.error('Falha ao processar venda balcão:', err);
+      setPosSubmittingStatus('');
+      if (err?.isNetworkRetryExhausted || isNetworkOrTimeoutError(err)) {
+        // Mantém o MESMO posClientRequestId para não duplicar ao tocar em "Tentar de novo"
+        setPosError(ORDER_NETWORK_EXHAUSTED_MESSAGE);
+        setPosCanRetry(true);
+      } else {
+        setPosCanRetry(false);
+        setPosError(err.message || 'Não foi possível finalizar a venda.');
+      }
     } finally {
       setIsSubmittingPos(false);
     }
@@ -3471,6 +3645,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
                   <button
                     type="button"
+                    disabled={batchPhotoOpt.running}
+                    onClick={handleBatchOptimizeProductPhotos}
+                    className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-3.5 py-2.5 bg-white hover:bg-neutral-50 disabled:opacity-50 text-neutral-800 border border-neutral-300 font-bold rounded-xl text-xs shadow-2xs transition-colors cursor-pointer"
+                    title="Reduzir o tamanho das fotos já cadastradas no banco para economizar tráfego"
+                  >
+                    <ImageIcon className="w-4 h-4 text-amber-600" />
+                    <span>
+                      {batchPhotoOpt.running
+                        ? `Otimizando (${batchPhotoOpt.current} de ${batchPhotoOpt.total})...`
+                        : 'Otimizar fotos dos produtos'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => setIsImportModalOpen(true)}
                     className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-white hover:bg-neutral-50 text-neutral-800 border border-neutral-300 font-bold rounded-xl text-xs shadow-2xs transition-colors cursor-pointer"
                   >
@@ -3488,6 +3677,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   </button>
                 </div>
               </div>
+
+              {(batchPhotoOpt.running || batchPhotoOpt.summaryText || batchPhotoOpt.errorText) && (
+                <div className="p-4 rounded-2xl bg-white border border-neutral-200 shadow-2xs space-y-2 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-black text-neutral-900">
+                      {batchPhotoOpt.running
+                        ? `Otimizando fotos dos produtos: ${batchPhotoOpt.current} de ${batchPhotoOpt.total}`
+                        : 'Otimização de fotos dos produtos concluída'}
+                    </span>
+                    {batchPhotoOpt.summaryText && (
+                      <span className="px-2.5 py-1 rounded-lg bg-emerald-100 text-emerald-900 font-black">
+                        {batchPhotoOpt.summaryText}
+                      </span>
+                    )}
+                  </div>
+                  {batchPhotoOpt.running && batchPhotoOpt.total > 0 && (
+                    <div className="w-full h-2.5 bg-neutral-100 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-amber-500 transition-all duration-200"
+                        style={{
+                          width: `${Math.round((batchPhotoOpt.current / batchPhotoOpt.total) * 100)}%`,
+                        }}
+                      />
+                    </div>
+                  )}
+                  {batchPhotoOpt.errorText && (
+                    <p className="text-red-600 font-bold">{batchPhotoOpt.errorText}</p>
+                  )}
+                </div>
+              )}
 
               {/* Category Filter Row: flex-wrap on desktop, horizontal scroll with right fade/chevron on mobile */}
               <div className="relative">
@@ -3568,10 +3787,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           <tr key={p.id} className="hover:bg-neutral-50 transition-colors">
                             <td className="py-3 px-4">
                               <div className="flex items-center gap-3">
-                                {p.image ? (
+                                {p.imageUrl || p.image ? (
                                   <img
-                                    src={p.image}
+                                    src={p.imageUrl || p.image}
                                     alt={p.name}
+                                    loading="lazy"
+                                    width={40}
+                                    height={40}
                                     className="w-10 h-10 rounded-xl object-cover border border-neutral-200 shrink-0"
                                   />
                                 ) : (
@@ -4111,10 +4333,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <tr key={prod.id} className="hover:bg-neutral-50/80 transition-colors">
                           <td className="py-3.5 px-4">
                             <div className="flex items-center gap-3">
-                              {prod.image ? (
+                              {prod.imageUrl || prod.image ? (
                                 <img
-                                  src={prod.image}
+                                  src={prod.imageUrl || prod.image}
                                   alt={prod.name}
+                                  loading="lazy"
+                                  width={44}
+                                  height={44}
                                   className="w-11 h-11 rounded-xl object-cover border border-neutral-200 shrink-0"
                                 />
                               ) : (
@@ -4407,6 +4632,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <button
                     onClick={() => {
                       setPosCart([]);
+                      setPosError('');
+                      setPosCanRetry(false);
+                      setPosSubmittingStatus('');
                       setPosClientRequestId(crypto.randomUUID());
                     }}
                     className="text-xs text-neutral-400 hover:text-red-500 font-semibold"
@@ -4552,13 +4780,39 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <span className="text-2xl font-black text-amber-600">{formatCurrency(posSubtotal)}</span>
               </div>
 
+              {isSubmittingPos && posSubmittingStatus && (
+                <div className="p-3 bg-amber-50 border border-amber-300 rounded-2xl text-amber-900 text-xs font-bold flex items-center gap-2">
+                  <RotateCcw className="w-4 h-4 shrink-0 text-amber-600 animate-spin" />
+                  <span>{posSubmittingStatus}</span>
+                </div>
+              )}
+
+              {posError && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-2xl text-red-700 text-xs font-bold space-y-2">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+                    <span>{posError}</span>
+                  </div>
+                  {posCanRetry && (
+                    <button
+                      type="button"
+                      disabled={isSubmittingPos}
+                      onClick={handleFinishPosSale}
+                      className="w-full py-2 px-3 bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white font-black text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <span>Tentar de novo</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
               <button
                 onClick={handleFinishPosSale}
                 disabled={posCart.length === 0 || isSubmittingPos || isPosCashShort}
                 className="w-full py-3.5 bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 text-white font-black text-sm rounded-2xl shadow-lg transition-all flex items-center justify-center gap-2"
               >
                 <CheckCircle2 className="w-5 h-5 text-amber-400" />
-                <span>{isSubmittingPos ? 'Enviando...' : 'Finalizar Venda & Imprimir'}</span>
+                <span>{isSubmittingPos ? (posSubmittingStatus || 'Enviando...') : 'Finalizar Venda & Imprimir'}</span>
               </button>
             </div>
           </div>
@@ -5075,6 +5329,65 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <option value="price_asc">Menor preço primeiro</option>
                   <option value="price_desc">Maior preço primeiro</option>
                 </select>
+              </div>
+
+              {/* OTIMIZAR FOTOS JÁ EXISTENTES NO BANCO */}
+              <div className="p-4 rounded-2xl bg-neutral-50 border border-neutral-200 space-y-3 text-xs">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <span className="font-bold text-xs sm:text-sm text-neutral-900 block">
+                      Otimizar fotos cadastradas ({storedPhotoProducts.length} com foto no banco)
+                    </span>
+                    <span className="text-[11px] text-neutral-500 block mt-0.5">
+                      Reduz automaticamente fotos pesadas já cadastradas (máx. 600×600 px, WebP/JPEG leve) para deixar a loja mais rápida e economizar tráfego do banco.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={batchPhotoOpt.running}
+                    onClick={handleBatchOptimizeProductPhotos}
+                    className="px-4 py-2.5 bg-neutral-900 hover:bg-neutral-800 disabled:opacity-50 text-white font-black rounded-xl text-xs inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer transition-colors"
+                  >
+                    <ImageIcon className="w-4 h-4 text-amber-400" />
+                    <span>
+                      {batchPhotoOpt.running
+                        ? `${batchPhotoOpt.current} de ${batchPhotoOpt.total}`
+                        : 'Otimizar fotos dos produtos'}
+                    </span>
+                  </button>
+                </div>
+
+                {batchPhotoOpt.running && batchPhotoOpt.total > 0 && (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px] font-bold text-neutral-700">
+                      <span>Progresso: {batchPhotoOpt.current} de {batchPhotoOpt.total}</span>
+                      <span>{Math.round((batchPhotoOpt.current / batchPhotoOpt.total) * 100)}%</span>
+                    </div>
+                    <div className="w-full h-2.5 bg-neutral-200 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-amber-500 transition-all duration-200"
+                        style={{
+                          width: `${Math.round((batchPhotoOpt.current / batchPhotoOpt.total) * 100)}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {batchPhotoOpt.summaryText && (
+                  <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 font-black flex flex-wrap items-center justify-between gap-2">
+                    <span>{batchPhotoOpt.summaryText}</span>
+                    <span className="text-[11px] font-bold text-emerald-700">
+                      ({batchPhotoOpt.updatedCount} fotos reduzidas de {batchPhotoOpt.total})
+                    </span>
+                  </div>
+                )}
+
+                {batchPhotoOpt.errorText && (
+                  <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 font-bold">
+                    {batchPhotoOpt.errorText}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -5684,38 +5997,72 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </div>
               </div>
 
-              <div>
-                <label className="font-bold text-neutral-700 block mb-1">Foto da Bebida / Produto</label>
-                
-                <div className="flex items-center gap-3 mb-2">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="font-bold text-neutral-700 block">Foto da Bebida / Produto</label>
+                  <button
+                    type="button"
+                    onClick={() => setShowProductPhotoHelp((v) => !v)}
+                    className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-700 hover:text-amber-800 underline cursor-pointer"
+                  >
+                    <HelpCircle className="w-3.5 h-3.5" />
+                    <span>Como ajustar a foto</span>
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-3">
                   {productForm.image ? (
                     <img
                       src={productForm.image}
                       alt="Preview"
-                      className="w-14 h-14 rounded-xl object-cover border border-neutral-300"
+                      loading="lazy"
+                      width={56}
+                      height={56}
+                      className="w-14 h-14 rounded-xl object-cover border border-neutral-300 shrink-0"
                     />
                   ) : (
-                    <div className="w-14 h-14 rounded-xl bg-neutral-100 flex items-center justify-center text-neutral-400">
+                    <div className="w-14 h-14 rounded-xl bg-neutral-100 flex items-center justify-center text-neutral-400 shrink-0">
                       <ImageIcon className="w-6 h-6" />
                     </div>
                   )}
 
-                  <div className="space-y-1">
-                    <input
-                      type="file"
-                      id="product-computer-file"
-                      accept="image/*"
-                      onChange={handleProductPhotoUpload}
-                      className="hidden"
-                    />
-                    <label
-                      htmlFor="product-computer-file"
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-bold cursor-pointer transition-colors"
-                    >
-                      <Upload className="w-3.5 h-3.5 text-amber-400" />
-                      <span>{isUploadingProductPhoto ? 'Carregando...' : 'Carregar Foto do Computador'}</span>
-                    </label>
-                    <p className="text-[10px] text-neutral-500">Escolha uma foto salva no seu computador</p>
+                  <div className="space-y-1 flex-1 min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        type="file"
+                        id="product-computer-file"
+                        accept="image/jpeg,image/png,image/webp"
+                        onChange={handleProductPhotoUpload}
+                        className="hidden"
+                      />
+                      <label
+                        htmlFor="product-computer-file"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-bold cursor-pointer transition-colors"
+                      >
+                        <Upload className="w-3.5 h-3.5 text-amber-400" />
+                        <span>{isUploadingProductPhoto ? 'Otimizando...' : 'Carregar Foto'}</span>
+                      </label>
+                      {productForm.image && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProductForm({ ...productForm, image: '' });
+                            setProductPhotoOptimizedSummary('');
+                          }}
+                          className="px-2.5 py-1.5 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl font-bold text-xs cursor-pointer"
+                        >
+                          Remover foto
+                        </button>
+                      )}
+                      {productPhotoOptimizedSummary && (
+                        <span className="px-2.5 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 font-bold text-[11px]">
+                          {productPhotoOptimizedSummary}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-neutral-500">
+                      JPG, PNG ou WebP (máx. 10 MB no arquivo original)
+                    </p>
                   </div>
                 </div>
 
@@ -5724,10 +6071,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     type="url"
                     placeholder="Ou cole o link da imagem (https://...)"
                     value={productForm.image}
-                    onChange={(e) => setProductForm({ ...productForm, image: e.target.value })}
+                    onChange={(e) => {
+                      setProductForm({ ...productForm, image: e.target.value });
+                      setProductPhotoOptimizedSummary('');
+                    }}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
                   />
                 </div>
+
+                <p className="text-[11px] text-neutral-500 leading-relaxed">
+                  Dica: use foto quadrada, com o produto centralizado e fundo claro. Tamanho ideal 600×600 px. Fotos grandes são reduzidas automaticamente para não deixar a loja lenta.
+                </p>
+
+                {showProductPhotoHelp && (
+                  <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-[11px] text-amber-950 space-y-1">
+                    <p className="font-black">Como deixar a foto perfeita:</p>
+                    <ul className="list-disc pl-4 space-y-0.5 text-amber-900 font-medium">
+                      <li>No celular, abra a foto na galeria e toque em <strong>editar → cortar → 1:1</strong> (formato quadrado).</li>
+                      <li>Evite print de tela com bordas pretas, relógio ou barra de bateria.</li>
+                      <li>Prefira fundo branco ou claro com a bebida bem centralizada.</li>
+                      <li>Aceitamos JPG, PNG e WebP (até 10 MB). Fotos acima de 5 MB podem levar alguns segundos a mais para otimizar.</li>
+                    </ul>
+                  </div>
+                )}
               </div>
 
               <div>
@@ -6042,11 +6408,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               {selectedPromoProduct && (
                 <div className="p-3 bg-neutral-50 rounded-2xl border border-neutral-200 flex items-center gap-3">
-                  <img
-                    src={selectedPromoProduct.image}
-                    alt={selectedPromoProduct.name}
-                    className="w-12 h-12 rounded-xl object-cover border border-neutral-200"
-                  />
+                  {selectedPromoProduct.imageUrl || selectedPromoProduct.image ? (
+                    <img
+                      src={selectedPromoProduct.imageUrl || selectedPromoProduct.image}
+                      alt={selectedPromoProduct.name}
+                      loading="lazy"
+                      width={48}
+                      height={48}
+                      className="w-12 h-12 rounded-xl object-cover border border-neutral-200 shrink-0"
+                    />
+                  ) : (
+                    <div className="w-12 h-12 rounded-xl bg-neutral-100 border border-neutral-200 flex items-center justify-center text-neutral-400 shrink-0">
+                      <Package className="w-5 h-5" />
+                    </div>
+                  )}
                   <div className="flex-1 min-w-0">
                     <p className="font-bold text-neutral-900 truncate">{selectedPromoProduct.name}</p>
                     <p className="text-[11px] text-neutral-500">

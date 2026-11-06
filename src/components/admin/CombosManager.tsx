@@ -12,6 +12,7 @@ import {
   isProductHiddenFromStore,
 } from '../../types';
 import { api } from '../../services/api';
+import { optimizeProductImageFile } from '../../utils/imageOptimizer';
 import {
   Package,
   Plus,
@@ -28,6 +29,7 @@ import {
   Boxes,
   Truck,
   Utensils,
+  HelpCircle,
 } from 'lucide-react';
 
 interface CombosManagerProps {
@@ -42,34 +44,6 @@ interface CombosManagerProps {
   externalEditingComboId?: string | null;
   onClearExternalEditingComboId?: () => void;
 }
-
-const compressImageFile = (file: File, maxWidth = 600, quality = 0.88): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        let width = img.width;
-        let height = img.height;
-        if (width > maxWidth) {
-          height = Math.round((height * maxWidth) / width);
-          width = maxWidth;
-        }
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return reject(new Error('Canvas context unavailable'));
-        ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', quality));
-      };
-      img.onerror = reject;
-      img.src = event.target?.result as string;
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-};
 
 export const CombosManager: React.FC<CombosManagerProps> = ({
   products,
@@ -103,6 +77,8 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
   const [modalError, setModalError] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
+  const [photoOptimizedSummary, setPhotoOptimizedSummary] = useState('');
+  const [showPhotoHelp, setShowPhotoHelp] = useState(false);
   const [confirmDeleteCombo, setConfirmDeleteCombo] = useState<Product | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
@@ -169,6 +145,8 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
     setPriceStr('');
     setCategory(suggestedCombosCategoryId);
     setImage('');
+    setPhotoOptimizedSummary('');
+    setShowPhotoHelp(false);
     setIsCold(true);
     setActive(true);
     setAppearsInDelivery(true);
@@ -187,7 +165,9 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
     setName(comboProd.name);
     setPriceStr(String(comboProd.price || ''));
     setCategory(comboProd.category || suggestedCombosCategoryId);
-    setImage(comboProd.image || '');
+    setImage(comboProd.imageUrl || comboProd.image || '');
+    setPhotoOptimizedSummary('');
+    setShowPhotoHelp(false);
     setIsCold(comboProd.isCold !== false);
     setActive(comboProd.active !== false);
     setAppearsInDelivery(!isProductHiddenFromStore(comboProd.id, settings));
@@ -213,19 +193,19 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      setModalError('Selecione um arquivo de imagem válido.');
-      return;
-    }
     setIsUploadingPhoto(true);
     try {
-      const compressed = await compressImageFile(file, 600, 0.88);
-      setImage(compressed);
+      const optimized = await optimizeProductImageFile(file);
+      setImage(optimized.dataUrl);
+      setPhotoOptimizedSummary(
+        `Foto otimizada: ${optimized.width}×${optimized.height}, ${optimized.kb} KB`
+      );
       setModalError('');
-    } catch {
-      setModalError('Não foi possível carregar a foto.');
+    } catch (err: any) {
+      setModalError(err?.message || 'Não foi possível carregar a foto.');
     } finally {
       setIsUploadingPhoto(false);
+      e.target.value = '';
     }
   };
 
@@ -547,10 +527,13 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
                 className="p-3.5 rounded-2xl border border-neutral-200 bg-neutral-50/60 hover:bg-white transition-colors flex items-start justify-between gap-3"
               >
                 <div className="flex items-start gap-3 min-w-0">
-                  {combo.image ? (
+                  {combo.imageUrl || combo.image ? (
                     <img
-                      src={combo.image}
+                      src={combo.imageUrl || combo.image}
                       alt={combo.name}
+                      loading="lazy"
+                      width={48}
+                      height={48}
                       className="w-12 h-12 rounded-xl object-cover border border-neutral-200 shrink-0"
                     />
                   ) : (
@@ -775,14 +758,27 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
 
                 {/* Photo upload & URL */}
                 <div className="sm:col-span-2 space-y-2">
-                  <label className="font-bold text-neutral-700 block">
-                    Foto do combo (opcional)
-                  </label>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="font-bold text-neutral-700 block">
+                      Foto do combo (opcional)
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setShowPhotoHelp((v) => !v)}
+                      className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-700 hover:text-amber-800 underline cursor-pointer"
+                    >
+                      <HelpCircle className="w-3.5 h-3.5" />
+                      <span>Como ajustar a foto</span>
+                    </button>
+                  </div>
                   <div className="flex items-center gap-3">
                     {image ? (
                       <img
                         src={image}
                         alt="Preview"
+                        loading="lazy"
+                        width={56}
+                        height={56}
                         className="w-14 h-14 rounded-2xl object-cover border border-neutral-300 shrink-0"
                       />
                     ) : (
@@ -794,10 +790,10 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
                       <div className="flex flex-wrap items-center gap-2">
                         <label className="px-3 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl font-bold text-xs inline-flex items-center gap-1.5 cursor-pointer">
                           <Upload className="w-3.5 h-3.5" />
-                          <span>{isUploadingPhoto ? 'Carregando...' : 'Enviar foto'}</span>
+                          <span>{isUploadingPhoto ? 'Otimizando...' : 'Enviar foto'}</span>
                           <input
                             type="file"
-                            accept="image/*"
+                            accept="image/jpeg,image/png,image/webp"
                             onChange={handlePhotoUpload}
                             className="hidden"
                           />
@@ -805,22 +801,47 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
                         {image && (
                           <button
                             type="button"
-                            onClick={() => setImage('')}
+                            onClick={() => {
+                              setImage('');
+                              setPhotoOptimizedSummary('');
+                            }}
                             className="px-2.5 py-1.5 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl font-bold text-xs cursor-pointer"
                           >
                             Remover foto
                           </button>
+                        )}
+                        {photoOptimizedSummary && (
+                          <span className="px-2.5 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 font-bold text-[11px]">
+                            {photoOptimizedSummary}
+                          </span>
                         )}
                       </div>
                       <input
                         type="url"
                         placeholder="Ou cole o link (URL) da imagem..."
                         value={image}
-                        onChange={(e) => setImage(e.target.value)}
+                        onChange={(e) => {
+                          setImage(e.target.value);
+                          setPhotoOptimizedSummary('');
+                        }}
                         className="w-full px-3 py-1.5 bg-neutral-50 border border-neutral-200 rounded-xl text-xs"
                       />
                     </div>
                   </div>
+                  <p className="text-[11px] text-neutral-500 leading-relaxed">
+                    Dica: use foto quadrada, com o produto centralizado e fundo claro. Tamanho ideal 600×600 px. Fotos grandes são reduzidas automaticamente para não deixar a loja lenta.
+                  </p>
+                  {showPhotoHelp && (
+                    <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-[11px] text-amber-950 space-y-1">
+                      <p className="font-black">Como deixar a foto perfeita:</p>
+                      <ul className="list-disc pl-4 space-y-0.5 text-amber-900 font-medium">
+                        <li>No celular, abra a foto na galeria e toque em <strong>editar → cortar → 1:1</strong> (formato quadrado).</li>
+                        <li>Evite print de tela com bordas pretas, relógio ou barra de bateria.</li>
+                        <li>Prefira fundo branco ou claro com a bebida bem centralizada.</li>
+                        <li>Aceitamos JPG, PNG e WebP (até 10 MB). Fotos acima de 5 MB podem levar alguns segundos a mais para otimizar.</li>
+                      </ul>
+                    </div>
+                  )}
                 </div>
 
                 {/* Toggles: Gelada, Ativo/Desativado & Aparece no delivery */}

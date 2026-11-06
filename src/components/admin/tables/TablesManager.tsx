@@ -86,12 +86,29 @@ export const TablesManager: React.FC<TablesManagerProps> = ({ products, settings
   useEffect(() => {
     loadTables();
 
-    // Auto-refresh every 10 seconds while tab is open
-    const interval = setInterval(() => {
-      loadTables();
-    }, 10000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        loadTables();
+      }
+    };
 
-    return () => clearInterval(interval);
+    // Auto-refresh every 15 seconds ONLY while tab is visible
+    const interval = setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        loadTables();
+      }
+    }, 15000);
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+
+    return () => {
+      clearInterval(interval);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      }
+    };
   }, []);
 
   // Summary statistics

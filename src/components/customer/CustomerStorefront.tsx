@@ -27,7 +27,13 @@ import {
   formatOrderItemComboLine,
   isProductHiddenFromStore,
 } from '../../types';
-import { api, CouponValidationResult, CustomerDeliveryQuoteResult } from '../../services/api';
+import {
+  api,
+  CouponValidationResult,
+  CustomerDeliveryQuoteResult,
+  isNetworkOrTimeoutError,
+  ORDER_NETWORK_EXHAUSTED_MESSAGE,
+} from '../../services/api';
 import { CustomerAuthModal } from './CustomerAuthModal';
 import { AddressPinMap } from '../AddressPinMap';
 import { ProductAddonsModal } from '../ProductAddonsModal';
@@ -169,11 +175,13 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     }
   };
 
-  // Poll placedOrder status every 15 seconds while the tracking screen is open
+  // Poll placedOrder status every 15 seconds ONLY while the tab is visible
   useEffect(() => {
     if (!placedOrder || !api.isCustomerAuthenticated()) return;
     const orderId = placedOrder.id;
-    const interval = setInterval(async () => {
+
+    const fetchCurrentOrder = async () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
       try {
         const updated = await api.getCustomerOrder(orderId);
         if (updated && updated.id === orderId) {
@@ -182,8 +190,25 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       } catch {
         // Ignore transient network errors during background refresh
       }
-    }, 15000);
-    return () => clearInterval(interval);
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        fetchCurrentOrder();
+      }
+    };
+
+    const interval = setInterval(fetchCurrentOrder, 15000);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibility);
+    }
+
+    return () => {
+      clearInterval(interval);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibility);
+      }
+    };
   }, [placedOrder?.id]);
 
   // Keep fields synced when currentCustomer changes
@@ -255,7 +280,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       neighborhood?: string;
       city?: string;
       state?: string;
-    }
+    },
+    suppressErrorBanner: boolean = false
   ) => {
     setCheckoutLat(newLat);
     setCheckoutLng(newLng);
@@ -308,7 +334,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       );
     } catch (err: any) {
       console.warn('Falha ao atualizar coordenadas do cliente:', err);
-      if (err?.message) {
+      if (!suppressErrorBanner && err?.message && !isNetworkOrTimeoutError(err)) {
         setCheckoutError(err.message);
       }
     } finally {
@@ -426,6 +452,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   }, [activeAreas, neighborhood]);
 
   const [checkoutError, setCheckoutError] = useState<string>('');
+  const [submittingStatusText, setSubmittingStatusText] = useState<string>('');
+  const [canRetryOrderSubmit, setCanRetryOrderSubmit] = useState<boolean>(false);
 
   const handleCheckDistance = async () => {
     if (!address.trim()) {
@@ -488,18 +516,25 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   }, [deliveryType, activeAreas.length, matchedArea, deliveryQuote, customerDistance, settings.deliveryModel, settings.deliveryRadiusKm]);
 
   const showOutOfStock = Boolean(settings.showOutOfStock);
+  const lastProductsFetchAtRef = React.useRef<number>(Date.now());
 
-  // Refresh products when cart is opened or periodically while cart has items
+  // Loja do cliente: não faz polling periódico de produtos.
+  // Recarrega apenas quando o cliente volta para a aba depois de 5 min (e logo antes de finalizar o pedido).
   useEffect(() => {
-    if (cart.length === 0) return;
-    if (isCartOpen) {
-      api.reloadProducts().catch(() => {});
-    }
-    const interval = setInterval(() => {
-      api.reloadProducts().catch(() => {});
-    }, 15000);
-    return () => clearInterval(interval);
-  }, [cart.length, isCartOpen]);
+    if (typeof document === 'undefined') return;
+    const FIVE_MIN_MS = 5 * 60 * 1000;
+    const handleVisibilityChange = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        Date.now() - lastProductsFetchAtRef.current >= FIVE_MIN_MS
+      ) {
+        lastProductsFetchAtRef.current = Date.now();
+        api.reloadProducts().catch(() => {});
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, []);
 
   // If a product in the cart goes out of stock (stock < 1), becomes inactive, or is hidden from online store, remove it and notify the customer
   useEffect(() => {
@@ -896,10 +931,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     (Number.isNaN(checkoutCashNum) || Math.round(checkoutCashNum * 100) < Math.round(cartTotal * 100));
 
   // Submit order to depot
-  const handleCheckoutSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const submitCustomerOrder = async () => {
     if (isSubmitting) return;
     setCheckoutError('');
+    setCanRetryOrderSubmit(false);
+    setSubmittingStatusText('');
     if (!settings.isOpen) {
       setCheckoutError(settings.closedMessage || 'Desculpe, o depósito está fechado no momento para novos pedidos.');
       return;
@@ -943,6 +979,10 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
     setIsSubmitting(true);
     try {
+      // Refresh products right before finalizing the order (Requirement 4c)
+      lastProductsFetchAtRef.current = Date.now();
+      await api.reloadProducts().catch(() => {});
+
       // If customer has pin coordinates in checkout, ensure they are saved in their profile & marked confirmed
       if (deliveryType === 'delivery' && checkoutLat !== undefined && checkoutLng !== undefined && currentCustomer) {
         if (
@@ -952,66 +992,71 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
           currentCustomer.address !== address ||
           currentCustomer.number !== addressNumber
         ) {
-          await persistCheckoutCoordinates(checkoutLat, checkoutLng, true);
+          await persistCheckoutCoordinates(checkoutLat, checkoutLng, true, undefined, true);
         }
       }
 
-      const order = await api.createOrder({
-        source: 'online',
-        clientRequestId: checkoutClientRequestId,
-        couponCode: appliedCoupon?.code,
-        customer: {
-          name: customerName,
-          phone: customerPhone,
-          cep: deliveryType === 'delivery' ? cep : undefined,
-          address: deliveryType === 'delivery' ? address : 'Retirada no Depósito',
-          number: deliveryType === 'delivery' ? addressNumber : 'S/N',
-          neighborhood: deliveryType === 'delivery' ? neighborhood : 'Depósito',
-          complement,
-          reference,
+      const order = await api.createOrder(
+        {
+          source: 'online',
+          clientRequestId: checkoutClientRequestId,
+          couponCode: appliedCoupon?.code,
+          customer: {
+            name: customerName,
+            phone: customerPhone,
+            cep: deliveryType === 'delivery' ? cep : undefined,
+            address: deliveryType === 'delivery' ? address : 'Retirada no Depósito',
+            number: deliveryType === 'delivery' ? addressNumber : 'S/N',
+            neighborhood: deliveryType === 'delivery' ? neighborhood : 'Depósito',
+            complement,
+            reference,
+          },
+          deliveryType,
+          items: cart.map((i) => {
+            const currentProd = products.find((p) => p.id === i.product.id) || i.product;
+            const isCase = i.saleUnit === 'case' && canSellProductCase(currentProd, settings, 'store');
+            const effPrice = getCartItemUnitPrice(currentProd, i.saleUnit, i.addonsTotal);
+            const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
+            return {
+              productId: currentProd.id,
+              name: currentProd.name,
+              volume: currentProd.volume,
+              price: effPrice,
+              originalPrice: isCase ? Number(currentProd.casePrice) : currentProd.price,
+              costPrice: currentProd.costPrice,
+              quantity: i.quantity,
+              saleUnit: isCase ? 'case' : 'unit',
+              unitsPerSale,
+              isCold: currentProd.isCold,
+              addons:
+                i.addons && i.addons.length > 0
+                  ? i.addons.map((a) => ({
+                      groupId: a.groupId,
+                      optionId: a.optionId,
+                      groupName: a.groupName,
+                      optionName: a.optionName,
+                      price: a.price,
+                      quantity: a.quantity,
+                    }))
+                  : undefined,
+              addonsTotal: i.addonsTotal,
+              comboItems: i.comboItems && i.comboItems.length > 0 ? i.comboItems : undefined,
+            };
+          }),
+          subtotal: cartSubtotal,
+          deliveryFee,
+          total: cartTotal,
+          paymentMethod,
+          cashChangeFor:
+            paymentMethod === 'dinheiro' && hasCheckoutCashTyped && !Number.isNaN(checkoutCashNum)
+              ? Math.round(checkoutCashNum * 100) / 100
+              : undefined,
+          notes: orderNotes,
         },
-        deliveryType,
-        items: cart.map((i) => {
-          const currentProd = products.find((p) => p.id === i.product.id) || i.product;
-          const isCase = i.saleUnit === 'case' && canSellProductCase(currentProd, settings, 'store');
-          const effPrice = getCartItemUnitPrice(currentProd, i.saleUnit, i.addonsTotal);
-          const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
-          return {
-            productId: currentProd.id,
-            name: currentProd.name,
-            volume: currentProd.volume,
-            price: effPrice,
-            originalPrice: isCase ? Number(currentProd.casePrice) : currentProd.price,
-            costPrice: currentProd.costPrice,
-            quantity: i.quantity,
-            saleUnit: isCase ? 'case' : 'unit',
-            unitsPerSale,
-            isCold: currentProd.isCold,
-            addons:
-              i.addons && i.addons.length > 0
-                ? i.addons.map((a) => ({
-                    groupId: a.groupId,
-                    optionId: a.optionId,
-                    groupName: a.groupName,
-                    optionName: a.optionName,
-                    price: a.price,
-                    quantity: a.quantity,
-                  }))
-                : undefined,
-            addonsTotal: i.addonsTotal,
-            comboItems: i.comboItems && i.comboItems.length > 0 ? i.comboItems : undefined,
-          };
-        }),
-        subtotal: cartSubtotal,
-        deliveryFee,
-        total: cartTotal,
-        paymentMethod,
-        cashChangeFor:
-          paymentMethod === 'dinheiro' && hasCheckoutCashTyped && !Number.isNaN(checkoutCashNum)
-            ? Math.round(checkoutCashNum * 100) / 100
-            : undefined,
-        notes: orderNotes,
-      });
+        {
+          onStatusMessage: (msg) => setSubmittingStatusText(msg),
+        }
+      );
 
       confetti({
         particleCount: 100,
@@ -1026,9 +1071,21 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setCouponInput('');
       setCouponError('');
       setCheckoutError('');
+      setCanRetryOrderSubmit(false);
+      setSubmittingStatusText('');
       setIsCartOpen(false);
     } catch (err: any) {
       console.error('Falha ao processar pedido:', err);
+      setSubmittingStatusText('');
+
+      if (err?.isNetworkRetryExhausted || isNetworkOrTimeoutError(err)) {
+        // Mantém o MESMO checkoutClientRequestId para não duplicar ao tocar em "Tentar de novo"
+        setCheckoutError(ORDER_NETWORK_EXHAUSTED_MESSAGE);
+        setCanRetryOrderSubmit(true);
+        return;
+      }
+
+      setCanRetryOrderSubmit(false);
       const rawMessage: string = err.message || 'Não foi possível finalizar o pedido. Verifique o estoque dos itens.';
       const lowerMsg = rawMessage.toLowerCase();
       if (
@@ -1037,7 +1094,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         lowerMsg.includes('indisponivel') ||
         lowerMsg.includes('não encontrado')
       ) {
-        await api.reloadProducts();
+        await api.reloadProducts().catch(() => {});
         const freshProducts = api.getProducts();
         const freshMap = new Map(freshProducts.map((p) => [p.id, p]));
         const stockWarnings: string[] = [];
@@ -1097,6 +1154,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     } finally {
       setIsSubmitting(false);
     }
+  };
+
+  const handleCheckoutSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await submitCustomerOrder();
   };
 
   const handleCopyPix = () => {
@@ -1730,10 +1792,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 >
                   <div>
                     <div className="relative h-48 bg-neutral-100 overflow-hidden">
-                      {product.image ? (
+                      {product.imageUrl || product.image ? (
                         <img
-                          src={product.image}
+                          src={product.imageUrl || product.image}
                           alt={product.name}
+                          width={300}
+                          height={192}
                           className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                           loading="lazy"
                         />
@@ -2010,10 +2074,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       }`}
                     >
                       <div className="relative aspect-square bg-neutral-100 overflow-hidden">
-                        {product.image ? (
+                        {product.imageUrl || product.image ? (
                           <img
-                            src={product.image}
+                            src={product.imageUrl || product.image}
                             alt={product.name}
+                            width={300}
+                            height={300}
                             className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                             loading="lazy"
                           />
@@ -2223,10 +2289,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 }`}
               >
                 <div className="relative aspect-square bg-neutral-100 overflow-hidden">
-                  {product.image ? (
+                  {product.imageUrl || product.image ? (
                     <img
-                      src={product.image}
+                      src={product.imageUrl || product.image}
                       alt={product.name}
+                      width={300}
+                      height={300}
                       className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                       loading="lazy"
                     />
@@ -2505,10 +2573,13 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       key={item.lineId}
                       className="flex items-start justify-between gap-2.5 p-3 bg-neutral-50 rounded-2xl border border-neutral-200"
                     >
-                      {currentProd.image ? (
+                      {currentProd.imageUrl || currentProd.image ? (
                         <img
-                          src={currentProd.image}
+                          src={currentProd.imageUrl || currentProd.image}
                           alt={currentProd.name}
+                          width={44}
+                          height={44}
+                          loading="lazy"
                           className="w-11 h-11 rounded-xl object-cover shrink-0 mt-0.5"
                         />
                       ) : (
@@ -3139,10 +3210,29 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 )}
               </div>
 
+              {isSubmitting && submittingStatusText && (
+                <div className="p-3.5 bg-amber-50 border border-amber-300 rounded-2xl text-amber-900 text-xs font-bold flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 shrink-0 text-amber-600 animate-spin" />
+                  <span>{submittingStatusText}</span>
+                </div>
+              )}
+
               {checkoutError && (
-                <div className="p-3.5 bg-red-50 border border-red-200 rounded-2xl text-red-700 text-xs font-bold flex items-start gap-2">
-                  <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
-                  <span>{checkoutError}</span>
+                <div className="p-3.5 bg-red-50 border border-red-200 rounded-2xl text-red-700 text-xs font-bold space-y-2.5">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+                    <span>{checkoutError}</span>
+                  </div>
+                  {canRetryOrderSubmit && (
+                    <button
+                      type="button"
+                      disabled={isSubmitting}
+                      onClick={() => submitCustomerOrder()}
+                      className="w-full py-2.5 px-4 bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white font-black text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <span>Tentar de novo</span>
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -3154,7 +3244,10 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 {!settings.isOpen ? (
                   <span>🔴 Depósito Fechado no Momento</span>
                 ) : isSubmitting ? (
-                  <span>Enviando pedido...</span>
+                  <>
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    <span>{submittingStatusText || 'Enviando pedido...'}</span>
+                  </>
                 ) : (
                   <>
                     <span>Confirmar e Enviar Pedido</span>

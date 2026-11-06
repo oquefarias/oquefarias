@@ -17,6 +17,7 @@ import {
   StockAdjustMode,
   StockAdjustReason,
   StockMovementsResponse,
+  AdminChangesResponse,
   isComboProduct,
   calculateComboMetrics,
 } from '../types';
@@ -63,12 +64,65 @@ export interface CustomerDeliveryQuoteResult {
 
 const STORAGE_PREFIX_PIN_CONFIRMED = 'deposito_pin_confirmed_v1_';
 
+export const ORDER_SUBMIT_TIMEOUT_MS = 20000;
+export const ORDER_RETRY_DELAYS_MS = [2000, 4000, 6000] as const;
+export const ORDER_CHECKING_STATUS_MESSAGE = 'Conferindo se o seu pedido chegou...';
+export const ORDER_NETWORK_EXHAUSTED_MESSAGE =
+  'Não conseguimos confirmar seu pedido por falha na internet. Toque em Tentar de novo — não será criado pedido duplicado.';
+
+export function isNetworkOrTimeoutError(err: any): boolean {
+  if (!err) return false;
+  if (err.isServerResponse) return false;
+  if (err.isNetworkError || err.isNetworkRetryExhausted) return true;
+  const name = String(err.name || '');
+  if (name === 'AbortError' || name === 'TimeoutError' || err instanceof TypeError) {
+    return true;
+  }
+  const msg = String(err.message || err || '').toLowerCase();
+  return (
+    msg.includes('load failed') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('networkerror') ||
+    msg.includes('network request failed') ||
+    msg.includes('fetch failed') ||
+    msg.includes('the internet connection appears to be offline') ||
+    msg.includes('the network connection was lost') ||
+    msg.includes('aborted') ||
+    msg.includes('timeout') ||
+    msg.includes('tempo limite')
+  );
+}
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs: number = ORDER_SUBMIT_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 class ApiService {
   private listeners: Array<() => void> = [];
   private version: number = 0;
   private pollingInterval: any = null;
   private productPollingInterval: any = null;
   private tokenRefreshInterval: any = null;
+  private visibilityListener: (() => void) | null = null;
+  private lastOrdersSyncTime: string = '';
+  private lastProductsSyncTime: string = '';
   private adminSessionExpiredMessage: string = '';
 
   // In-memory state synchronized directly with the server API
@@ -510,22 +564,175 @@ class ApiService {
   }
 
   // ================= ORDER & STOCK POLLING =================
+  private isDocumentVisible(): boolean {
+    if (typeof document === 'undefined') return true;
+    return document.visibilityState === 'visible';
+  }
+
+  public async checkAdminChanges(since?: string): Promise<AdminChangesResponse | null> {
+    const token = this.getAdminToken();
+    if (!token) return null;
+
+    try {
+      const qs = since ? `?since=${encodeURIComponent(since)}` : '';
+      const res = await fetch(`/api/admin/changes${qs}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
+      });
+      if (res.status === 401) {
+        this.handleAdminSessionExpired();
+        return null;
+      }
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  private mergeFetchedOrders(fetchedOrders: Order[]) {
+    if (!Array.isArray(fetchedOrders)) return;
+
+    const existingIds = new Set(this.state.orders.map((o) => o.id));
+    const hasNewPendingOrder = fetchedOrders.some(
+      (fo) => !existingIds.has(fo.id) && fo.status === 'pendente' && fo.source !== 'mesa'
+    );
+
+    if (hasNewPendingOrder) {
+      soundService.playNewOrderSound();
+    }
+
+    const byId = new Map<string, Order>();
+    for (const o of this.state.orders) {
+      byId.set(o.id, o);
+    }
+    for (const fo of fetchedOrders) {
+      byId.set(fo.id, fo);
+    }
+
+    const cutoff48hMs = Date.now() - 48 * 60 * 60 * 1000;
+    const merged = Array.from(byId.values()).filter((o) => {
+      if (o.status === 'pendente' || o.status === 'em_separacao' || o.status === 'em_rota') {
+        return true;
+      }
+      const createdMs = new Date(o.createdAt).getTime();
+      return Number.isNaN(createdMs) || createdMs >= cutoff48hMs;
+    });
+
+    merged.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    this.state.orders = merged;
+  }
+
+  public async fetchUpdatedAdminOrders(since?: string): Promise<void> {
+    const token = this.getAdminToken();
+    if (!token) return;
+
+    try {
+      const qs = since ? `?since=${encodeURIComponent(since)}` : '';
+      const ordersRes = await fetch(`/api/admin/orders${qs}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
+      });
+
+      if (ordersRes.status === 401) {
+        this.handleAdminSessionExpired();
+        return;
+      }
+
+      if (ordersRes.ok) {
+        const fetchedOrders: Order[] = await ordersRes.json();
+        this.mergeFetchedOrders(fetchedOrders);
+        this.notifyListeners();
+      }
+    } catch {
+      // Ignore transient background errors
+    }
+  }
+
+  private async pollAdminChanges(options: { checkOrders: boolean; checkProducts: boolean }): Promise<void> {
+    const token = this.getAdminToken();
+    if (!token) {
+      this.stopOrderPolling();
+      return;
+    }
+
+    if (!this.isDocumentVisible()) {
+      return;
+    }
+
+    try {
+      let since = '';
+      if (options.checkOrders && options.checkProducts) {
+        if (this.lastOrdersSyncTime && this.lastProductsSyncTime) {
+          since =
+            new Date(this.lastOrdersSyncTime).getTime() <= new Date(this.lastProductsSyncTime).getTime()
+              ? this.lastOrdersSyncTime
+              : this.lastProductsSyncTime;
+        } else {
+          since = this.lastOrdersSyncTime || this.lastProductsSyncTime;
+        }
+      } else if (options.checkOrders) {
+        since = this.lastOrdersSyncTime;
+      } else if (options.checkProducts) {
+        since = this.lastProductsSyncTime;
+      }
+
+      const changes = await this.checkAdminChanges(since);
+      if (!changes) return;
+
+      const tasks: Promise<any>[] = [];
+
+      if (options.checkOrders && changes.ordersChanged) {
+        const prevSince = this.lastOrdersSyncTime;
+        this.lastOrdersSyncTime = changes.serverTime || new Date().toISOString();
+        tasks.push(this.fetchUpdatedAdminOrders(prevSince));
+      } else if (options.checkOrders && !this.lastOrdersSyncTime) {
+        this.lastOrdersSyncTime = changes.serverTime || new Date().toISOString();
+      }
+
+      if (options.checkProducts && changes.productsChanged) {
+        this.lastProductsSyncTime = changes.serverTime || new Date().toISOString();
+        tasks.push(this.reloadProducts());
+      } else if (options.checkProducts && !this.lastProductsSyncTime) {
+        this.lastProductsSyncTime = changes.serverTime || new Date().toISOString();
+      }
+
+      if (tasks.length > 0) {
+        await Promise.all(tasks);
+      }
+    } catch {
+      // Background poll silently continues
+    }
+  }
+
   private startOrderPolling() {
     this.stopOrderPolling();
     if (!this.isAdminAuthenticated()) return;
 
-    this.pollOrders();
     this.checkAndRefreshAdminToken();
 
-    // Poll orders every 10s
-    this.pollingInterval = setInterval(() => {
-      this.pollOrders();
-    }, 10000);
+    if (typeof document !== 'undefined') {
+      this.visibilityListener = () => {
+        if (document.visibilityState === 'visible' && this.isAdminAuthenticated()) {
+          this.pollAdminChanges({ checkOrders: true, checkProducts: true });
+        }
+      };
+      document.addEventListener('visibilitychange', this.visibilityListener);
+    }
 
-    // Poll products/stock every 15s while admin panel is open
-    this.productPollingInterval = setInterval(() => {
-      this.reloadProducts();
+    // Poll orders every 15s ONLY while tab is visible
+    this.pollingInterval = setInterval(() => {
+      if (this.isDocumentVisible()) {
+        this.pollAdminChanges({ checkOrders: true, checkProducts: false });
+      }
     }, 15000);
+
+    // Poll products/stock every 60s ONLY while tab is visible
+    this.productPollingInterval = setInterval(() => {
+      if (this.isDocumentVisible()) {
+        this.pollAdminChanges({ checkOrders: false, checkProducts: true });
+      }
+    }, 60000);
 
     // Check token expiration every 30 minutes and auto-renew if < 2h remaining
     this.tokenRefreshInterval = setInterval(() => {
@@ -546,58 +753,9 @@ class ApiService {
       clearInterval(this.tokenRefreshInterval);
       this.tokenRefreshInterval = null;
     }
-  }
-
-  private async pollOrders(): Promise<void> {
-    const token = this.getAdminToken();
-    if (!token) {
-      this.stopOrderPolling();
-      return;
-    }
-
-    try {
-      const [ordersRes, prodRes] = await Promise.all([
-        fetch('/api/admin/orders', {
-          headers: { Authorization: `Bearer ${token}` },
-          cache: 'no-store',
-        }),
-        fetch('/api/products', {
-          headers: { Authorization: `Bearer ${token}` },
-          cache: 'no-store',
-        }),
-      ]);
-
-      if (ordersRes.status === 401 || prodRes.status === 401) {
-        this.handleAdminSessionExpired();
-        return;
-      }
-
-      if (ordersRes.ok) {
-        const fetchedOrders: Order[] = await ordersRes.json();
-        if (Array.isArray(fetchedOrders)) {
-          const existingIds = new Set(this.state.orders.map((o) => o.id));
-          const hasNewPendingOrder = fetchedOrders.some(
-            (fo) => !existingIds.has(fo.id) && fo.status === 'pendente' && fo.source !== 'mesa'
-          );
-
-          if (hasNewPendingOrder) {
-            soundService.playNewOrderSound();
-          }
-
-          this.state.orders = fetchedOrders;
-        }
-      }
-
-      if (prodRes.ok) {
-        const fetchedProducts: Product[] = await prodRes.json();
-        if (Array.isArray(fetchedProducts)) {
-          this.state.products = fetchedProducts;
-        }
-      }
-
-      this.notifyListeners();
-    } catch {
-      // Background poll silently continues
+    if (this.visibilityListener && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.visibilityListener);
+      this.visibilityListener = null;
     }
   }
 
@@ -616,6 +774,9 @@ class ApiService {
 
         if (res.ok) {
           const data = await res.json();
+          const srvTime = data.serverTime || new Date().toISOString();
+          this.lastOrdersSyncTime = srvTime;
+          this.lastProductsSyncTime = srvTime;
           this.state = {
             products: Array.isArray(data.products) ? data.products : [],
             orders: Array.isArray(data.orders) ? data.orders : [],
@@ -857,6 +1018,40 @@ class ApiService {
     const saved: Product = await res.json();
     await this.reloadProducts();
     return saved;
+  }
+
+  public async updateProductImage(
+    productId: string,
+    imageDataUrl: string | null
+  ): Promise<{ id: string; imageUrl: string; updatedAt: string; decodedBytes: number; storageBytes: number }> {
+    const res = await fetch(`/api/admin/products/${encodeURIComponent(productId)}/image`, {
+      method: 'PUT',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ image: imageDataUrl }),
+    });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
+    if (!res.ok) {
+      let message = 'Não foi possível salvar a foto do produto.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+
+    const result = await res.json();
+    this.state.products = this.state.products.map((p) =>
+      p.id === productId
+        ? { ...p, image: '', imageUrl: result.imageUrl || '', updatedAt: result.updatedAt }
+        : p
+    );
+    this.notifyListeners();
+    return result;
   }
 
   public setLocalProductStock(productId: string, newStock: number): void {
@@ -1134,7 +1329,8 @@ class ApiService {
   }
 
   public async createOrder(
-    newOrder: Omit<Order, 'id' | 'createdAt' | 'updatedAt' | 'status'> & { id?: string }
+    newOrder: Omit<Order, 'id' | 'createdAt' | 'updatedAt' | 'status'> & { id?: string },
+    options?: { onStatusMessage?: (msg: string) => void }
   ): Promise<Order> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const adminToken = this.getAdminToken();
@@ -1148,37 +1344,82 @@ class ApiService {
       headers['Authorization'] = `Bearer ${adminToken}`;
     }
 
-    const res = await fetch('/api/orders', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(newOrder),
-    });
+    const bodyPayload = JSON.stringify(newOrder);
+    let createdOrder: Order | null = null;
 
-    if (res.status === 401 && newOrder.source === 'balcao') {
-      this.handleAdminSessionExpired();
-      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
-    }
-
-    if (!res.ok) {
-      let message = 'Não foi possível realizar o pedido.';
+    for (let attempt = 0; attempt <= ORDER_RETRY_DELAYS_MS.length; attempt++) {
       try {
-        const json = await res.json();
-        if (json?.error) message = json.error;
-      } catch {}
-      if (newOrder.source === 'balcao') {
-        this.notifyError(message);
+        const res = await fetchWithTimeout(
+          '/api/orders',
+          {
+            method: 'POST',
+            headers,
+            body: bodyPayload,
+          },
+          ORDER_SUBMIT_TIMEOUT_MS
+        );
+
+        if (res.status === 401 && newOrder.source === 'balcao') {
+          this.handleAdminSessionExpired();
+          const authErr: any = new Error('Sua sessão expirou. Digite o PIN novamente.');
+          authErr.status = 401;
+          authErr.isServerResponse = true;
+          throw authErr;
+        }
+
+        if (!res.ok) {
+          let message = 'Não foi possível realizar o pedido.';
+          try {
+            const json = await res.json();
+            if (json?.error) message = json.error;
+          } catch {}
+          if (newOrder.source === 'balcao') {
+            this.notifyError(message);
+          }
+          const serverErr: any = new Error(message);
+          serverErr.status = res.status;
+          serverErr.isServerResponse = true;
+          throw serverErr;
+        }
+
+        createdOrder = await res.json();
+        break;
+      } catch (err: any) {
+        if (!isNetworkOrTimeoutError(err)) {
+          throw err;
+        }
+
+        if (attempt < ORDER_RETRY_DELAYS_MS.length) {
+          options?.onStatusMessage?.(ORDER_CHECKING_STATUS_MESSAGE);
+          await sleepMs(ORDER_RETRY_DELAYS_MS[attempt]);
+          continue;
+        }
+
+        const exhaustedErr: any = new Error(ORDER_NETWORK_EXHAUSTED_MESSAGE);
+        exhaustedErr.isNetworkError = true;
+        exhaustedErr.isNetworkRetryExhausted = true;
+        throw exhaustedErr;
       }
-      throw new Error(message);
     }
 
-    const createdOrder: Order = await res.json();
+    if (!createdOrder) {
+      const exhaustedErr: any = new Error(ORDER_NETWORK_EXHAUSTED_MESSAGE);
+      exhaustedErr.isNetworkError = true;
+      exhaustedErr.isNetworkRetryExhausted = true;
+      throw exhaustedErr;
+    }
 
     if (this.isAdminAuthenticated()) {
-      this.state.orders.unshift(createdOrder);
+      const existingIdx = this.state.orders.findIndex((o) => o.id === createdOrder!.id);
+      if (existingIdx >= 0) {
+        this.state.orders[existingIdx] = createdOrder;
+      } else {
+        this.state.orders.unshift(createdOrder);
+      }
     }
 
     // Refresh products on server to sync atomic real-time stock
-    await this.reloadProducts();
+    await this.reloadProducts().catch(() => {});
 
     soundService.playNewOrderSound();
     this.notifyListeners();
@@ -1733,7 +1974,7 @@ class ApiService {
     }
   }
 
-  public async closeTab(
+  private async tryRecoverClosedTabOrder(
     tabId: string,
     data: {
       payment_method: PaymentMethod;
@@ -1743,27 +1984,174 @@ class ApiService {
       expected_subtotal?: number;
       notes?: string;
     }
+  ): Promise<Order | null> {
+    try {
+      const fresh = await this.getTabDetail(tabId);
+      if (!fresh || fresh.status !== 'closed') {
+        return null;
+      }
+
+      await this.fetchUpdatedAdminOrders().catch(() => {});
+      let foundOrder: Order | undefined = this.state.orders.find(
+        (o) =>
+          (fresh.orderId && o.id === fresh.orderId) ||
+          o.clientRequestId === `tab:${tabId}`
+      );
+
+      if (!foundOrder) {
+        const activeItems = (fresh.items || []).filter((i) => i.status === 'active');
+        const sub = Number(fresh.subtotal) || 0;
+        const feePct = Number(data.service_fee_percent ?? 0);
+        const feeAmt = Math.round(sub * (feePct / 100) * 100) / 100;
+        const disc = Number(data.discount ?? 0);
+        const tot = Math.max(0, Math.round((sub + feeAmt - disc) * 100) / 100);
+        const nowIso = fresh.closedAt || new Date().toISOString();
+        const tableLabelText = fresh.tableLabel
+          ? `Mesa ${fresh.tableNumber} (${fresh.tableLabel})`
+          : `Mesa ${fresh.tableNumber}`;
+
+        const fallbackOrder: Order = {
+          id: fresh.orderId || `PED-${tabId.slice(0, 8).toUpperCase()}`,
+          source: 'mesa',
+          clientRequestId: `tab:${tabId}`,
+          customer: {
+            name: fresh.customerName || tableLabelText,
+            phone: '(Mesa)',
+            address: tableLabelText,
+            number: String(fresh.tableNumber || 'S/N'),
+            neighborhood: 'Consumo no Local',
+          },
+          deliveryType: 'local',
+          items: activeItems.map((it) => ({
+            productId: it.productId,
+            name: it.productName,
+            volume: '',
+            price: it.unitPrice,
+            originalPrice: it.unitPrice,
+            costPrice: 0,
+            quantity: it.quantity,
+            saleUnit: it.saleUnit || 'unit',
+            unitsPerSale: it.unitsPerSale || 1,
+            isCold: true,
+            comboItems: it.comboItems,
+          })),
+          subtotal: sub,
+          discount: disc,
+          deliveryFee: 0,
+          total: tot,
+          paymentMethod: data.payment_method,
+          cashChangeFor: data.cash_change_for,
+          status: 'concluido',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          notes: data.notes || fresh.notes || undefined,
+        };
+        this.mergeFetchedOrders([fallbackOrder]);
+        foundOrder = fallbackOrder;
+      }
+
+      await this.reloadProducts().catch(() => {});
+      this.notifyListeners();
+      return foundOrder;
+    } catch {
+      return null;
+    }
+  }
+
+  public async closeTab(
+    tabId: string,
+    data: {
+      payment_method: PaymentMethod;
+      service_fee_percent?: number;
+      discount?: number;
+      cash_change_for?: number;
+      expected_subtotal?: number;
+      notes?: string;
+    },
+    options?: { onStatusMessage?: (msg: string) => void }
   ): Promise<{ order: Order }> {
-    const res = await fetch(`/api/admin/tabs/${encodeURIComponent(tabId)}/close`, {
-      method: 'POST',
-      headers: this.getAdminHeaders(),
-      body: JSON.stringify(data),
-    });
-    if (res.status === 401) {
-      this.handleAdminSessionExpired();
-      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
-    }
-    if (!res.ok) {
-      let message = 'Não foi possível fechar a comanda.';
+    const bodyPayload = JSON.stringify(data);
+
+    for (let attempt = 0; attempt <= ORDER_RETRY_DELAYS_MS.length; attempt++) {
       try {
+        const res = await fetchWithTimeout(
+          `/api/admin/tabs/${encodeURIComponent(tabId)}/close`,
+          {
+            method: 'POST',
+            headers: this.getAdminHeaders(),
+            body: bodyPayload,
+          },
+          ORDER_SUBMIT_TIMEOUT_MS
+        );
+
+        if (res.status === 401) {
+          this.handleAdminSessionExpired();
+          const authErr: any = new Error('Sua sessão expirou. Digite o PIN novamente.');
+          authErr.status = 401;
+          authErr.isServerResponse = true;
+          throw authErr;
+        }
+
+        if (!res.ok) {
+          let message = 'Não foi possível fechar a comanda.';
+          try {
+            const json = await res.json();
+            if (json?.error) message = json.error;
+          } catch {}
+
+          // Se a comanda já havia sido fechada na tentativa anterior cuja resposta caiu, recupera o pedido gerado
+          if (res.status === 400 && message.toLowerCase().includes('não está aberta')) {
+            const recovered = await this.tryRecoverClosedTabOrder(tabId, data);
+            if (recovered) {
+              return { order: recovered };
+            }
+          }
+
+          const serverErr: any = new Error(message);
+          serverErr.status = res.status;
+          serverErr.isServerResponse = true;
+          throw serverErr;
+        }
+
         const json = await res.json();
-        if (json?.error) message = json.error;
-      } catch {}
-      throw new Error(message);
+        if (json?.order) {
+          this.mergeFetchedOrders([json.order]);
+        }
+        await this.reloadProducts().catch(() => {});
+        this.notifyListeners();
+        return json;
+      } catch (err: any) {
+        if (!isNetworkOrTimeoutError(err)) {
+          throw err;
+        }
+
+        options?.onStatusMessage?.(ORDER_CHECKING_STATUS_MESSAGE);
+
+        const recoveredImmediate = await this.tryRecoverClosedTabOrder(tabId, data);
+        if (recoveredImmediate) {
+          return { order: recoveredImmediate };
+        }
+
+        if (attempt < ORDER_RETRY_DELAYS_MS.length) {
+          await sleepMs(ORDER_RETRY_DELAYS_MS[attempt]);
+          const recoveredAfterWait = await this.tryRecoverClosedTabOrder(tabId, data);
+          if (recoveredAfterWait) {
+            return { order: recoveredAfterWait };
+          }
+          continue;
+        }
+
+        const exhaustedErr: any = new Error(ORDER_NETWORK_EXHAUSTED_MESSAGE);
+        exhaustedErr.isNetworkError = true;
+        exhaustedErr.isNetworkRetryExhausted = true;
+        throw exhaustedErr;
+      }
     }
-    const json = await res.json();
-    await this.syncWithBackend();
-    return json;
+
+    const exhaustedErr: any = new Error(ORDER_NETWORK_EXHAUSTED_MESSAGE);
+    exhaustedErr.isNetworkError = true;
+    exhaustedErr.isNetworkRetryExhausted = true;
+    throw exhaustedErr;
   }
 
   public async cancelTab(tabId: string, reason?: string): Promise<void> {
@@ -1784,7 +2172,8 @@ class ApiService {
       } catch {}
       throw new Error(message);
     }
-    await this.syncWithBackend();
+    await this.reloadProducts();
+    this.notifyListeners();
   }
 }
 

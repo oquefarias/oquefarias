@@ -8,7 +8,11 @@ import {
   DEFAULT_SHORTCUTS,
   formatOrderItemComboLine,
 } from '../../../types';
-import { api } from '../../../services/api';
+import {
+  api,
+  isNetworkOrTimeoutError,
+  ORDER_NETWORK_EXHAUSTED_MESSAGE,
+} from '../../../services/api';
 import {
   X,
   CreditCard,
@@ -20,6 +24,7 @@ import {
   AlertCircle,
   Receipt,
   Calculator,
+  Loader2,
 } from 'lucide-react';
 
 interface CloseTabModalProps {
@@ -46,7 +51,9 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
   const [cashChangeFor, setCashChangeFor] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [submittingStatusText, setSubmittingStatusText] = useState<string>('');
   const [error, setError] = useState<string>('');
+  const [canRetryClose, setCanRetryClose] = useState<boolean>(false);
 
   React.useEffect(() => {
     setCurrentTab(tab);
@@ -58,6 +65,8 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
       setServiceFeePercent(10);
       setNotes('');
       setError('');
+      setCanRetryClose(false);
+      setSubmittingStatusText('');
     }
   }, [tab]);
 
@@ -78,8 +87,10 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
   );
 
   React.useEffect(() => {
-    if (!isOpen || !currentTab?.id) return;
-    const interval = setInterval(async () => {
+    if (!isOpen || !currentTab?.id || isSubmitting) return;
+
+    const checkTabUpdate = async () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
       try {
         const fresh = await api.getTabDetail(currentTab.id);
         const oldSubCents = Math.round((currentTab.subtotal || 0) * 100);
@@ -94,9 +105,26 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
       } catch {
         // Ignored during background check
       }
-    }, 10000);
-    return () => clearInterval(interval);
-  }, [isOpen, currentTab, computeTotalForSubtotal]);
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        checkTabUpdate();
+      }
+    };
+
+    const interval = setInterval(checkTabUpdate, 15000);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibility);
+    }
+
+    return () => {
+      clearInterval(interval);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibility);
+      }
+    };
+  }, [isOpen, currentTab, isSubmitting, computeTotalForSubtotal]);
 
   const allTableNumbers = React.useMemo(() => {
     if (!currentTab) return '';
@@ -188,6 +216,8 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
     if (!currentTab || isSubmitting || isDiscountInvalid || isCashShort) return;
     setIsSubmitting(true);
     setError('');
+    setCanRetryClose(false);
+    setSubmittingStatusText('');
 
     try {
       const shouldSendCash =
@@ -196,17 +226,35 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
         !Number.isNaN(numCashGiven) &&
         Math.round(numCashGiven * 100) >= Math.round(total * 100);
 
-      const res = await api.closeTab(currentTab.id, {
-        payment_method: paymentMethod,
-        service_fee_percent: feePercentVal,
-        discount: numDiscount,
-        cash_change_for: shouldSendCash ? Math.round(numCashGiven * 100) / 100 : undefined,
-        notes: notes.trim() || undefined,
-        expected_subtotal: subtotal,
-      });
+      const res = await api.closeTab(
+        currentTab.id,
+        {
+          payment_method: paymentMethod,
+          service_fee_percent: feePercentVal,
+          discount: numDiscount,
+          cash_change_for: shouldSendCash ? Math.round(numCashGiven * 100) / 100 : undefined,
+          notes: notes.trim() || undefined,
+          expected_subtotal: subtotal,
+        },
+        {
+          onStatusMessage: (msg) => setSubmittingStatusText(msg),
+        }
+      );
 
+      setSubmittingStatusText('');
+      setCanRetryClose(false);
       onSuccess(res.order);
     } catch (err: any) {
+      setSubmittingStatusText('');
+
+      if (err?.isNetworkRetryExhausted || isNetworkOrTimeoutError(err)) {
+        setError(ORDER_NETWORK_EXHAUSTED_MESSAGE);
+        setCanRetryClose(true);
+        setIsSubmitting(false);
+        return;
+      }
+
+      setCanRetryClose(false);
       let errMsg = err.message || 'Erro ao fechar comanda.';
       try {
         const fresh = await api.getTabDetail(currentTab.id);
@@ -287,10 +335,29 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
 
         {/* Content */}
         <form onSubmit={handleConfirmClose} className="p-4 sm:p-6 overflow-y-auto space-y-5 flex-1">
+          {isSubmitting && submittingStatusText && (
+            <div className="p-3 bg-amber-50 border border-amber-300 rounded-2xl flex items-center gap-2 text-xs text-amber-900 font-bold">
+              <Loader2 className="w-4 h-4 shrink-0 text-amber-600 animate-spin" />
+              <span>{submittingStatusText}</span>
+            </div>
+          )}
+
           {error && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-2xl flex items-center gap-2 text-xs text-red-700 font-bold">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>{error}</span>
+            <div className="p-3 bg-red-50 border border-red-200 rounded-2xl text-xs text-red-700 font-bold space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{error}</span>
+              </div>
+              {canRetryClose && (
+                <button
+                  type="button"
+                  disabled={isSubmitting}
+                  onClick={() => submitCloseTab()}
+                  className="w-full py-2 px-3 bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white font-black text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <span>Tentar de novo</span>
+                </button>
+              )}
             </div>
           )}
 
@@ -528,10 +595,29 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
             />
           </div>
 
+          {isSubmitting && submittingStatusText && (
+            <div className="p-3 bg-amber-50 border border-amber-300 rounded-2xl flex items-center gap-2 text-xs text-amber-900 font-bold">
+              <Loader2 className="w-4 h-4 shrink-0 text-amber-600 animate-spin" />
+              <span>{submittingStatusText}</span>
+            </div>
+          )}
+
           {error && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-2xl flex items-center gap-2 text-xs text-red-700 font-bold">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>{error}</span>
+            <div className="p-3 bg-red-50 border border-red-200 rounded-2xl text-xs text-red-700 font-bold space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{error}</span>
+              </div>
+              {canRetryClose && (
+                <button
+                  type="button"
+                  disabled={isSubmitting}
+                  onClick={() => submitCloseTab()}
+                  className="w-full py-2 px-3 bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white font-black text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <span>Tentar de novo</span>
+                </button>
+              )}
             </div>
           )}
 
@@ -551,7 +637,7 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
               className="flex-2 py-3 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-2xl text-xs font-black shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2"
             >
               <CheckCircle2 className="w-4 h-4 shrink-0" />
-              <span>{isSubmitting ? 'Finalizando...' : `Receber e Fechar (R$ ${total.toFixed(2)})`}</span>
+              <span>{isSubmitting ? (submittingStatusText || 'Finalizando...') : `Receber e Fechar (R$ ${total.toFixed(2)})`}</span>
             </button>
           </div>
         </form>

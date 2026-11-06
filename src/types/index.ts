@@ -24,9 +24,18 @@ export interface Product {
   minStock: number;
   isCold: boolean;
   image: string;
+  imageUrl?: string;
   sku: string;
   active: boolean;
   description: string;
+  updatedAt?: string;
+}
+
+export interface AdminChangesResponse {
+  ordersChanged: boolean;
+  productsChanged: boolean;
+  tabsChanged: boolean;
+  serverTime: string;
 }
 
 export function hasProductStockCase(product?: Pick<Product, 'caseSize'> | null): boolean {

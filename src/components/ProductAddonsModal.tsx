@@ -169,10 +169,13 @@ export const ProductAddonsModal: React.FC<ProductAddonsModalProps> = ({
         {/* Header with Product Summary */}
         <div className="p-4 border-b border-zinc-800 flex items-start justify-between gap-3 bg-zinc-950/60 shrink-0">
           <div className="flex items-center gap-3 min-w-0">
-            {product.image ? (
+            {product.imageUrl || product.image ? (
               <img
-                src={product.image}
+                src={product.imageUrl || product.image}
                 alt={product.name}
+                width={56}
+                height={56}
+                loading="lazy"
                 className="w-14 h-14 rounded-xl object-cover bg-zinc-800 border border-zinc-700/60 shrink-0"
               />
             ) : (

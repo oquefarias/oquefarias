@@ -634,10 +634,13 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
                           <span className="w-6 h-6 rounded-lg bg-amber-500 text-neutral-950 font-black flex items-center justify-center shrink-0">
                             {idx + 1}º
                           </span>
-                          {fp.image ? (
+                          {fp.imageUrl || fp.image ? (
                             <img
-                              src={fp.image}
+                              src={fp.imageUrl || fp.image}
                               alt={fp.name}
+                              width={36}
+                              height={36}
+                              loading="lazy"
                               className="w-9 h-9 rounded-lg object-cover border border-neutral-200 shrink-0"
                             />
                           ) : (
@@ -993,10 +996,13 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
                               <span className="w-5 text-center font-mono font-bold text-[11px] text-neutral-400 shrink-0">
                                 {idx + 1}.
                               </span>
-                              {prod.image ? (
+                              {prod.imageUrl || prod.image ? (
                                 <img
-                                  src={prod.image}
+                                  src={prod.imageUrl || prod.image}
                                   alt={prod.name}
+                                  width={32}
+                                  height={32}
+                                  loading="lazy"
                                   className="w-8 h-8 rounded-lg object-cover border border-neutral-200 shrink-0"
                                 />
                               ) : (

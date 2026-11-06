@@ -614,7 +614,174 @@ function parseValidItemQuantity(raw: unknown): number | null {
   return num;
 }
 
-function productToDB(p: Product) {
+export const PRODUCT_COLUMNS_NO_IMAGE =
+  'id,name,category,volume,price,promo_price,promo_ends_at,case_size,case_price,cost_price,stock,min_stock,is_cold,sku,active,description,updated_at';
+
+export const MAX_PRODUCT_IMAGE_DECODED_BYTES = 200 * 1024; // 200 KB
+
+export interface ProductImageMeta {
+  hasImage: boolean;
+  externalUrl: string | null;
+  versionMs: number;
+}
+
+let productImageMetaCache: {
+  map: Map<string, ProductImageMeta>;
+  expiresAt: number;
+} | null = null;
+
+export function invalidateProductImageMetaCache(): void {
+  productImageMetaCache = null;
+}
+
+export function parseUpdatedAtVersionMs(rawUpdatedAt: unknown): number {
+  if (!rawUpdatedAt) return 1;
+  const ms = new Date(String(rawUpdatedAt)).getTime();
+  return Number.isFinite(ms) && ms > 0 ? Math.floor(ms) : 1;
+}
+
+export function buildProductImageUrl(
+  productId: string,
+  meta?: ProductImageMeta | null,
+  fallbackUpdatedAt?: unknown
+): string {
+  if (!meta || !meta.hasImage) return '';
+  if (meta.externalUrl) return meta.externalUrl;
+  const v = meta.versionMs || parseUpdatedAtVersionMs(fallbackUpdatedAt);
+  return `/api/products/${encodeURIComponent(productId)}/image?v=${v}`;
+}
+
+export async function fetchProductImageMetaMap(
+  supabase: SupabaseClient,
+  forceRefresh = false
+): Promise<Map<string, ProductImageMeta>> {
+  const now = Date.now();
+  if (!forceRefresh && productImageMetaCache && productImageMetaCache.expiresAt > now) {
+    return productImageMetaCache.map;
+  }
+
+  const [withImgRes, extUrlRes] = await Promise.all([
+    supabase
+      .from('products')
+      .select('id,updated_at')
+      .not('image', 'is', null)
+      .neq('image', ''),
+    supabase
+      .from('products')
+      .select('id,image,updated_at')
+      .or('image.ilike.http://%,image.ilike.https://%'),
+  ]);
+
+  if (withImgRes.error) {
+    console.error('[Supabase Error] fetchProductImageMetaMap (withImg):', withImgRes.error.message);
+  }
+  if (extUrlRes.error) {
+    console.error('[Supabase Error] fetchProductImageMetaMap (extUrl):', extUrlRes.error.message);
+  }
+
+  const map = new Map<string, ProductImageMeta>();
+  const extById = new Map<string, string>();
+
+  for (const r of extUrlRes.data || []) {
+    if (r?.id && typeof r.image === 'string') {
+      extById.set(String(r.id), r.image.trim());
+    }
+  }
+
+  for (const r of withImgRes.data || []) {
+    if (!r?.id) continue;
+    const id = String(r.id);
+    map.set(id, {
+      hasImage: true,
+      externalUrl: extById.get(id) || null,
+      versionMs: parseUpdatedAtVersionMs(r.updated_at),
+    });
+  }
+
+  productImageMetaCache = {
+    map,
+    expiresAt: now + 30_000,
+  };
+
+  return map;
+}
+
+export function validateIncomingProductImage(rawImage: unknown): {
+  error?: string;
+  value: string | null;
+  keepExisting: boolean;
+  copyFromProductId?: string;
+  decodedBytes?: number;
+} {
+  if (rawImage === undefined) {
+    return { value: null, keepExisting: true };
+  }
+  if (rawImage === null || typeof rawImage !== 'string') {
+    return { value: null, keepExisting: false };
+  }
+  const trimmed = rawImage.trim();
+  if (!trimmed) {
+    return { value: null, keepExisting: false };
+  }
+
+  const localApiMatch = trimmed.match(/^\/api\/products\/([^/?#]+)\/image/i);
+  if (localApiMatch) {
+    let sourceId = localApiMatch[1];
+    try {
+      sourceId = decodeURIComponent(sourceId);
+    } catch {
+      // ignore decode error
+    }
+    return {
+      value: null,
+      keepExisting: true,
+      copyFromProductId: sourceId,
+    };
+  }
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    if (trimmed.length > 2048) {
+      return { error: 'URL da imagem muito longa.', value: null, keepExisting: false };
+    }
+    return { value: trimmed, keepExisting: false };
+  }
+
+  const dataMatch = trimmed.match(/^data:(image\/(jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=\s]+)$/i);
+  if (!dataMatch) {
+    if (trimmed.startsWith('data:')) {
+      return {
+        error: 'Formato de imagem não suportado. Use apenas JPG, PNG ou WebP.',
+        value: null,
+        keepExisting: false,
+      };
+    }
+    return { error: 'Formato de imagem inválido.', value: null, keepExisting: false };
+  }
+
+  const base64Payload = dataMatch[3].replace(/\s+/g, '');
+  const buffer = Buffer.from(base64Payload, 'base64');
+  if (!buffer || buffer.length === 0) {
+    return { error: 'Imagem inválida ou vazia.', value: null, keepExisting: false };
+  }
+
+  if (buffer.length > MAX_PRODUCT_IMAGE_DECODED_BYTES) {
+    return {
+      error: 'Foto muito pesada. Use uma imagem menor',
+      value: null,
+      keepExisting: false,
+      decodedBytes: buffer.length,
+    };
+  }
+
+  const mime = dataMatch[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : dataMatch[1].toLowerCase();
+  return {
+    value: `data:${mime};base64,${base64Payload}`,
+    keepExisting: false,
+    decodedBytes: buffer.length,
+  };
+}
+
+function productToDB(p: Product, imageValue: string | null = null) {
   const promoPriceVal =
     p.promoPrice !== undefined && p.promoPrice !== null && Number(p.promoPrice) > 0
       ? Number(p.promoPrice)
@@ -636,7 +803,7 @@ function productToDB(p: Product) {
     stock: Number(p.stock) || 0,
     min_stock: Number(p.minStock ?? 10),
     is_cold: p.isCold !== false,
-    image: p.image || null,
+    image: imageValue,
     sku: p.sku || null,
     active: p.active !== false,
     description: p.description || '',
@@ -644,7 +811,7 @@ function productToDB(p: Product) {
   };
 }
 
-function productFromDB(row: any): Product {
+function productFromDB(row: any, imageMetaMap?: Map<string, ProductImageMeta>): Product {
   const rawCaseSize = row.case_size !== null && row.case_size !== undefined ? Number(row.case_size) : null;
   const rawCasePrice = row.case_price !== null && row.case_price !== undefined ? Number(row.case_price) : null;
   const hasValidCaseSize =
@@ -657,8 +824,24 @@ function productFromDB(row: any): Product {
     rawCasePrice !== null &&
     rawCasePrice > 0;
 
+  const id = String(row.id);
+  const updatedAtStr = row.updated_at ? String(row.updated_at) : undefined;
+  let imageUrl = '';
+
+  if (imageMetaMap) {
+    const meta = imageMetaMap.get(id);
+    imageUrl = buildProductImageUrl(id, meta, updatedAtStr);
+  } else if (typeof row.image === 'string' && row.image.trim() !== '') {
+    const rawImg = row.image.trim();
+    if (/^https?:\/\//i.test(rawImg)) {
+      imageUrl = rawImg;
+    } else {
+      imageUrl = `/api/products/${encodeURIComponent(id)}/image?v=${parseUpdatedAtVersionMs(updatedAtStr)}`;
+    }
+  }
+
   return {
-    id: String(row.id),
+    id,
     name: String(row.name || ''),
     category: row.category as any,
     volume: row.volume || '',
@@ -674,11 +857,18 @@ function productFromDB(row: any): Product {
     stock: Number(row.stock || 0),
     minStock: row.min_stock !== null && row.min_stock !== undefined ? Number(row.min_stock) : 10,
     isCold: row.is_cold ?? true,
-    image: row.image || '',
+    // Never include base64 data inside product objects returned in lists
+    image: '',
+    imageUrl,
     sku: row.sku || '',
     active: row.active ?? true,
     description: row.description || '',
+    updatedAt: updatedAtStr,
   };
+}
+
+function mapProductsFromDB(rows: any[] | null | undefined, imageMetaMap?: Map<string, ProductImageMeta>): Product[] {
+  return (rows || []).map((r) => productFromDB(r, imageMetaMap));
 }
 
 function sanitizePublicProduct(p: Product): Omit<Product, 'costPrice' | 'minStock'> {
@@ -686,6 +876,8 @@ function sanitizePublicProduct(p: Product): Omit<Product, 'costPrice' | 'minStoc
   const { costPrice: _costPrice, minStock: _minStock, ...rest } = p;
   return {
     ...rest,
+    image: '',
+    imageUrl: p.imageUrl || '',
     promoPrice: activePromo ? (p.promoPrice ?? null) : null,
     promoEndsAt: activePromo ? (p.promoEndsAt ?? null) : null,
     caseSize: p.caseSize ?? null,
@@ -2847,14 +3039,14 @@ export function createApp(): express.Express {
     let numSubtotal = Number(subtotal) || 0;
     if (Array.isArray(items) && items.length > 0) {
       const [{ data: prodRows, error: prodErr }, { data: settingsRow, error: settingsErr }] = await Promise.all([
-        supabase.from('products').select('*'),
+        supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE),
         supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
       ]);
       if (prodErr) return res.status(500).json({ error: prodErr.message });
       if (settingsErr) return res.status(500).json({ error: settingsErr.message });
 
       if (prodRows) {
-        const dbProds = prodRows.map(productFromDB);
+        const dbProds = mapProductsFromDB(prodRows);
         const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
         reconcileSettingsCategoriesAndOrders(dbSettings, dbProds);
 
@@ -2995,8 +3187,9 @@ export function createApp(): express.Express {
     }
 
     try {
-      const [prodRes, areasRes, settingsRes] = await Promise.all([
-        supabase.from('products').select('*'),
+      const [prodRes, imageMetaMap, areasRes, settingsRes] = await Promise.all([
+        supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE),
+        fetchProductImageMetaMap(supabase),
         supabase.from('delivery_areas').select('*').eq('active', true),
         supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
       ]);
@@ -3005,7 +3198,7 @@ export function createApp(): express.Express {
       if (areasRes.error) return res.status(500).json({ error: areasRes.error.message });
       if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
 
-      const allProductRows = (prodRes.data || []).map(productFromDB);
+      const allProductRows = mapProductsFromDB(prodRes.data, imageMetaMap);
       const deliveryAreas = (areasRes.data || []).map(deliveryAreaFromDB);
 
       let settings = sanitizePublicSettings(initialSettings);
@@ -3059,11 +3252,19 @@ export function createApp(): express.Express {
     }
 
     try {
-      const [prodRes, areasRes, custRes, orderRes, couponsRes, settingsRes] = await Promise.all([
-        supabase.from('products').select('*').order('name'),
+      const cutoff48hIso = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+
+      const [prodRes, imageMetaMap, areasRes, custRes, orderRes, couponsRes, settingsRes] = await Promise.all([
+        supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE).order('name'),
+        fetchProductImageMetaMap(supabase),
         supabase.from('delivery_areas').select('*'),
         supabase.from('customers').select('*').order('created_at', { ascending: false }),
-        supabase.from('orders').select('*').order('created_at', { ascending: false }),
+        supabase
+          .from('orders')
+          .select('*')
+          .or(`created_at.gte.${cutoff48hIso},status.in.(pendente,em_separacao,em_rota)`)
+          .order('created_at', { ascending: false })
+          .limit(500),
         supabase.from('coupons').select('*').order('code'),
         supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
       ]);
@@ -3075,7 +3276,7 @@ export function createApp(): express.Express {
       if (couponsRes.error) return res.status(500).json({ error: couponsRes.error.message });
       if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
 
-      const mappedProducts = (prodRes.data || []).map(productFromDB);
+      const mappedProducts = mapProductsFromDB(prodRes.data, imageMetaMap);
 
       let settings = sanitizePublicSettings(initialSettings);
       if (settingsRes.data && settingsRes.data.data) {
@@ -3106,6 +3307,7 @@ export function createApp(): express.Express {
         customers,
         coupons: (couponsRes.data || []).map(couponFromDB),
         settings,
+        serverTime: new Date().toISOString(),
       });
     } catch (err: any) {
       console.error('[Server Error] GET /api/admin/state:', err);
@@ -3114,32 +3316,196 @@ export function createApp(): express.Express {
   });
 
   // ---------------------------------------------------------------------------
-  // ADMIN POLLING FOR NEW ORDERS: GET /admin/orders
+  // ADMIN LIGHTWEIGHT CHANGE CHECK: GET /admin/changes?since=<timestamp>
   // ---------------------------------------------------------------------------
-  router.get('/admin/orders', requireAdmin, async (_req, res) => {
+  router.get('/admin/changes', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+    }
+
+    const rawSince = typeof req.query.since === 'string' ? req.query.since.trim() : '';
+    let sinceMs = 0;
+    if (rawSince) {
+      const asNum = Number(rawSince);
+      if (!Number.isNaN(asNum) && asNum > 0) {
+        sinceMs = asNum;
+      } else {
+        const parsed = new Date(rawSince).getTime();
+        if (!Number.isNaN(parsed) && parsed > 0) {
+          sinceMs = parsed;
+        }
+      }
+    }
+
+    if (!sinceMs) {
+      return res.json({
+        ordersChanged: true,
+        productsChanged: true,
+        tabsChanged: true,
+        serverTime: new Date().toISOString(),
+      });
+    }
+
+    try {
+      const [latestOrderRes, latestProdRes, latestMovRes, latestTabRes, latestTabItemRes] = await Promise.all([
+        supabase
+          .from('orders')
+          .select('created_at,updated_at')
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        supabase
+          .from('products')
+          .select('updated_at')
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        supabase
+          .from('stock_movements')
+          .select('created_at')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        supabase
+          .from('table_tabs')
+          .select('opened_at,closed_at')
+          .order('opened_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        supabase
+          .from('table_tab_items')
+          .select('created_at,cancelled_at')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+      ]);
+
+      if (latestOrderRes.error) {
+        console.error('[Supabase Error] /admin/changes orders:', latestOrderRes.error.message);
+      }
+      if (latestProdRes.error) {
+        console.error('[Supabase Error] /admin/changes products:', latestProdRes.error.message);
+      }
+      if (latestMovRes.error) {
+        console.error('[Supabase Error] /admin/changes stock_movements:', latestMovRes.error.message);
+      }
+      if (latestTabRes.error) {
+        console.error('[Supabase Error] /admin/changes table_tabs:', latestTabRes.error.message);
+      }
+      if (latestTabItemRes.error) {
+        console.error('[Supabase Error] /admin/changes table_tab_items:', latestTabItemRes.error.message);
+      }
+
+      const toMs = (v: unknown): number => {
+        if (!v) return 0;
+        const t = new Date(String(v)).getTime();
+        return Number.isNaN(t) ? 0 : t;
+      };
+
+      const latestOrderMs = Math.max(
+        toMs(latestOrderRes.data?.created_at),
+        toMs(latestOrderRes.data?.updated_at)
+      );
+      const latestProdMs = Math.max(
+        toMs(latestProdRes.data?.updated_at),
+        toMs(latestMovRes.data?.created_at)
+      );
+      const latestTabMs = Math.max(
+        toMs(latestTabRes.data?.opened_at),
+        toMs(latestTabRes.data?.closed_at),
+        toMs(latestTabItemRes.data?.created_at),
+        toMs(latestTabItemRes.data?.cancelled_at)
+      );
+
+      // Add a small 2s safety overlap window
+      const thresholdMs = Math.max(0, sinceMs - 2000);
+
+      return res.json({
+        ordersChanged: latestOrderMs >= thresholdMs,
+        productsChanged: latestProdMs >= thresholdMs,
+        tabsChanged: latestTabMs >= thresholdMs,
+        serverTime: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Erro ao verificar atualizações.' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // ADMIN POLLING FOR NEW ORDERS: GET /admin/orders
+  // Supports ?since=<timestamp> and limits to last 48h + active orders
+  // ---------------------------------------------------------------------------
+  router.get('/admin/orders', requireAdmin, async (req, res) => {
     const supabase = getSupabase();
     if (!supabase) {
       return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
     }
 
     try {
-      const [orderRes, custRes] = await Promise.all([
-        supabase.from('orders').select('*').order('created_at', { ascending: false }),
-        supabase.from('customers').select('*'),
-      ]);
+      const cutoff48hIso = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      const rawSince = typeof req.query.since === 'string' ? req.query.since.trim() : '';
+      let sinceIso: string | null = null;
+      if (rawSince) {
+        const asNum = Number(rawSince);
+        const d = !Number.isNaN(asNum) && asNum > 0 ? new Date(asNum) : new Date(rawSince);
+        if (!Number.isNaN(d.getTime())) {
+          // 5s overlap window to avoid clock drift misses
+          sinceIso = new Date(Math.max(0, d.getTime() - 5000)).toISOString();
+        }
+      }
+
+      let orderQuery = supabase
+        .from('orders')
+        .select('*')
+        .or(`created_at.gte.${cutoff48hIso},status.in.(pendente,em_separacao,em_rota)`)
+        .order('created_at', { ascending: false })
+        .limit(300);
+
+      if (sinceIso) {
+        orderQuery = supabase
+          .from('orders')
+          .select('*')
+          .or(`created_at.gte.${sinceIso},updated_at.gte.${sinceIso},status.in.(pendente,em_separacao,em_rota)`)
+          .order('created_at', { ascending: false })
+          .limit(200);
+      }
+
+      const orderRes = await orderQuery;
 
       if (orderRes.error) {
         console.error('[Supabase Error] admin orders query:', orderRes.error.message);
         return res.status(500).json({ error: orderRes.error.message });
       }
-      if (custRes.error) {
-        console.error('[Supabase Error] admin customers for orders query:', custRes.error.message);
-        return res.status(500).json({ error: custRes.error.message });
+
+      const orderRows = orderRes.data || [];
+      const customerIds = Array.from(
+        new Set(
+          orderRows
+            .map((r: any) => (r.customer_id ? String(r.customer_id).trim() : ''))
+            .filter(Boolean)
+        )
+      );
+
+      const customerById = new Map<string, CustomerProfile>();
+      if (customerIds.length > 0) {
+        const custRes = await supabase
+          .from('customers')
+          .select('*')
+          .in('id', customerIds);
+
+        if (custRes.error) {
+          console.error('[Supabase Error] admin customers for orders query:', custRes.error.message);
+          return res.status(500).json({ error: custRes.error.message });
+        }
+
+        for (const cRow of custRes.data || []) {
+          const c = customerFromDB(cRow);
+          customerById.set(c.id, c);
+        }
       }
 
-      const customers = (custRes.data || []).map(customerFromDB);
-      const customerById = new Map<string, CustomerProfile>(customers.map((c) => [c.id, c]));
-      const orders = (orderRes.data || []).map((r: any) => orderFromDB(r, customerById));
+      const orders = orderRows.map((r: any) => orderFromDB(r, customerById));
       return res.json(orders);
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
@@ -3153,8 +3519,9 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado.' });
 
-    const [{ data, error }, { data: settingsRow, error: settingsErr }] = await Promise.all([
-      supabase.from('products').select('*').order('name'),
+    const [{ data, error }, imageMetaMap, { data: settingsRow, error: settingsErr }] = await Promise.all([
+      supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE).order('name'),
+      fetchProductImageMetaMap(supabase),
       supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
     ]);
     if (error) return res.status(500).json({ error: error.message });
@@ -3166,8 +3533,127 @@ export function createApp(): express.Express {
     const isAdmin = signed?.role === 'admin';
 
     const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
-    const mapped = applyCombosStockAndCost((data || []).map(productFromDB), dbSettings);
+    const mapped = applyCombosStockAndCost(mapProductsFromDB(data, imageMetaMap), dbSettings);
     res.json(isAdmin ? mapped : mapped.filter((p) => p.active).map(sanitizePublicProduct));
+  });
+
+  // ---------------------------------------------------------------------------
+  // PUBLIC PRODUCT IMAGE ROUTE: GET /products/:id/image
+  // Reads ONLY image, updated_at of that single product and serves binary with immutable cache
+  // ---------------------------------------------------------------------------
+  router.get('/products/:id/image', async (req, res) => {
+    const { id } = req.params;
+    const supabase = getSupabase();
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+    }
+
+    const { data, error } = await supabase
+      .from('products')
+      .select('image, updated_at')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[Supabase Error] GET /products/:id/image:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+
+    const rawImage = typeof data?.image === 'string' ? data.image.trim() : '';
+    if (!data || !rawImage) {
+      return res.status(404).end();
+    }
+
+    const versionMs = parseUpdatedAtVersionMs(data.updated_at);
+    const etag = `W/"prod-img-${Buffer.from(String(id)).toString('hex')}-${versionMs}-${rawImage.length}"`;
+
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('ETag', etag);
+
+    if (req.headers['if-none-match'] === etag) {
+      return res.status(304).end();
+    }
+
+    if (/^https?:\/\//i.test(rawImage)) {
+      return res.redirect(302, rawImage);
+    }
+
+    const match = rawImage.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/i);
+    if (!match) {
+      return res.status(404).end();
+    }
+
+    const contentType = match[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : match[1].toLowerCase();
+    const base64Data = match[2].replace(/\s+/g, '');
+    const binaryBuffer = Buffer.from(base64Data, 'base64');
+
+    if (!binaryBuffer || binaryBuffer.length === 0) {
+      return res.status(404).end();
+    }
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Length', String(binaryBuffer.length));
+    res.setHeader('X-Image-Storage-Bytes', String(Buffer.byteLength(rawImage, 'utf8')));
+    res.setHeader('X-Image-Decoded-Bytes', String(binaryBuffer.length));
+    return res.status(200).send(binaryBuffer);
+  });
+
+  // ---------------------------------------------------------------------------
+  // ADMIN UPDATE ONLY PRODUCT IMAGE: PUT /admin/products/:id/image
+  // ---------------------------------------------------------------------------
+  router.put('/admin/products/:id/image', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const rawImage = req.body?.image;
+    const imgValidation = validateIncomingProductImage(rawImage);
+    if (imgValidation.error) {
+      return res.status(400).json({ error: imgValidation.error });
+    }
+
+    const nowIso = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('products')
+      .update({
+        image: imgValidation.value,
+        updated_at: nowIso,
+      })
+      .eq('id', id)
+      .select('id, updated_at')
+      .maybeSingle();
+
+    if (error) {
+      console.error('[Supabase Error] PUT /admin/products/:id/image:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+    if (!data) {
+      return res.status(404).json({ error: 'Produto não encontrado.' });
+    }
+
+    invalidateProductImageMetaCache();
+    const versionMs = parseUpdatedAtVersionMs(data.updated_at);
+    const hasImage = Boolean(imgValidation.value);
+    const externalUrl =
+      imgValidation.value && /^https?:\/\//i.test(imgValidation.value) ? imgValidation.value : null;
+
+    const imageUrl = buildProductImageUrl(
+      String(data.id),
+      {
+        hasImage,
+        externalUrl,
+        versionMs,
+      },
+      data.updated_at
+    );
+
+    return res.json({
+      id: String(data.id),
+      imageUrl,
+      updatedAt: String(data.updated_at || nowIso),
+      decodedBytes: imgValidation.decodedBytes ?? 0,
+      storageBytes: imgValidation.value ? Buffer.byteLength(imgValidation.value, 'utf8') : 0,
+    });
   });
 
   router.post('/products', requireAdmin, async (req, res) => {
@@ -3179,6 +3665,12 @@ export function createApp(): express.Express {
     const parsedCase = parseProductCaseFields(product);
     if (parsedCase.error) {
       return res.status(400).json({ error: parsedCase.error });
+    }
+
+    const rawImageInput = product.image || product.imageUrl || '';
+    const imgValidation = validateIncomingProductImage(rawImageInput);
+    if (imgValidation.error) {
+      return res.status(400).json({ error: imgValidation.error });
     }
 
     const supabase = getSupabase();
@@ -3193,6 +3685,20 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: existingErr.message });
     }
 
+    let finalImageToSave: string | null = imgValidation.value;
+    if (imgValidation.keepExisting) {
+      const sourceId = imgValidation.copyFromProductId || product.id;
+      const { data: srcImgRow, error: srcImgErr } = await supabase
+        .from('products')
+        .select('image')
+        .eq('id', sourceId)
+        .maybeSingle();
+      if (srcImgErr) {
+        return res.status(500).json({ error: srcImgErr.message });
+      }
+      finalImageToSave = srcImgRow?.image || null;
+    }
+
     const requestedStock = Math.max(0, Math.trunc(Number(product.stock) || 0));
     const normalizedProduct: Product = {
       ...product,
@@ -3203,15 +3709,17 @@ export function createApp(): express.Express {
 
     const { data, error } = await supabase
       .from('products')
-      .upsert(productToDB(normalizedProduct))
-      .select('*')
+      .upsert(productToDB(normalizedProduct, finalImageToSave))
+      .select(PRODUCT_COLUMNS_NO_IMAGE)
       .single();
     if (error) {
       console.error('[Supabase Error] products upsert:', error.message);
       return res.status(500).json({ error: error.message });
     }
 
-    let savedProduct = data ? productFromDB(data) : normalizedProduct;
+    invalidateProductImageMetaCache();
+    const imageMetaMap = await fetchProductImageMetaMap(supabase, true);
+    let savedProduct = data ? productFromDB(data, imageMetaMap) : normalizedProduct;
     const { data: settingsRow, error: settingsErr } = await supabase
       .from('store_settings')
       .select('data')
@@ -3243,9 +3751,11 @@ export function createApp(): express.Express {
     }
 
     if (isCombo) {
-      const { data: allRows, error: allErr } = await supabase.from('products').select('*');
+      const { data: allRows, error: allErr } = await supabase
+        .from('products')
+        .select(PRODUCT_COLUMNS_NO_IMAGE);
       if (allErr) return res.status(500).json({ error: allErr.message });
-      const withCombos = applyCombosStockAndCost((allRows || []).map(productFromDB), dbSettings);
+      const withCombos = applyCombosStockAndCost(mapProductsFromDB(allRows, imageMetaMap), dbSettings);
       const found = withCombos.find((p) => p.id === savedProduct.id);
       if (found) savedProduct = found;
     }
@@ -3265,9 +3775,17 @@ export function createApp(): express.Express {
       return res.status(400).json({ error: parsedCase.error });
     }
 
+    const hasImageField = Object.prototype.hasOwnProperty.call(body, 'image');
+    const imgValidation = hasImageField
+      ? validateIncomingProductImage(body.image)
+      : { value: null, keepExisting: true };
+    if (imgValidation.error) {
+      return res.status(400).json({ error: imgValidation.error });
+    }
+
     const [{ data: existingRow, error: fetchExistErr }, { data: settingsRow, error: settingsErr }] =
       await Promise.all([
-        supabase.from('products').select('*').eq('id', id).maybeSingle(),
+        supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE).eq('id', id).maybeSingle(),
         supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
       ]);
 
@@ -3309,12 +3827,15 @@ export function createApp(): express.Express {
       cost_price: Number(body.costPrice) || 0,
       min_stock: Number(body.minStock ?? 10),
       is_cold: body.isCold !== false,
-      image: body.image || null,
       sku: body.sku || null,
       active: body.active !== false,
       description: body.description || '',
       updated_at: new Date().toISOString(),
     };
+
+    if (!imgValidation.keepExisting) {
+      updateData.image = imgValidation.value;
+    }
 
     if (Object.prototype.hasOwnProperty.call(body, 'promoPrice')) {
       updateData.promo_price =
@@ -3330,7 +3851,7 @@ export function createApp(): express.Express {
       .from('products')
       .update(updateData)
       .eq('id', id)
-      .select('*')
+      .select(PRODUCT_COLUMNS_NO_IMAGE)
       .maybeSingle();
 
     if (error || !data) {
@@ -3338,7 +3859,9 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error?.message || 'Produto não encontrado.' });
     }
 
-    let updatedProduct = productFromDB(data);
+    invalidateProductImageMetaCache();
+    const imageMetaMap = await fetchProductImageMetaMap(supabase, true);
+    let updatedProduct = productFromDB(data, imageMetaMap);
 
     if (!isCombo && targetStock !== null && targetStock !== Number(existingRow.stock || 0)) {
       const { data: newStockVal, error: adjErr } = await supabase.rpc('adjust_stock', {
@@ -3363,9 +3886,11 @@ export function createApp(): express.Express {
     }
 
     if (isCombo) {
-      const { data: allRows, error: allErr } = await supabase.from('products').select('*');
+      const { data: allRows, error: allErr } = await supabase
+        .from('products')
+        .select(PRODUCT_COLUMNS_NO_IMAGE);
       if (allErr) return res.status(500).json({ error: allErr.message });
-      const withCombos = applyCombosStockAndCost((allRows || []).map(productFromDB), dbSettings);
+      const withCombos = applyCombosStockAndCost(mapProductsFromDB(allRows, imageMetaMap), dbSettings);
       const found = withCombos.find((p) => p.id === updatedProduct.id);
       if (found) updatedProduct = found;
     }
@@ -3382,7 +3907,7 @@ export function createApp(): express.Express {
 
     const { data: existing, error: fetchErr } = await supabase
       .from('products')
-      .select('*')
+      .select(PRODUCT_COLUMNS_NO_IMAGE)
       .eq('id', id)
       .maybeSingle();
 
@@ -3411,9 +3936,10 @@ export function createApp(): express.Express {
       .update({
         promo_price: Math.round(numPromo * 100) / 100,
         promo_ends_at: cleanEndsAt,
+        updated_at: new Date().toISOString(),
       })
       .eq('id', id)
-      .select('*')
+      .select(PRODUCT_COLUMNS_NO_IMAGE)
       .single();
 
     if (updateErr || !updated) {
@@ -3421,7 +3947,8 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: updateErr?.message || 'Erro ao salvar promoção.' });
     }
 
-    res.json(productFromDB(updated));
+    const imageMetaMap = await fetchProductImageMetaMap(supabase);
+    res.json(productFromDB(updated, imageMetaMap));
   });
 
   router.delete('/admin/products/:id/promotion', requireAdmin, async (req, res) => {
@@ -3434,9 +3961,10 @@ export function createApp(): express.Express {
       .update({
         promo_price: null,
         promo_ends_at: null,
+        updated_at: new Date().toISOString(),
       })
       .eq('id', id)
-      .select('*')
+      .select(PRODUCT_COLUMNS_NO_IMAGE)
       .maybeSingle();
 
     if (updateErr || !updated) {
@@ -3444,7 +3972,8 @@ export function createApp(): express.Express {
       return res.status(404).json({ error: updateErr?.message || 'Produto não encontrado.' });
     }
 
-    res.json(productFromDB(updated));
+    const imageMetaMap = await fetchProductImageMetaMap(supabase);
+    res.json(productFromDB(updated, imageMetaMap));
   });
 
   // Requirement 2a: POST /api/admin/products/:id/stock (mode: 'delta'|'set', value: inteiro, reason: 'ajuste'|'entrada'|'perda'|'contagem', note)
@@ -3454,7 +3983,7 @@ export function createApp(): express.Express {
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
     const [{ data: existingRow, error: prodErr }, { data: settingsRow, error: settingsErr }] = await Promise.all([
-      supabase.from('products').select('*').eq('id', id).maybeSingle(),
+      supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE).eq('id', id).maybeSingle(),
       supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
     ]);
 
@@ -3765,6 +4294,8 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
+    invalidateProductImageMetaCache();
+
     // If deleted product was in store_settings (combos, hiddenFromStoreIds, featuredProductIds, caseSaleChannels), clean it up
     const { data: settingsRow, error: settingsErr } = await supabase
       .from('store_settings')
@@ -3903,7 +4434,7 @@ export function createApp(): express.Express {
     };
 
     const [{ data: existingRows, error: fetchErr }, { data: settingsRow, error: settingsErr }] = await Promise.all([
-      supabase.from('products').select('*'),
+      supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE),
       supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
     ]);
     if (fetchErr) {
@@ -4085,6 +4616,8 @@ export function createApp(): express.Express {
       }
       updated++;
     }
+
+    invalidateProductImageMetaCache();
 
     return res.json({
       created,
@@ -4391,9 +4924,9 @@ export function createApp(): express.Express {
       }
     }
 
-    // 1. Fetch current products, delivery areas, settings directly from Supabase
+    // 1. Fetch current products, delivery areas, settings directly from Supabase (without base64 images)
     const [prodRes, areasRes, settingsRes] = await Promise.all([
-      supabase.from('products').select('*'),
+      supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE),
       supabase.from('delivery_areas').select('*').eq('active', true),
       supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
     ]);
@@ -4401,7 +4934,7 @@ export function createApp(): express.Express {
     if (prodRes.error) return res.status(500).json({ error: prodRes.error.message });
     if (areasRes.error) return res.status(500).json({ error: areasRes.error.message });
     if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
-    const dbProducts = (prodRes.data || []).map(productFromDB);
+    const dbProducts = mapProductsFromDB(prodRes.data);
     const dbAreas = (areasRes.data || []).map(deliveryAreaFromDB);
     const dbSettings = settingsRes.data?.data ? sanitizePublicSettings(settingsRes.data.data) : initialSettings;
     reconcileSettingsCategoriesAndOrders(dbSettings, dbProducts);
@@ -5795,7 +6328,7 @@ export function createApp(): express.Express {
 
     // Fetch product and store_settings to calculate effective price and check if product is a combo
     const [{ data: prodData, error: prodErr }, { data: settingsRow, error: settingsErr }] = await Promise.all([
-      supabase.from('products').select('*').eq('id', product_id).maybeSingle(),
+      supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE).eq('id', product_id).maybeSingle(),
       supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
     ]);
 
@@ -5834,7 +6367,7 @@ export function createApp(): express.Express {
 
       const { data: compRows, error: compErr } = await supabase
         .from('products')
-        .select('*')
+        .select(PRODUCT_COLUMNS_NO_IMAGE)
         .in('id', Array.from(new Set(compIds)));
 
       if (compErr) return res.status(500).json({ error: compErr.message });
@@ -6278,7 +6811,7 @@ export function createApp(): express.Express {
     const productIds = Array.from(productIdsSet);
     const { data: prodRows, error: prodErr } = await supabase
       .from('products')
-      .select('*')
+      .select(PRODUCT_COLUMNS_NO_IMAGE)
       .in('id', productIds);
 
     if (prodErr) {

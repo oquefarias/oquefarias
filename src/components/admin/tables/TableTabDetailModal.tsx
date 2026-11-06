@@ -1019,10 +1019,13 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                         }`}
                       >
                         <div className="flex items-center gap-3 min-w-0">
-                          {p.image ? (
+                          {p.imageUrl || p.image ? (
                             <img
-                              src={p.image}
+                              src={p.imageUrl || p.image}
                               alt={p.name}
+                              width={40}
+                              height={40}
+                              loading="lazy"
                               className="w-10 h-10 rounded-xl object-cover bg-neutral-100 shrink-0"
                             />
                           ) : (
