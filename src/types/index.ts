@@ -1058,4 +1058,85 @@ export interface ProductImportResult {
   errors: ProductImportErrorItem[];
 }
 
+export interface CashSessionSummary {
+  ordersCount: number;
+  totalRevenue: number;
+  netProfit: number;
+  avgTicket: number;
+  onlineCount: number;
+  onlineRevenue: number;
+  posCount: number;
+  posRevenue: number;
+  mesaCount: number;
+  mesaRevenue: number;
+  paymentBreakdown: {
+    dinheiro: number;
+    pix: number;
+    cartao_debito: number;
+    cartao_credito: number;
+  };
+  serviceFeeTotal: number;
+  discountTotal: number;
+  cancelledCount: number;
+  openingCash: number;
+  expectedCash: number;
+  countedCash: number | null;
+  cashDifference: number | null;
+}
 
+export interface CashSession {
+  id: string;
+  openedAt: string;
+  closedAt?: string | null;
+  openingCash: number;
+  countedCash?: number | null;
+  notes?: string | null;
+  summary: CashSessionSummary;
+  createdAt: string;
+}
+
+export interface PaymentHistoryItem {
+  id: string;
+  orderId: string;
+  type: 'entrada' | 'saida';
+  status: OrderStatus;
+  source: 'online' | 'balcao' | 'mesa';
+  channelLabel: string;
+  customerName: string;
+  paymentMethod: PaymentMethod;
+  amount: number;
+  cashReceived?: number | null;
+  changeGiven?: number | null;
+  serviceFee?: number;
+  discount?: number;
+  createdAt: string;
+  updatedAt: string;
+  cancelReason?: string | null;
+}
+
+export interface PaymentsHistorySummary {
+  entriesCount: number;
+  entriesTotal: number;
+  cancelledCount: number;
+  cancelledTotal: number;
+  balance: number;
+  byPaymentMethod: {
+    dinheiro: number;
+    pix: number;
+    cartao_debito: number;
+    cartao_credito: number;
+  };
+}
+
+export interface PaymentsHistoryResponse {
+  items: PaymentHistoryItem[];
+  summary: PaymentsHistorySummary;
+  hasMore: boolean;
+  nextOffset: number | null;
+  totalCount: number;
+  sessionInfo?: {
+    id: string;
+    openedAt: string;
+    closedAt?: string | null;
+  } | null;
+}

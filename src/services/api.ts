@@ -20,6 +20,9 @@ import {
   AdminChangesResponse,
   GuestTrackedOrderResponse,
   SavedGuestOrderLink,
+  CashSession,
+  CashSessionSummary,
+  PaymentsHistoryResponse,
   isComboProduct,
   calculateComboMetrics,
 } from '../types';
@@ -2271,6 +2274,195 @@ class ApiService {
     }
     await this.reloadProducts();
     this.notifyListeners();
+  }
+
+  // ---------------------------------------------------------------------------
+  // EXPEDIENTE (CASH SESSIONS) & PAYMENTS HISTORY
+  // ---------------------------------------------------------------------------
+
+  public async getCurrentCashSession(): Promise<{
+    session: CashSession | null;
+    openTablesCount: number;
+    latestClosedSession: CashSession | null;
+  }> {
+    const res = await fetch('/api/admin/cash-sessions/current', {
+      headers: this.getAdminHeaders(),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível consultar o expediente atual.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    return await res.json();
+  }
+
+  public async openCashSession(openingCash: number): Promise<{
+    session: CashSession;
+    settings?: StoreSettings;
+  }> {
+    const res = await fetch('/api/admin/cash-sessions/open', {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({ openingCash }),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err: any = new Error(json?.error || 'Não foi possível abrir o expediente.');
+      err.status = res.status;
+      err.session = json?.session || null;
+      throw err;
+    }
+    if (json?.settings) {
+      this.state.settings = { ...this.state.settings, ...json.settings };
+      this.notifyListeners();
+    }
+    return json;
+  }
+
+  public async closeCashSession(
+    sessionId: string,
+    data: { countedCash: number; notes?: string }
+  ): Promise<{
+    session: CashSession;
+    settings?: StoreSettings;
+  }> {
+    const res = await fetch(`/api/admin/cash-sessions/${encodeURIComponent(sessionId)}/close`, {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify(data),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err: any = new Error(json?.error || 'Não foi possível fechar o expediente.');
+      err.status = res.status;
+      throw err;
+    }
+    if (json?.settings) {
+      this.state.settings = { ...this.state.settings, ...json.settings };
+      this.notifyListeners();
+    }
+    return json;
+  }
+
+  public async getCashSessions(limit = 30): Promise<CashSession[]> {
+    const res = await fetch(`/api/admin/cash-sessions?limit=${encodeURIComponent(String(limit))}`, {
+      headers: this.getAdminHeaders(),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível listar os expedientes.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    const json = await res.json();
+    return Array.isArray(json?.sessions) ? json.sessions : [];
+  }
+
+  public async getCashSummaryByRange(from: string, to: string): Promise<{
+    summary: CashSessionSummary;
+    fromIso: string;
+    toIso: string;
+  }> {
+    const params = new URLSearchParams({ from, to });
+    const res = await fetch(`/api/admin/cash-sessions/summary-by-range?${params.toString()}`, {
+      headers: this.getAdminHeaders(),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível calcular o resumo do período.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    return await res.json();
+  }
+
+  public async getPaymentsHistory(params: {
+    channels?: string[];
+    paymentMethod?: string;
+    showCancelled?: boolean;
+    period?: 'session' | 'today' | '7d' | 'custom';
+    sessionId?: string;
+    from?: string;
+    to?: string;
+    search?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaymentsHistoryResponse> {
+    const qs = new URLSearchParams();
+    if (params.channels && params.channels.length > 0) {
+      qs.set('channels', params.channels.join(','));
+    }
+    if (params.paymentMethod) {
+      qs.set('paymentMethod', params.paymentMethod);
+    }
+    if (params.showCancelled !== undefined) {
+      qs.set('showCancelled', String(params.showCancelled));
+    }
+    if (params.period) {
+      qs.set('period', params.period);
+    }
+    if (params.sessionId) {
+      qs.set('sessionId', params.sessionId);
+    }
+    if (params.from) {
+      qs.set('from', params.from);
+    }
+    if (params.to) {
+      qs.set('to', params.to);
+    }
+    if (params.search) {
+      qs.set('search', params.search);
+    }
+    if (params.limit) {
+      qs.set('limit', String(params.limit));
+    }
+    if (params.offset !== undefined) {
+      qs.set('offset', String(params.offset));
+    }
+
+    const res = await fetch(`/api/admin/payments-history?${qs.toString()}`, {
+      headers: this.getAdminHeaders(),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let message = 'Não foi possível carregar o histórico de pagamentos.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+    return await res.json();
   }
 }
 

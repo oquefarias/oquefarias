@@ -22,9 +22,16 @@ import {
 interface TablesManagerProps {
   products: Product[];
   settings: StoreSettings;
+  hasOpenCashSession?: boolean;
+  onRequestOpenCashSession?: () => void;
 }
 
-export const TablesManager: React.FC<TablesManagerProps> = ({ products, settings }) => {
+export const TablesManager: React.FC<TablesManagerProps> = ({
+  products,
+  settings,
+  hasOpenCashSession = true,
+  onRequestOpenCashSession,
+}) => {
   const [tables, setTables] = useState<TableWithTab[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
@@ -593,6 +600,8 @@ export const TablesManager: React.FC<TablesManagerProps> = ({ products, settings
         tab={tabToClose}
         isOpen={Boolean(tabToClose)}
         settings={settings}
+        hasOpenCashSession={hasOpenCashSession}
+        onRequestOpenCashSession={onRequestOpenCashSession}
         onClose={() => setTabToClose(null)}
         onSuccess={(createdOrder) => {
           setTabToClose(null);

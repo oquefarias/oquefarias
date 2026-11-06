@@ -42,6 +42,11 @@ import {
   canSellProductCase,
   StockMovement,
   StockMovementsResponse,
+  CashSession,
+  CashSessionSummary,
+  PaymentHistoryItem,
+  PaymentsHistorySummary,
+  PaymentsHistoryResponse,
 } from '../types/index.js';
 
 dotenv.config();
@@ -7549,6 +7554,942 @@ export function createApp(): express.Express {
     }
 
     res.json({ success: true });
+  });
+
+  // ---------------------------------------------------------------------------
+  // EXPEDIENTE (CASH SESSIONS) & PAYMENTS HISTORY (Admin only)
+  // ---------------------------------------------------------------------------
+
+  const extractServiceFeeFromNotes = (notes?: string | null): number => {
+    if (!notes || typeof notes !== 'string') return 0;
+    const match = notes.match(/Taxa de servi[çc]o\s*\(\d+(?:[.,]\d+)?%\)\s*:\s*R\$\s*(\d+(?:[.,]\d+)?)/i);
+    if (match && match[1]) {
+      const parsed = parseFloat(match[1].replace(',', '.'));
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        return Math.round(parsed * 100) / 100;
+      }
+    }
+    return 0;
+  };
+
+  const extractCancelReasonFromOrderNotes = (notes?: string | null): string | null => {
+    if (!notes || typeof notes !== 'string') return null;
+    const trimmed = notes.trim();
+    if (!trimmed) return null;
+    const match = trimmed.match(/Cancelad[oa]\s*:\s*([^|\]]+)/i);
+    if (match && match[1]?.trim()) {
+      return match[1].trim();
+    }
+    return trimmed;
+  };
+
+  const extractOrderChannelLabel = (row: any): string => {
+    const src = String(row.source || 'online');
+    if (src === 'balcao') return 'PDV Balcão';
+    if (src === 'mesa') {
+      const notes = typeof row.notes === 'string' ? row.notes : '';
+      const mesaMatch = notes.match(/Mesa\s+[\d\s+]+/i);
+      if (mesaMatch && mesaMatch[0]) {
+        return mesaMatch[0].trim();
+      }
+      const custName = typeof row.customer?.name === 'string' ? row.customer.name : '';
+      const custMatch = custName.match(/Mesa\s+[\d\s+]+/i);
+      if (custMatch && custMatch[0]) {
+        return custMatch[0].trim();
+      }
+      const custAddr = typeof row.customer?.address === 'string' ? row.customer.address : '';
+      const addrMatch = custAddr.match(/Mesa\s+[\d\s+]+/i);
+      if (addrMatch && addrMatch[0]) {
+        return addrMatch[0].trim();
+      }
+      return 'Mesa';
+    }
+    return 'Delivery';
+  };
+
+  const computeCashSessionSummaryFromOrders = (
+    orderRows: any[],
+    openingCashRaw: number,
+    countedCashRaw: number | null = null
+  ): CashSessionSummary => {
+    const openingCash = Math.max(0, Math.round((Number(openingCashRaw) || 0) * 100) / 100);
+    const countedCash =
+      countedCashRaw !== null && countedCashRaw !== undefined && !Number.isNaN(Number(countedCashRaw))
+        ? Math.max(0, Math.round(Number(countedCashRaw) * 100) / 100)
+        : null;
+
+    let ordersCount = 0;
+    let totalRevenue = 0;
+    let totalCost = 0;
+    let onlineCount = 0;
+    let onlineRevenue = 0;
+    let posCount = 0;
+    let posRevenue = 0;
+    let mesaCount = 0;
+    let mesaRevenue = 0;
+    const paymentBreakdown = {
+      dinheiro: 0,
+      pix: 0,
+      cartao_debito: 0,
+      cartao_credito: 0,
+    };
+    let serviceFeeTotal = 0;
+    let discountTotal = 0;
+    let cancelledCount = 0;
+
+    for (const row of orderRows) {
+      const status = String(row.status || 'pendente');
+      if (status === 'cancelado') {
+        cancelledCount += 1;
+        continue;
+      }
+
+      const total = Math.max(0, Number(row.total) || 0);
+      const discount = Math.max(0, Number(row.discount) || 0);
+      const source = String(row.source || 'online');
+      const pm = String(row.payment_method || 'pix') as PaymentMethod;
+
+      ordersCount += 1;
+      totalRevenue += total;
+      discountTotal += discount;
+
+      if (source === 'balcao') {
+        posCount += 1;
+        posRevenue += total;
+      } else if (source === 'mesa') {
+        mesaCount += 1;
+        mesaRevenue += total;
+      } else {
+        onlineCount += 1;
+        onlineRevenue += total;
+      }
+
+      if (pm === 'dinheiro') {
+        paymentBreakdown.dinheiro += total;
+      } else if (pm === 'cartao_debito') {
+        paymentBreakdown.cartao_debito += total;
+      } else if (pm === 'cartao_credito') {
+        paymentBreakdown.cartao_credito += total;
+      } else {
+        paymentBreakdown.pix += total;
+      }
+
+      if (row.notes) {
+        serviceFeeTotal += extractServiceFeeFromNotes(String(row.notes));
+      }
+
+      const items = Array.isArray(row.items) ? row.items : [];
+      for (const it of items) {
+        const price = Number(it?.price) || 0;
+        const cost = Number(it?.costPrice) || price * 0.65;
+        const qty = Math.max(1, Number(it?.quantity) || 1);
+        totalCost += cost * qty;
+      }
+    }
+
+    totalRevenue = Math.round(totalRevenue * 100) / 100;
+    const netProfit = Math.max(0, Math.round((totalRevenue - totalCost) * 100) / 100);
+    const avgTicket = ordersCount > 0 ? Math.round((totalRevenue / ordersCount) * 100) / 100 : 0;
+    onlineRevenue = Math.round(onlineRevenue * 100) / 100;
+    posRevenue = Math.round(posRevenue * 100) / 100;
+    mesaRevenue = Math.round(mesaRevenue * 100) / 100;
+    paymentBreakdown.dinheiro = Math.round(paymentBreakdown.dinheiro * 100) / 100;
+    paymentBreakdown.pix = Math.round(paymentBreakdown.pix * 100) / 100;
+    paymentBreakdown.cartao_debito = Math.round(paymentBreakdown.cartao_debito * 100) / 100;
+    paymentBreakdown.cartao_credito = Math.round(paymentBreakdown.cartao_credito * 100) / 100;
+    serviceFeeTotal = Math.round(serviceFeeTotal * 100) / 100;
+    discountTotal = Math.round(discountTotal * 100) / 100;
+
+    const expectedCash = Math.round((openingCash + paymentBreakdown.dinheiro) * 100) / 100;
+    const cashDifference =
+      countedCash !== null ? Math.round((countedCash - expectedCash) * 100) / 100 : null;
+
+    return {
+      ordersCount,
+      totalRevenue,
+      netProfit,
+      avgTicket,
+      onlineCount,
+      onlineRevenue,
+      posCount,
+      posRevenue,
+      mesaCount,
+      mesaRevenue,
+      paymentBreakdown,
+      serviceFeeTotal,
+      discountTotal,
+      cancelledCount,
+      openingCash,
+      expectedCash,
+      countedCash,
+      cashDifference,
+    };
+  };
+
+  const normalizeStoredSummary = (
+    rawSummary: any,
+    openingCashRaw: number,
+    countedCashRaw: number | null
+  ): CashSessionSummary | null => {
+    if (!rawSummary || typeof rawSummary !== 'object') return null;
+    if (typeof rawSummary.totalRevenue !== 'number' && typeof rawSummary.ordersCount !== 'number') {
+      return null;
+    }
+    const openingCash = Math.max(0, Math.round((Number(openingCashRaw ?? rawSummary.openingCash) || 0) * 100) / 100);
+    const countedCash =
+      countedCashRaw !== null && countedCashRaw !== undefined && !Number.isNaN(Number(countedCashRaw))
+        ? Math.max(0, Math.round(Number(countedCashRaw) * 100) / 100)
+        : rawSummary.countedCash !== null && rawSummary.countedCash !== undefined && !Number.isNaN(Number(rawSummary.countedCash))
+        ? Math.max(0, Math.round(Number(rawSummary.countedCash) * 100) / 100)
+        : null;
+    const pb = rawSummary.paymentBreakdown || {};
+    const dinheiro = Math.max(0, Math.round((Number(pb.dinheiro) || 0) * 100) / 100);
+    const pix = Math.max(0, Math.round((Number(pb.pix) || 0) * 100) / 100);
+    const cartao_debito = Math.max(0, Math.round((Number(pb.cartao_debito) || 0) * 100) / 100);
+    const cartao_credito = Math.max(0, Math.round((Number(pb.cartao_credito) || 0) * 100) / 100);
+    const expectedCash = Math.round((openingCash + dinheiro) * 100) / 100;
+    const cashDifference =
+      countedCash !== null ? Math.round((countedCash - expectedCash) * 100) / 100 : null;
+    const ordersCount = Math.max(0, Math.floor(Number(rawSummary.ordersCount) || 0));
+    const totalRevenue = Math.max(0, Math.round((Number(rawSummary.totalRevenue) || 0) * 100) / 100);
+
+    return {
+      ordersCount,
+      totalRevenue,
+      netProfit: Math.max(0, Math.round((Number(rawSummary.netProfit ?? totalRevenue * 0.35) || 0) * 100) / 100),
+      avgTicket:
+        ordersCount > 0
+          ? Math.round((Number(rawSummary.avgTicket ?? totalRevenue / ordersCount) || 0) * 100) / 100
+          : 0,
+      onlineCount: Math.max(0, Math.floor(Number(rawSummary.onlineCount) || 0)),
+      onlineRevenue: Math.max(0, Math.round((Number(rawSummary.onlineRevenue) || 0) * 100) / 100),
+      posCount: Math.max(0, Math.floor(Number(rawSummary.posCount) || 0)),
+      posRevenue: Math.max(0, Math.round((Number(rawSummary.posRevenue) || 0) * 100) / 100),
+      mesaCount: Math.max(0, Math.floor(Number(rawSummary.mesaCount) || 0)),
+      mesaRevenue: Math.max(0, Math.round((Number(rawSummary.mesaRevenue) || 0) * 100) / 100),
+      paymentBreakdown: {
+        dinheiro,
+        pix,
+        cartao_debito,
+        cartao_credito,
+      },
+      serviceFeeTotal: Math.max(0, Math.round((Number(rawSummary.serviceFeeTotal) || 0) * 100) / 100),
+      discountTotal: Math.max(0, Math.round((Number(rawSummary.discountTotal) || 0) * 100) / 100),
+      cancelledCount: Math.max(0, Math.floor(Number(rawSummary.cancelledCount) || 0)),
+      openingCash,
+      expectedCash,
+      countedCash,
+      cashDifference,
+    };
+  };
+
+  const cashSessionFromDB = (row: any, computedSummary: CashSessionSummary): CashSession => ({
+    id: String(row.id),
+    openedAt: String(row.opened_at),
+    closedAt: row.closed_at ? String(row.closed_at) : null,
+    openingCash: Math.max(0, Math.round((Number(row.opening_cash) || 0) * 100) / 100),
+    countedCash:
+      row.counted_cash !== null && row.counted_cash !== undefined && !Number.isNaN(Number(row.counted_cash))
+        ? Math.max(0, Math.round(Number(row.counted_cash) * 100) / 100)
+        : null,
+    notes: row.notes ? String(row.notes) : null,
+    summary: computedSummary,
+    createdAt: String(row.created_at || row.opened_at),
+  });
+
+  const buildLiveCashSession = async (
+    supabase: SupabaseClient,
+    sessionRow: any
+  ): Promise<{ session?: CashSession; error?: string }> => {
+    const openedAt = String(sessionRow.opened_at);
+    const endIso = sessionRow.closed_at ? String(sessionRow.closed_at) : new Date().toISOString();
+    const { data: orderRows, error: ordErr } = await supabase
+      .from('orders')
+      .select('id, status, source, total, discount, payment_method, notes, items, created_at')
+      .gte('created_at', openedAt)
+      .lte('created_at', endIso);
+
+    if (ordErr) {
+      return { error: ordErr.message };
+    }
+
+    const countedCash =
+      sessionRow.counted_cash !== null &&
+      sessionRow.counted_cash !== undefined &&
+      !Number.isNaN(Number(sessionRow.counted_cash))
+        ? Number(sessionRow.counted_cash)
+        : null;
+
+    const summary = computeCashSessionSummaryFromOrders(
+      orderRows || [],
+      Number(sessionRow.opening_cash) || 0,
+      countedCash
+    );
+
+    return {
+      session: cashSessionFromDB(sessionRow, summary),
+    };
+  };
+
+  const updateStoreOpenStatusOnServer = async (
+    supabase: SupabaseClient,
+    isOpen: boolean
+  ): Promise<{ settings?: StoreSettings; error?: string }> => {
+    const { data: existingData, error: fetchError } = await supabase
+      .from('store_settings')
+      .select('data')
+      .eq('id', 'default')
+      .maybeSingle();
+
+    if (fetchError) {
+      return { error: fetchError.message };
+    }
+
+    const current = existingData?.data || initialSettings;
+    const nextSettings = sanitizePublicSettings({
+      ...current,
+      isOpen,
+    });
+
+    const { error: upsertErr } = await supabase.from('store_settings').upsert({
+      id: 'default',
+      data: nextSettings,
+      updated_at: new Date().toISOString(),
+    });
+
+    if (upsertErr) {
+      return { error: upsertErr.message };
+    }
+
+    return { settings: nextSettings };
+  };
+
+  // 1a. GET /api/admin/cash-sessions/current
+  router.get('/admin/cash-sessions/current', requireAdmin, async (_req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const [openRes, openTabsRes, latestClosedRes] = await Promise.all([
+      supabase
+        .from('cash_sessions')
+        .select('*')
+        .is('closed_at', null)
+        .order('opened_at', { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+      supabase
+        .from('table_tabs')
+        .select('id', { count: 'exact' })
+        .in('status', ['open', 'closing']),
+      supabase
+        .from('cash_sessions')
+        .select('*')
+        .not('closed_at', 'is', null)
+        .order('closed_at', { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+    ]);
+
+    if (openRes.error) {
+      console.error('[Supabase Error] cash_sessions current:', openRes.error.message);
+      return res.status(500).json({ error: openRes.error.message });
+    }
+    if (openTabsRes.error) {
+      console.error('[Supabase Error] table_tabs count in cash-sessions/current:', openTabsRes.error.message);
+      return res.status(500).json({ error: openTabsRes.error.message });
+    }
+    if (latestClosedRes.error) {
+      console.error('[Supabase Error] cash_sessions latestClosed:', latestClosedRes.error.message);
+      return res.status(500).json({ error: latestClosedRes.error.message });
+    }
+
+    const openTablesCount = openTabsRes.count ?? (openTabsRes.data?.length || 0);
+
+    let latestClosedSession: CashSession | null = null;
+    if (latestClosedRes.data) {
+      const row = latestClosedRes.data;
+      const stored = normalizeStoredSummary(
+        row.summary,
+        Number(row.opening_cash) || 0,
+        row.counted_cash !== null && row.counted_cash !== undefined ? Number(row.counted_cash) : null
+      );
+      if (stored) {
+        latestClosedSession = cashSessionFromDB(row, stored);
+      } else {
+        const built = await buildLiveCashSession(supabase, row);
+        if (built.error) return res.status(500).json({ error: built.error });
+        latestClosedSession = built.session || null;
+      }
+    }
+
+    if (!openRes.data) {
+      return res.json({
+        session: null,
+        openTablesCount,
+        latestClosedSession,
+      });
+    }
+
+    const builtOpen = await buildLiveCashSession(supabase, openRes.data);
+    if (builtOpen.error) {
+      return res.status(500).json({ error: builtOpen.error });
+    }
+
+    return res.json({
+      session: builtOpen.session || null,
+      openTablesCount,
+      latestClosedSession,
+    });
+  });
+
+  // 1b. POST /api/admin/cash-sessions/open { openingCash }
+  router.post('/admin/cash-sessions/open', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const rawOpening = req.body?.openingCash;
+    if (rawOpening === undefined || rawOpening === null || String(rawOpening).trim() === '') {
+      return res.status(400).json({ error: 'Informe o dinheiro inicial na gaveta.' });
+    }
+    const parsedOpening = Number(String(rawOpening).replace(',', '.'));
+    if (!Number.isFinite(parsedOpening) || parsedOpening < 0 || parsedOpening > 1_000_000) {
+      return res.status(400).json({ error: 'Dinheiro inicial inválido (deve ser maior ou igual a zero).' });
+    }
+    const openingCash = Math.round(parsedOpening * 100) / 100;
+
+    // Pre-check if an open session already exists
+    const { data: existingOpen, error: checkErr } = await supabase
+      .from('cash_sessions')
+      .select('*')
+      .is('closed_at', null)
+      .order('opened_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (checkErr) {
+      console.error('[Supabase Error] cash_sessions open pre-check:', checkErr.message);
+      return res.status(500).json({ error: checkErr.message });
+    }
+
+    if (existingOpen) {
+      const builtExisting = await buildLiveCashSession(supabase, existingOpen);
+      if (builtExisting.error) {
+        return res.status(500).json({ error: builtExisting.error });
+      }
+      return res.status(409).json({
+        error: 'Já existe um expediente aberto',
+        session: builtExisting.session,
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+    const newId = crypto.randomUUID();
+    const initialSummary = computeCashSessionSummaryFromOrders([], openingCash, null);
+
+    const { data: createdRow, error: insertErr } = await supabase
+      .from('cash_sessions')
+      .insert({
+        id: newId,
+        opened_at: nowIso,
+        closed_at: null,
+        opening_cash: openingCash,
+        counted_cash: null,
+        notes: null,
+        summary: initialSummary,
+        created_at: nowIso,
+      })
+      .select('*')
+      .maybeSingle();
+
+    if (insertErr) {
+      if (
+        String(insertErr.code) === '23505' ||
+        String(insertErr.message || '').toLowerCase().includes('duplicate') ||
+        String(insertErr.message || '').toLowerCase().includes('unique')
+      ) {
+        const { data: conflictOpen, error: conflictFetchErr } = await supabase
+          .from('cash_sessions')
+          .select('*')
+          .is('closed_at', null)
+          .order('opened_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (conflictFetchErr) {
+          return res.status(500).json({ error: conflictFetchErr.message });
+        }
+        if (conflictOpen) {
+          const builtConflict = await buildLiveCashSession(supabase, conflictOpen);
+          if (builtConflict.error) {
+            return res.status(500).json({ error: builtConflict.error });
+          }
+          return res.status(409).json({
+            error: 'Já existe um expediente aberto',
+            session: builtConflict.session,
+          });
+        }
+        return res.status(409).json({ error: 'Já existe um expediente aberto' });
+      }
+
+      console.error('[Supabase Error] cash_sessions insert:', insertErr.message);
+      return res.status(500).json({ error: insertErr.message });
+    }
+
+    if (!createdRow) {
+      return res.status(500).json({ error: 'Não foi possível criar o expediente.' });
+    }
+
+    // Set store as Open (isOpen: true)
+    const storeUpdate = await updateStoreOpenStatusOnServer(supabase, true);
+    if (storeUpdate.error) {
+      console.error('[Supabase Error] store_settings open on cash_sessions/open:', storeUpdate.error);
+      return res.status(500).json({ error: storeUpdate.error });
+    }
+
+    const session = cashSessionFromDB(createdRow, initialSummary);
+    return res.status(201).json({
+      session,
+      settings: storeUpdate.settings,
+    });
+  });
+
+  // 1c. POST /api/admin/cash-sessions/:id/close { countedCash, notes }
+  router.post('/admin/cash-sessions/:id/close', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { id } = req.params;
+    const rawCounted = req.body?.countedCash;
+    if (rawCounted === undefined || rawCounted === null || String(rawCounted).trim() === '') {
+      return res.status(400).json({ error: 'Informe o dinheiro contado na gaveta.' });
+    }
+    const parsedCounted = Number(String(rawCounted).replace(',', '.'));
+    if (!Number.isFinite(parsedCounted) || parsedCounted < 0 || parsedCounted > 10_000_000) {
+      return res.status(400).json({ error: 'Valor contado inválido (deve ser maior ou igual a zero).' });
+    }
+    const countedCash = Math.round(parsedCounted * 100) / 100;
+    const cleanNotes =
+      req.body?.notes && typeof req.body.notes === 'string' && req.body.notes.trim()
+        ? req.body.notes.trim().slice(0, 500)
+        : null;
+
+    // Fetch session to check opened_at and opening_cash
+    const { data: sessionRow, error: fetchErr } = await supabase
+      .from('cash_sessions')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (fetchErr) {
+      console.error('[Supabase Error] cash_sessions fetch before close:', fetchErr.message);
+      return res.status(500).json({ error: fetchErr.message });
+    }
+    if (!sessionRow) {
+      return res.status(404).json({ error: 'Expediente não encontrado.' });
+    }
+    if (sessionRow.closed_at !== null) {
+      return res.status(409).json({ error: 'Este expediente já foi fechado' });
+    }
+
+    const closedAtIso = new Date().toISOString();
+    const { data: orderRows, error: ordErr } = await supabase
+      .from('orders')
+      .select('id, status, source, total, discount, payment_method, notes, items, created_at')
+      .gte('created_at', String(sessionRow.opened_at))
+      .lte('created_at', closedAtIso);
+
+    if (ordErr) {
+      console.error('[Supabase Error] orders fetch for cash_sessions close:', ordErr.message);
+      return res.status(500).json({ error: ordErr.message });
+    }
+
+    const finalSummary = computeCashSessionSummaryFromOrders(
+      orderRows || [],
+      Number(sessionRow.opening_cash) || 0,
+      countedCash
+    );
+
+    const { data: updatedRows, error: closeErr } = await supabase
+      .from('cash_sessions')
+      .update({
+        closed_at: closedAtIso,
+        counted_cash: countedCash,
+        notes: cleanNotes,
+        summary: finalSummary,
+      })
+      .eq('id', id)
+      .is('closed_at', null)
+      .select('*');
+
+    if (closeErr) {
+      console.error('[Supabase Error] cash_sessions close update:', closeErr.message);
+      return res.status(500).json({ error: closeErr.message });
+    }
+
+    if (!updatedRows || updatedRows.length === 0) {
+      return res.status(409).json({ error: 'Este expediente já foi fechado' });
+    }
+
+    // Set store as Closed (isOpen: false)
+    const storeUpdate = await updateStoreOpenStatusOnServer(supabase, false);
+    if (storeUpdate.error) {
+      console.error('[Supabase Error] store_settings close on cash_sessions/close:', storeUpdate.error);
+      return res.status(500).json({ error: storeUpdate.error });
+    }
+
+    const closedSession = cashSessionFromDB(updatedRows[0], finalSummary);
+    return res.json({
+      session: closedSession,
+      settings: storeUpdate.settings,
+    });
+  });
+
+  // 1d. GET /api/admin/cash-sessions?limit=30
+  router.get('/admin/cash-sessions', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const parsedLimit = parseInt(String(req.query.limit || '30'), 10);
+    const limit = Number.isNaN(parsedLimit) ? 30 : Math.max(1, Math.min(100, parsedLimit));
+
+    const { data: rows, error } = await supabase
+      .from('cash_sessions')
+      .select('*')
+      .order('opened_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      console.error('[Supabase Error] cash_sessions list:', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+
+    const sessions: CashSession[] = [];
+    for (const row of rows || []) {
+      if (!row.closed_at) {
+        const built = await buildLiveCashSession(supabase, row);
+        if (built.error) {
+          return res.status(500).json({ error: built.error });
+        }
+        if (built.session) sessions.push(built.session);
+      } else {
+        const stored = normalizeStoredSummary(
+          row.summary,
+          Number(row.opening_cash) || 0,
+          row.counted_cash !== null && row.counted_cash !== undefined ? Number(row.counted_cash) : null
+        );
+        if (stored) {
+          sessions.push(cashSessionFromDB(row, stored));
+        } else {
+          const built = await buildLiveCashSession(supabase, row);
+          if (built.error) {
+            return res.status(500).json({ error: built.error });
+          }
+          if (built.session) sessions.push(built.session);
+        }
+      }
+    }
+
+    return res.json({ sessions });
+  });
+
+  // Summary by custom date range (for Caixa & Relatórios date filter)
+  router.get('/admin/cash-sessions/summary-by-range', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const fromRaw = typeof req.query.from === 'string' ? req.query.from.trim() : '';
+    const toRaw = typeof req.query.to === 'string' ? req.query.to.trim() : '';
+
+    const toIso = (raw: string, isEnd: boolean): string | null => {
+      if (!raw) return null;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        return isEnd ? `${raw}T23:59:59.999-03:00` : `${raw}T00:00:00.000-03:00`;
+      }
+      const d = new Date(raw);
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    };
+
+    const fromIso = toIso(fromRaw, false);
+    const toIsoVal = toIso(toRaw, true);
+
+    if (!fromIso || !toIsoVal) {
+      return res.status(400).json({ error: 'Informe um período de datas válido.' });
+    }
+
+    const { data: orderRows, error: ordErr } = await supabase
+      .from('orders')
+      .select('id, status, source, total, discount, payment_method, notes, items, created_at')
+      .gte('created_at', fromIso)
+      .lte('created_at', toIsoVal);
+
+    if (ordErr) {
+      console.error('[Supabase Error] summary-by-range orders:', ordErr.message);
+      return res.status(500).json({ error: ordErr.message });
+    }
+
+    const summary = computeCashSessionSummaryFromOrders(orderRows || [], 0, null);
+    return res.json({ summary, fromIso, toIso: toIsoVal });
+  });
+
+  // 5e. GET /api/admin/payments-history
+  router.get('/admin/payments-history', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const channelsParam = typeof req.query.channels === 'string' ? req.query.channels.trim() : '';
+    const selectedChannels = channelsParam
+      ? channelsParam
+          .split(',')
+          .map((c) => c.trim().toLowerCase())
+          .filter((c) => c === 'online' || c === 'balcao' || c === 'mesa')
+      : [];
+
+    const paymentMethodParam =
+      typeof req.query.paymentMethod === 'string' ? req.query.paymentMethod.trim().toLowerCase() : 'todas';
+    const showCancelled =
+      typeof req.query.showCancelled === 'string'
+        ? req.query.showCancelled.trim().toLowerCase() !== 'false'
+        : true;
+    const periodParam =
+      typeof req.query.period === 'string' ? req.query.period.trim().toLowerCase() : 'session';
+    const sessionIdParam =
+      typeof req.query.sessionId === 'string' ? req.query.sessionId.trim() : '';
+    const fromRaw = typeof req.query.from === 'string' ? req.query.from.trim() : '';
+    const toRaw = typeof req.query.to === 'string' ? req.query.to.trim() : '';
+    const searchRaw = typeof req.query.search === 'string' ? req.query.search.trim().toLowerCase() : '';
+    const parsedLimit = parseInt(String(req.query.limit || '100'), 10);
+    const limit = Number.isNaN(parsedLimit) ? 100 : Math.max(1, Math.min(100, parsedLimit));
+    const parsedOffset = parseInt(String(req.query.offset || '0'), 10);
+    const offset = Number.isNaN(parsedOffset) ? 0 : Math.max(0, parsedOffset);
+
+    const toIsoRange = (raw: string, isEnd: boolean): string | null => {
+      if (!raw) return null;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        return isEnd ? `${raw}T23:59:59.999-03:00` : `${raw}T00:00:00.000-03:00`;
+      }
+      const d = new Date(raw);
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    };
+
+    let fromIso: string | null = null;
+    let toIso: string | null = null;
+    let sessionInfo: PaymentsHistoryResponse['sessionInfo'] = null;
+
+    if (periodParam === 'session') {
+      let targetSession: any = null;
+      if (sessionIdParam) {
+        const { data: byId, error: byIdErr } = await supabase
+          .from('cash_sessions')
+          .select('id, opened_at, closed_at')
+          .eq('id', sessionIdParam)
+          .maybeSingle();
+        if (byIdErr) {
+          console.error('[Supabase Error] payments-history session by id:', byIdErr.message);
+          return res.status(500).json({ error: byIdErr.message });
+        }
+        targetSession = byId;
+      } else {
+        const { data: openSess, error: openErr } = await supabase
+          .from('cash_sessions')
+          .select('id, opened_at, closed_at')
+          .is('closed_at', null)
+          .order('opened_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (openErr) {
+          console.error('[Supabase Error] payments-history open session:', openErr.message);
+          return res.status(500).json({ error: openErr.message });
+        }
+        if (openSess) {
+          targetSession = openSess;
+        } else {
+          const { data: lastClosed, error: lastErr } = await supabase
+            .from('cash_sessions')
+            .select('id, opened_at, closed_at')
+            .not('closed_at', 'is', null)
+            .order('closed_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (lastErr) {
+            console.error('[Supabase Error] payments-history last closed session:', lastErr.message);
+            return res.status(500).json({ error: lastErr.message });
+          }
+          targetSession = lastClosed;
+        }
+      }
+
+      if (targetSession) {
+        fromIso = String(targetSession.opened_at);
+        toIso = targetSession.closed_at ? String(targetSession.closed_at) : new Date().toISOString();
+        sessionInfo = {
+          id: String(targetSession.id),
+          openedAt: fromIso,
+          closedAt: targetSession.closed_at ? String(targetSession.closed_at) : null,
+        };
+      } else {
+        // Fallback to today in Brazil time (-03:00) if no cash session exists yet
+        const nowBr = new Date(Date.now() - 3 * 60 * 60 * 1000);
+        const yyyyMmDd = nowBr.toISOString().slice(0, 10);
+        fromIso = `${yyyyMmDd}T00:00:00.000-03:00`;
+        toIso = new Date().toISOString();
+      }
+    } else if (periodParam === 'today') {
+      const nowBr = new Date(Date.now() - 3 * 60 * 60 * 1000);
+      const yyyyMmDd = nowBr.toISOString().slice(0, 10);
+      fromIso = `${yyyyMmDd}T00:00:00.000-03:00`;
+      toIso = `${yyyyMmDd}T23:59:59.999-03:00`;
+    } else if (periodParam === '7d') {
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      fromIso = sevenDaysAgo.toISOString();
+      toIso = new Date().toISOString();
+    } else if (periodParam === 'custom') {
+      fromIso = toIsoRange(fromRaw, false);
+      toIso = toIsoRange(toRaw, true);
+    }
+
+    let query = supabase
+      .from('orders')
+      .select(
+        'id, source, status, customer, subtotal, discount, delivery_fee, total, payment_method, cash_change_for, notes, created_at, updated_at'
+      )
+      .order('created_at', { ascending: false });
+
+    if (selectedChannels.length > 0 && selectedChannels.length < 3) {
+      query = query.in('source', selectedChannels);
+    }
+    if (
+      paymentMethodParam &&
+      paymentMethodParam !== 'todas' &&
+      ['dinheiro', 'pix', 'cartao_debito', 'cartao_credito'].includes(paymentMethodParam)
+    ) {
+      query = query.eq('payment_method', paymentMethodParam);
+    }
+    if (fromIso) {
+      query = query.gte('created_at', fromIso);
+    }
+    if (toIso) {
+      query = query.lte('created_at', toIso);
+    }
+
+    const { data: rawOrders, error: ordersErr } = await query.limit(5000);
+    if (ordersErr) {
+      console.error('[Supabase Error] payments-history orders:', ordersErr.message);
+      return res.status(500).json({ error: ordersErr.message });
+    }
+
+    // Filter by search (number / customer / table)
+    const searchFiltered = (rawOrders || []).filter((row: any) => {
+      if (!searchRaw) return true;
+      const idStr = String(row.id || '').toLowerCase();
+      const custName = String(row.customer?.name || '').toLowerCase();
+      const custPhone = String(row.customer?.phone || '').toLowerCase();
+      const chLabel = extractOrderChannelLabel(row).toLowerCase();
+      return (
+        idStr.includes(searchRaw) ||
+        custName.includes(searchRaw) ||
+        custPhone.includes(searchRaw) ||
+        chLabel.includes(searchRaw)
+      );
+    });
+
+    // Compute summary across all matching rows (entries vs cancelled)
+    let entriesCount = 0;
+    let entriesTotal = 0;
+    let cancelledCount = 0;
+    let cancelledTotal = 0;
+    const byPaymentMethod = {
+      dinheiro: 0,
+      pix: 0,
+      cartao_debito: 0,
+      cartao_credito: 0,
+    };
+
+    const allItems: PaymentHistoryItem[] = [];
+
+    for (const row of searchFiltered) {
+      const status = (row.status as OrderStatus) || 'pendente';
+      const isCancelled = status === 'cancelado';
+      const amount = Math.max(0, Math.round((Number(row.total) || 0) * 100) / 100);
+      const pm = (row.payment_method as PaymentMethod) || 'pix';
+      const source = (row.source as 'online' | 'balcao' | 'mesa') || 'online';
+      const channelLabel = extractOrderChannelLabel(row);
+      const customerName = String(row.customer?.name || 'Cliente').trim();
+      const serviceFee = source === 'mesa' ? extractServiceFeeFromNotes(row.notes) : 0;
+      const discount = Math.max(0, Math.round((Number(row.discount) || 0) * 100) / 100);
+      const cashReceived =
+        pm === 'dinheiro' && row.cash_change_for !== null && row.cash_change_for !== undefined
+          ? Math.round(Number(row.cash_change_for) * 100) / 100
+          : null;
+      const changeGiven =
+        cashReceived !== null && cashReceived >= amount
+          ? Math.round((cashReceived - amount) * 100) / 100
+          : null;
+
+      if (isCancelled) {
+        cancelledCount += 1;
+        cancelledTotal += amount;
+      } else {
+        entriesCount += 1;
+        entriesTotal += amount;
+        if (pm === 'dinheiro') byPaymentMethod.dinheiro += amount;
+        else if (pm === 'cartao_debito') byPaymentMethod.cartao_debito += amount;
+        else if (pm === 'cartao_credito') byPaymentMethod.cartao_credito += amount;
+        else byPaymentMethod.pix += amount;
+      }
+
+      if (isCancelled && !showCancelled) {
+        continue;
+      }
+
+      allItems.push({
+        id: `${row.id}:${isCancelled ? 'saida' : 'entrada'}`,
+        orderId: String(row.id),
+        type: isCancelled ? 'saida' : 'entrada',
+        status,
+        source,
+        channelLabel,
+        customerName,
+        paymentMethod: pm,
+        amount,
+        cashReceived,
+        changeGiven,
+        serviceFee: serviceFee > 0 ? serviceFee : undefined,
+        discount: discount > 0 ? discount : undefined,
+        createdAt: String(row.created_at),
+        updatedAt: String(row.updated_at || row.created_at),
+        cancelReason: isCancelled ? extractCancelReasonFromOrderNotes(row.notes) : null,
+      });
+    }
+
+    entriesTotal = Math.round(entriesTotal * 100) / 100;
+    cancelledTotal = Math.round(cancelledTotal * 100) / 100;
+    byPaymentMethod.dinheiro = Math.round(byPaymentMethod.dinheiro * 100) / 100;
+    byPaymentMethod.pix = Math.round(byPaymentMethod.pix * 100) / 100;
+    byPaymentMethod.cartao_debito = Math.round(byPaymentMethod.cartao_debito * 100) / 100;
+    byPaymentMethod.cartao_credito = Math.round(byPaymentMethod.cartao_credito * 100) / 100;
+
+    const totalCount = allItems.length;
+    const pagedItems = allItems.slice(offset, offset + limit);
+    const hasMore = offset + limit < totalCount;
+    const nextOffset = hasMore ? offset + limit : null;
+
+    const responsePayload: PaymentsHistoryResponse = {
+      items: pagedItems,
+      summary: {
+        entriesCount,
+        entriesTotal,
+        cancelledCount,
+        cancelledTotal,
+        balance: entriesTotal,
+        byPaymentMethod,
+      },
+      hasMore,
+      nextOffset,
+      totalCount,
+      sessionInfo,
+    };
+
+    return res.json(responsePayload);
   });
 
   // Mount the router under both /api and root (for Vercel path rewrites compatibility)

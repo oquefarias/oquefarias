@@ -31,6 +31,8 @@ interface CloseTabModalProps {
   tab: TabDetail | null;
   isOpen: boolean;
   settings?: StoreSettings;
+  hasOpenCashSession?: boolean;
+  onRequestOpenCashSession?: () => void;
   onClose: () => void;
   onSuccess: (order: Order) => void;
 }
@@ -39,6 +41,8 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
   tab,
   isOpen,
   settings,
+  hasOpenCashSession = true,
+  onRequestOpenCashSession,
   onClose,
   onSuccess,
 }) => {
@@ -338,6 +342,24 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
 
         {/* Content */}
         <form onSubmit={handleConfirmClose} className="p-4 sm:p-6 overflow-y-auto space-y-5 flex-1">
+          {!hasOpenCashSession && (
+            <div className="p-3 bg-amber-50 border border-amber-300 rounded-2xl flex flex-wrap items-center justify-between gap-2 text-xs text-amber-900 font-bold">
+              <div className="flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+                <span>Abra o expediente para registrar as vendas no caixa</span>
+              </div>
+              {onRequestOpenCashSession && (
+                <button
+                  type="button"
+                  onClick={onRequestOpenCashSession}
+                  className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-black rounded-xl text-xs transition-colors shrink-0 cursor-pointer"
+                >
+                  Abrir expediente
+                </button>
+              )}
+            </div>
+          )}
+
           {isSubmitting && submittingStatusText && (
             <div className="p-3 bg-amber-50 border border-amber-300 rounded-2xl flex items-center gap-2 text-xs text-amber-900 font-bold">
               <Loader2 className="w-4 h-4 shrink-0 text-amber-600 animate-spin" />

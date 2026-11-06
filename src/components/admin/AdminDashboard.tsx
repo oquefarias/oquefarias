@@ -35,6 +35,8 @@ import {
   calculateComboMetrics,
   formatOrderItemComboLine,
   isProductHiddenFromStore,
+  CashSession,
+  CashSessionSummary,
 } from '../../types';
 import {
   api,
@@ -51,6 +53,16 @@ import { ImportProductsModal } from './ImportProductsModal';
 import { TablesManager } from './tables/TablesManager';
 import { StoreOrganizationSection } from './StoreOrganizationSection';
 import { StockHistorySection } from './StockHistorySection';
+import {
+  OpenCashSessionModal,
+  CloseCashSessionModal,
+  CashClosingReceiptModal,
+  formatCashSessionBadgeDate,
+  formatCashSessionDateTime,
+  formatCashSessionDuration,
+  formatCashDifferenceLabel,
+} from './CashSessionModals';
+import { PaymentsHistorySection } from './PaymentsHistorySection';
 import {
   calculateDistanceKm,
   buildSingleDeliveryRouteUrl,
@@ -2071,6 +2083,166 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     };
   }, [localOrders, products, settings]);
 
+  // =========================================================
+  // EXPEDIENTE (CAIXA) & HISTÓRICO DE PAGAMENTOS STATE
+  // =========================================================
+  const [currentCashSession, setCurrentCashSession] = useState<CashSession | null>(null);
+  const [latestClosedCashSession, setLatestClosedCashSession] = useState<CashSession | null>(null);
+  const [openTablesCountForCash, setOpenTablesCountForCash] = useState<number>(0);
+  const [cashSessionsList, setCashSessionsList] = useState<CashSession[]>([]);
+  const [isLoadingCashData, setIsLoadingCashData] = useState<boolean>(false);
+
+  const [isOpenCashModalOpen, setIsOpenCashModalOpen] = useState<boolean>(false);
+  const [isCloseCashModalOpen, setIsCloseCashModalOpen] = useState<boolean>(false);
+  const [closingReceiptSession, setClosingReceiptSession] = useState<CashSession | null>(null);
+
+  const [financeiroSubTab, setFinanceiroSubTab] = useState<'resumo' | 'pagamentos'>('resumo');
+  const [financeiroFilterMode, setFinanceiroFilterMode] = useState<
+    'current_session' | 'session' | 'date_range'
+  >('current_session');
+  const [selectedFinanceiroSessionId, setSelectedFinanceiroSessionId] = useState<string>('');
+  const [financeiroDateFrom, setFinanceiroDateFrom] = useState<string>(() =>
+    new Date().toISOString().slice(0, 10)
+  );
+  const [financeiroDateTo, setFinanceiroDateTo] = useState<string>(() =>
+    new Date().toISOString().slice(0, 10)
+  );
+  const [rangeSummary, setRangeSummary] = useState<CashSessionSummary | null>(null);
+  const [isLoadingRangeSummary, setIsLoadingRangeSummary] = useState<boolean>(false);
+
+  const refreshCashSessionsData = React.useCallback(async (includeHistory = false) => {
+    try {
+      setIsLoadingCashData(true);
+      const currentRes = await api.getCurrentCashSession();
+      setCurrentCashSession(currentRes.session || null);
+      setOpenTablesCountForCash(currentRes.openTablesCount || 0);
+      if (currentRes.latestClosedSession) {
+        setLatestClosedCashSession(currentRes.latestClosedSession);
+      }
+      if (includeHistory) {
+        const listRes = await api.getCashSessions(30);
+        setCashSessionsList(listRes || []);
+        if (!currentRes.latestClosedSession) {
+          const firstClosed = (listRes || []).find((s) => Boolean(s.closedAt)) || null;
+          setLatestClosedCashSession(firstClosed);
+        }
+      }
+    } catch (err) {
+      console.error('Erro ao consultar expediente atual:', err);
+    } finally {
+      setIsLoadingCashData(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshCashSessionsData(true);
+  }, [refreshCashSessionsData]);
+
+  useEffect(() => {
+    if (activeTab === 'financeiro') {
+      refreshCashSessionsData(true);
+    } else if (activeTab === 'pdv' || activeTab === 'mesas') {
+      refreshCashSessionsData(false);
+    }
+  }, [activeTab, localOrders.length, refreshCashSessionsData]);
+
+  useEffect(() => {
+    if (activeTab !== 'financeiro' || financeiroFilterMode !== 'date_range') return;
+    let cancelled = false;
+    const loadRange = async () => {
+      setIsLoadingRangeSummary(true);
+      try {
+        const fromIso = financeiroDateFrom
+          ? new Date(`${financeiroDateFrom}T00:00:00`).toISOString()
+          : new Date(new Date().setHours(0, 0, 0, 0)).toISOString();
+        const toIso = financeiroDateTo
+          ? new Date(`${financeiroDateTo}T23:59:59.999`).toISOString()
+          : new Date().toISOString();
+        const res = await api.getCashSummaryByRange(fromIso, toIso);
+        if (!cancelled) {
+          setRangeSummary(res.summary);
+        }
+      } catch (err) {
+        console.error('Erro ao carregar resumo por período:', err);
+      } finally {
+        if (!cancelled) {
+          setIsLoadingRangeSummary(false);
+        }
+      }
+    };
+    loadRange();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, financeiroFilterMode, financeiroDateFrom, financeiroDateTo, localOrders.length]);
+
+  const handleOpenCashSessionSuccess = async (session: CashSession) => {
+    setCurrentCashSession(session);
+    setSettingsForm((prev) => ({ ...prev, isOpen: true }));
+    await refreshCashSessionsData(true);
+  };
+
+  const handleCloseCashSessionSuccess = async (closedSession: CashSession) => {
+    setCurrentCashSession(null);
+    setLatestClosedCashSession(closedSession);
+    setSettingsForm((prev) => ({ ...prev, isOpen: false }));
+    setIsCloseCashModalOpen(false);
+    await refreshCashSessionsData(true);
+    setClosingReceiptSession(closedSession);
+  };
+
+  const displayedCashSession = useMemo<CashSession | null>(() => {
+    if (financeiroFilterMode === 'date_range') return null;
+    if (financeiroFilterMode === 'session' && selectedFinanceiroSessionId) {
+      return (
+        cashSessionsList.find((s) => s.id === selectedFinanceiroSessionId) ||
+        (currentCashSession?.id === selectedFinanceiroSessionId ? currentCashSession : null) ||
+        latestClosedCashSession
+      );
+    }
+    return currentCashSession || latestClosedCashSession || cashSessionsList[0] || null;
+  }, [
+    financeiroFilterMode,
+    selectedFinanceiroSessionId,
+    cashSessionsList,
+    currentCashSession,
+    latestClosedCashSession,
+  ]);
+
+  const displayedSummary = useMemo<CashSessionSummary>(() => {
+    if (financeiroFilterMode === 'date_range' && rangeSummary) {
+      return rangeSummary;
+    }
+    if (displayedCashSession?.summary) {
+      return displayedCashSession.summary;
+    }
+    return {
+      ordersCount: 0,
+      totalRevenue: 0,
+      netProfit: 0,
+      avgTicket: 0,
+      onlineCount: 0,
+      onlineRevenue: 0,
+      posCount: 0,
+      posRevenue: 0,
+      mesaCount: 0,
+      mesaRevenue: 0,
+      paymentBreakdown: {
+        dinheiro: 0,
+        pix: 0,
+        cartao_debito: 0,
+        cartao_credito: 0,
+      },
+      serviceFeeTotal: 0,
+      discountTotal: 0,
+      cancelledCount: 0,
+      openingCash: displayedCashSession?.openingCash || 0,
+      expectedCash: displayedCashSession?.openingCash || 0,
+      countedCash: displayedCashSession?.countedCash ?? null,
+      cashDifference: null,
+    };
+  }, [financeiroFilterMode, rangeSummary, displayedCashSession]);
+
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
@@ -2490,6 +2662,70 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
         </div>
       )}
+
+      {/* Fixed Top Bar: Expediente (Caixa) & Loja Online Toggle (2a & 2e) */}
+      <div className="mb-4 bg-white p-3 sm:px-4 rounded-2xl border border-neutral-200 shadow-xs flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2.5">
+          {currentCashSession ? (
+            <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-100 text-emerald-900 border border-emerald-300 text-xs sm:text-sm font-black">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+              <span>
+                Expediente aberto desde {formatCashSessionBadgeDate(currentCashSession.openedAt)}
+              </span>
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-neutral-200 text-neutral-700 border border-neutral-300 text-xs sm:text-sm font-bold">
+              <span className="w-2.5 h-2.5 rounded-full bg-neutral-500 shrink-0" />
+              <span>Expediente fechado</span>
+            </span>
+          )}
+
+          {currentCashSession ? (
+            <button
+              type="button"
+              onClick={async () => {
+                await refreshCashSessionsData(false);
+                setIsCloseCashModalOpen(true);
+              }}
+              className="px-3.5 py-1.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-black text-xs transition-colors shadow-2xs cursor-pointer"
+            >
+              Fechar expediente
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setIsOpenCashModalOpen(true)}
+              className="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs transition-colors shadow-2xs cursor-pointer"
+            >
+              Abrir expediente
+            </button>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              const next = !settingsForm.isOpen;
+              setSettingsForm((prev) => ({ ...prev, isOpen: next }));
+              api.updateSettings({ isOpen: next });
+            }}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors flex items-center gap-1.5 cursor-pointer ${
+              settingsForm.isOpen
+                ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                : 'bg-neutral-100 text-neutral-600 border-neutral-300 hover:bg-neutral-200'
+            }`}
+            title="Abrir ou pausar a loja online independentemente do expediente"
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${
+                settingsForm.isOpen ? 'bg-emerald-500' : 'bg-red-500'
+              }`}
+            />
+            <span>Loja: {settingsForm.isOpen ? 'Aberta' : 'Fechada'}</span>
+          </button>
+        </div>
+      </div>
 
       {/* Owner System Navigation Bar */}
       <div className="bg-white p-2 rounded-2xl border border-neutral-200 shadow-xs mb-6 flex flex-wrap items-center justify-between gap-2">
@@ -4740,14 +4976,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {/* TAB: MESAS & COMANDAS                                     */}
       {/* ========================================================= */}
       {activeTab === 'mesas' && (
-        <TablesManager products={products} settings={settings} />
+        <TablesManager
+          products={products}
+          settings={settings}
+          hasOpenCashSession={Boolean(currentCashSession)}
+          onRequestOpenCashSession={() => setIsOpenCashModalOpen(true)}
+        />
       )}
 
       {/* ========================================================= */}
       {/* TAB: PDV BALCÃO                                           */}
       {/* ========================================================= */}
       {activeTab === 'pdv' && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="space-y-4">
+          {!currentCashSession && (
+            <div className="p-3.5 bg-amber-50 border border-amber-300 rounded-2xl flex flex-wrap items-center justify-between gap-3 text-xs text-amber-900 font-bold">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 shrink-0 text-amber-600" />
+                <span>Abra o expediente para registrar as vendas no caixa</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsOpenCashModalOpen(true)}
+                className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-black rounded-xl text-xs transition-colors cursor-pointer shrink-0"
+              >
+                Abrir expediente
+              </button>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-4 min-w-0">
             <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
               <div className="relative flex-1 min-w-0">
@@ -5147,191 +5405,604 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </button>
             </div>
           </div>
+          </div>
         </div>
       )}
 
       {/* ========================================================= */}
-      {/* TAB: FINANCEIRO                                           */}
+      {/* TAB: FINANCEIRO (CAIXA & RELATÓRIOS)                      */}
       {/* ========================================================= */}
       {activeTab === 'financeiro' && (
         <div className="space-y-6">
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs">
-              <div className="flex items-center justify-between text-neutral-500 mb-2">
-                <span className="text-xs font-bold uppercase tracking-wider">Faturamento Hoje</span>
-                <DollarSign className="w-4 h-4 text-emerald-500" />
-              </div>
-              <h3 className="text-2xl font-black text-neutral-900">{formatCurrency(financialStats.totalRevenueToday)}</h3>
-              <p className="text-[11px] text-neutral-500 mt-1">{financialStats.todayOrdersCount} vendas realizadas hoje</p>
+          {/* Sub-tabs: Resumo & Expedientes | Pagamentos */}
+          <div className="bg-white p-3 rounded-2xl border border-neutral-200 shadow-xs flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setFinanceiroSubTab('resumo')}
+                className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-black transition-all cursor-pointer ${
+                  financeiroSubTab === 'resumo'
+                    ? 'bg-neutral-900 text-white shadow-xs'
+                    : 'bg-neutral-100 text-neutral-600 hover:text-neutral-900'
+                }`}
+              >
+                📊 Resumo & Expedientes
+              </button>
+              <button
+                type="button"
+                onClick={() => setFinanceiroSubTab('pagamentos')}
+                className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-black transition-all cursor-pointer ${
+                  financeiroSubTab === 'pagamentos'
+                    ? 'bg-neutral-900 text-white shadow-xs'
+                    : 'bg-neutral-100 text-neutral-600 hover:text-neutral-900'
+                }`}
+              >
+                💳 Pagamentos
+              </button>
             </div>
 
-            <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs">
-              <div className="flex items-center justify-between text-neutral-500 mb-2">
-                <span className="text-xs font-bold uppercase tracking-wider">Lucro Estimado</span>
-                <TrendingUp className="w-4 h-4 text-amber-500" />
-              </div>
-              <h3 className="text-2xl font-black text-amber-600">{formatCurrency(financialStats.netProfitToday)}</h3>
-              <p className="text-[11px] text-neutral-500 mt-1">
-                Margem média: {financialStats.totalRevenueToday > 0 ? ((financialStats.netProfitToday / financialStats.totalRevenueToday) * 100).toFixed(0) : 0}%
-              </p>
-            </div>
-
-            <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs">
-              <div className="flex items-center justify-between text-neutral-500 mb-2">
-                <span className="text-xs font-bold uppercase tracking-wider">Ticket Médio</span>
-                <BarChart3 className="w-4 h-4 text-sky-500" />
-              </div>
-              <h3 className="text-2xl font-black text-neutral-900">{formatCurrency(financialStats.avgTicket)}</h3>
-              <p className="text-[11px] text-neutral-500 mt-1">Valor médio por cliente</p>
-            </div>
-
-            <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs">
-              <div className="flex items-center justify-between text-neutral-500 mb-2">
-                <span className="text-xs font-bold uppercase tracking-wider">Canais de Venda</span>
-                <Truck className="w-4 h-4 text-purple-500" />
-              </div>
-              <div className="space-y-1 text-xs font-bold text-neutral-800 mt-1">
-                <div className="flex justify-between">
-                  <span>📱 Online ({financialStats.onlineOrdersCount}):</span>
-                  <span>{formatCurrency(financialStats.onlineRevenue)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>🏪 Balcão ({financialStats.posOrdersCount}):</span>
-                  <span>{formatCurrency(financialStats.posRevenue)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>🍻 Mesas ({financialStats.mesaOrdersCount}):</span>
-                  <span>{formatCurrency(financialStats.mesaRevenue)}</span>
-                </div>
-              </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => refreshCashSessionsData(true)}
+                disabled={isLoadingCashData}
+                className="px-3 py-1.5 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-700 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <RotateCcw className={`w-3.5 h-3.5 ${isLoadingCashData ? 'animate-spin' : ''}`} />
+                <span>Atualizar</span>
+              </button>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <div className="bg-white rounded-3xl border border-neutral-200 p-6 shadow-xs">
-              <h4 className="font-bold text-sm text-neutral-900 mb-4">Entradas por Forma de Pagamento</h4>
-              <div className="space-y-3 text-xs">
-                <div>
-                  <div className="flex justify-between font-bold mb-1">
-                    <span>⚡ PIX</span>
-                    <span>{formatCurrency(financialStats.paymentBreakdown.pix)}</span>
+          {financeiroSubTab === 'pagamentos' ? (
+            <PaymentsHistorySection
+              currentSession={currentCashSession}
+              cashSessions={cashSessionsList}
+            />
+          ) : (
+            <div className="space-y-6">
+              {/* Filter Bar (4a): Default = Expediente atual (or latest closed), selector for any session or date range */}
+              <div className="bg-white p-4 sm:p-5 rounded-3xl border border-neutral-200 shadow-xs space-y-4">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div>
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-amber-600 block">
+                      Período do Caixa & Relatórios
+                    </span>
+                    <h3 className="text-base sm:text-lg font-black text-neutral-900 mt-0.5">
+                      {financeiroFilterMode === 'date_range'
+                        ? `Filtro por datas (${financeiroDateFrom} até ${financeiroDateTo})`
+                        : displayedCashSession
+                        ? displayedCashSession.closedAt
+                          ? `Expediente fechado (${formatCashSessionDateTime(
+                              displayedCashSession.openedAt
+                            )} → ${formatCashSessionDateTime(displayedCashSession.closedAt)})`
+                          : `Expediente atual • Aberto desde ${formatCashSessionBadgeDate(
+                              displayedCashSession.openedAt
+                            )}`
+                        : 'Nenhum expediente registrado ainda'}
+                    </h3>
                   </div>
-                  <div className="w-full bg-neutral-100 rounded-full h-2.5 overflow-hidden">
-                    <div
-                      className="bg-amber-500 h-2.5 rounded-full"
-                      style={{
-                        width: `${financialStats.totalRevenueToday > 0 ? (financialStats.paymentBreakdown.pix / financialStats.totalRevenueToday) * 100 : 0}%`,
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      value={
+                        financeiroFilterMode === 'session'
+                          ? `session:${selectedFinanceiroSessionId}`
+                          : financeiroFilterMode
+                      }
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === 'current_session') {
+                          setFinanceiroFilterMode('current_session');
+                          setSelectedFinanceiroSessionId('');
+                        } else if (val === 'date_range') {
+                          setFinanceiroFilterMode('date_range');
+                          setSelectedFinanceiroSessionId('');
+                        } else if (val.startsWith('session:')) {
+                          setFinanceiroFilterMode('session');
+                          setSelectedFinanceiroSessionId(val.replace('session:', ''));
+                        }
                       }}
-                    ></div>
+                      className="px-3.5 py-2.5 bg-neutral-100 border border-neutral-300 rounded-xl text-xs font-bold text-neutral-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                    >
+                      <option value="current_session">
+                        {currentCashSession
+                          ? 'Expediente atual (aberto)'
+                          : latestClosedCashSession
+                          ? `Último expediente fechado (${formatCashSessionDateTime(
+                              latestClosedCashSession.openedAt
+                            )})`
+                          : 'Expediente atual'}
+                      </option>
+                      <option value="date_range">📅 Filtrar por datas do calendário</option>
+                      {cashSessionsList.length > 0 && (
+                        <optgroup label="Escolher expediente da lista">
+                          {cashSessionsList.map((sess) => (
+                            <option key={sess.id} value={`session:${sess.id}`}>
+                              {formatCashSessionDateTime(sess.openedAt)}
+                              {sess.closedAt
+                                ? ` → ${formatCashSessionDateTime(sess.closedAt)}`
+                                : ' (Aberto agora)'}{' '}
+                              — {formatCurrency(sess.summary?.totalRevenue || 0)}
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                    </select>
+
+                    {displayedCashSession && (
+                      <button
+                        type="button"
+                        onClick={() => setClosingReceiptSession(displayedCashSession)}
+                        className="px-3.5 py-2.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-black flex items-center gap-1.5 transition-colors cursor-pointer"
+                      >
+                        <Printer className="w-4 h-4 text-amber-400" />
+                        <span>Ver / Imprimir 80mm</span>
+                      </button>
+                    )}
                   </div>
                 </div>
 
-                <div>
-                  <div className="flex justify-between font-bold mb-1">
-                    <span>💳 Cartão de Crédito</span>
-                    <span>{formatCurrency(financialStats.paymentBreakdown.cartao_credito)}</span>
+                {financeiroFilterMode === 'date_range' && (
+                  <div className="pt-3 border-t border-neutral-100 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 items-end">
+                    <div>
+                      <label className="block text-xs font-bold text-neutral-600 mb-1">
+                        Data inicial
+                      </label>
+                      <input
+                        type="date"
+                        value={financeiroDateFrom}
+                        onChange={(e) => setFinanceiroDateFrom(e.target.value)}
+                        className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs font-bold text-neutral-900"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-neutral-600 mb-1">
+                        Data final
+                      </label>
+                      <input
+                        type="date"
+                        value={financeiroDateTo}
+                        onChange={(e) => setFinanceiroDateTo(e.target.value)}
+                        className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs font-bold text-neutral-900"
+                      />
+                    </div>
+                    <div className="text-xs text-neutral-500 pb-1">
+                      {isLoadingRangeSummary
+                        ? 'Calculando vendas do período...'
+                        : `${displayedSummary.ordersCount} vendas encontradas no período`}
+                    </div>
                   </div>
-                  <div className="w-full bg-neutral-100 rounded-full h-2.5 overflow-hidden">
-                    <div
-                      className="bg-blue-500 h-2.5 rounded-full"
-                      style={{
-                        width: `${financialStats.totalRevenueToday > 0 ? (financialStats.paymentBreakdown.cartao_credito / financialStats.totalRevenueToday) * 100 : 0}%`,
-                      }}
-                    ></div>
+                )}
+              </div>
+
+              {/* Top KPI Cards (Item 3) */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs">
+                  <div className="flex items-center justify-between text-neutral-500 mb-2">
+                    <span className="text-xs font-bold uppercase tracking-wider">Faturamento</span>
+                    <DollarSign className="w-4 h-4 text-emerald-500" />
+                  </div>
+                  <h3 className="text-2xl font-black text-neutral-900">
+                    {formatCurrency(displayedSummary.totalRevenue)}
+                  </h3>
+                  <p className="text-[11px] text-neutral-500 mt-1">
+                    {displayedSummary.ordersCount}{' '}
+                    {displayedSummary.ordersCount === 1 ? 'venda válida' : 'vendas válidas'}
+                    {displayedSummary.cancelledCount > 0
+                      ? ` • ${displayedSummary.cancelledCount} cancelada(s)`
+                      : ''}
+                  </p>
+                </div>
+
+                <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs">
+                  <div className="flex items-center justify-between text-neutral-500 mb-2">
+                    <span className="text-xs font-bold uppercase tracking-wider">Ticket Médio</span>
+                    <BarChart3 className="w-4 h-4 text-sky-500" />
+                  </div>
+                  <h3 className="text-2xl font-black text-neutral-900">
+                    {formatCurrency(displayedSummary.avgTicket)}
+                  </h3>
+                  <p className="text-[11px] text-neutral-500 mt-1">
+                    Taxa garçom: {formatCurrency(displayedSummary.serviceFeeTotal)} • Descontos:{' '}
+                    {formatCurrency(displayedSummary.discountTotal)}
+                  </p>
+                </div>
+
+                <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs">
+                  <div className="flex items-center justify-between text-neutral-500 mb-2">
+                    <span className="text-xs font-bold uppercase tracking-wider">
+                      Canais de Venda
+                    </span>
+                    <Truck className="w-4 h-4 text-purple-500" />
+                  </div>
+                  <div className="space-y-1 text-xs font-bold text-neutral-800 mt-1">
+                    <div className="flex justify-between">
+                      <span>📱 Online ({displayedSummary.onlineCount}):</span>
+                      <span>{formatCurrency(displayedSummary.onlineRevenue)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>🏪 Balcão ({displayedSummary.posCount}):</span>
+                      <span>{formatCurrency(displayedSummary.posRevenue)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>🍻 Mesas ({displayedSummary.mesaCount}):</span>
+                      <span>{formatCurrency(displayedSummary.mesaRevenue)}</span>
+                    </div>
                   </div>
                 </div>
 
-                <div>
-                  <div className="flex justify-between font-bold mb-1">
-                    <span>💳 Cartão de Débito</span>
-                    <span>{formatCurrency(financialStats.paymentBreakdown.cartao_debito)}</span>
+                <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs">
+                  <div className="flex items-center justify-between text-neutral-500 mb-2">
+                    <span className="text-xs font-bold uppercase tracking-wider">
+                      Gaveta (Dinheiro)
+                    </span>
+                    <TrendingUp className="w-4 h-4 text-amber-500" />
                   </div>
-                  <div className="w-full bg-neutral-100 rounded-full h-2.5 overflow-hidden">
-                    <div
-                      className="bg-purple-500 h-2.5 rounded-full"
-                      style={{
-                        width: `${financialStats.totalRevenueToday > 0 ? (financialStats.paymentBreakdown.cartao_debito / financialStats.totalRevenueToday) * 100 : 0}%`,
-                      }}
-                    ></div>
+                  <h3 className="text-2xl font-black text-emerald-700">
+                    {formatCurrency(displayedSummary.expectedCash)}
+                  </h3>
+                  <div className="text-[11px] text-neutral-500 mt-1 space-y-0.5">
+                    <div>
+                      Troco inicial {formatCurrency(displayedSummary.openingCash)} + Vendas{' '}
+                      {formatCurrency(displayedSummary.paymentBreakdown.dinheiro)}
+                    </div>
+                    {displayedSummary.countedCash !== null && (
+                      <div className="font-bold text-neutral-800">
+                        Contado: {formatCurrency(displayedSummary.countedCash)} (
+                        <span
+                          className={
+                            formatCashDifferenceLabel(displayedSummary.cashDifference).tone ===
+                            'red'
+                              ? 'text-red-600'
+                              : formatCashDifferenceLabel(displayedSummary.cashDifference).tone ===
+                                'amber'
+                              ? 'text-amber-600'
+                              : 'text-emerald-600'
+                          }
+                        >
+                          {formatCashDifferenceLabel(displayedSummary.cashDifference).text}
+                        </span>
+                        )
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Payment Breakdown & Detailed Cash Closing Card */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="bg-white rounded-3xl border border-neutral-200 p-6 shadow-xs">
+                  <h4 className="font-bold text-sm text-neutral-900 mb-4">
+                    Entradas por Forma de Pagamento
+                  </h4>
+                  <div className="space-y-3 text-xs">
+                    <div>
+                      <div className="flex justify-between font-bold mb-1">
+                        <span>💵 Dinheiro</span>
+                        <span>{formatCurrency(displayedSummary.paymentBreakdown.dinheiro)}</span>
+                      </div>
+                      <div className="w-full bg-neutral-100 rounded-full h-2.5 overflow-hidden">
+                        <div
+                          className="bg-emerald-500 h-2.5 rounded-full"
+                          style={{
+                            width: `${
+                              displayedSummary.totalRevenue > 0
+                                ? (displayedSummary.paymentBreakdown.dinheiro /
+                                    displayedSummary.totalRevenue) *
+                                  100
+                                : 0
+                            }%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="flex justify-between font-bold mb-1">
+                        <span>⚡ PIX</span>
+                        <span>{formatCurrency(displayedSummary.paymentBreakdown.pix)}</span>
+                      </div>
+                      <div className="w-full bg-neutral-100 rounded-full h-2.5 overflow-hidden">
+                        <div
+                          className="bg-amber-500 h-2.5 rounded-full"
+                          style={{
+                            width: `${
+                              displayedSummary.totalRevenue > 0
+                                ? (displayedSummary.paymentBreakdown.pix /
+                                    displayedSummary.totalRevenue) *
+                                  100
+                                : 0
+                            }%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="flex justify-between font-bold mb-1">
+                        <span>💳 Cartão de Débito</span>
+                        <span>
+                          {formatCurrency(displayedSummary.paymentBreakdown.cartao_debito)}
+                        </span>
+                      </div>
+                      <div className="w-full bg-neutral-100 rounded-full h-2.5 overflow-hidden">
+                        <div
+                          className="bg-purple-500 h-2.5 rounded-full"
+                          style={{
+                            width: `${
+                              displayedSummary.totalRevenue > 0
+                                ? (displayedSummary.paymentBreakdown.cartao_debito /
+                                    displayedSummary.totalRevenue) *
+                                  100
+                                : 0
+                            }%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="flex justify-between font-bold mb-1">
+                        <span>💳 Cartão de Crédito</span>
+                        <span>
+                          {formatCurrency(displayedSummary.paymentBreakdown.cartao_credito)}
+                        </span>
+                      </div>
+                      <div className="w-full bg-neutral-100 rounded-full h-2.5 overflow-hidden">
+                        <div
+                          className="bg-blue-500 h-2.5 rounded-full"
+                          style={{
+                            width: `${
+                              displayedSummary.totalRevenue > 0
+                                ? (displayedSummary.paymentBreakdown.cartao_credito /
+                                    displayedSummary.totalRevenue) *
+                                  100
+                                : 0
+                            }%`,
+                          }}
+                        />
+                      </div>
+                    </div>
                   </div>
                 </div>
 
-                <div>
-                  <div className="flex justify-between font-bold mb-1">
-                    <span>💵 Dinheiro em Gaveta</span>
-                    <span>{formatCurrency(financialStats.paymentBreakdown.dinheiro)}</span>
+                <div className="bg-neutral-900 text-white rounded-3xl p-6 shadow-xs flex flex-col justify-between">
+                  <div>
+                    <span className="text-xs font-bold uppercase tracking-wider text-amber-400">
+                      Resumo Completo do Expediente (Item 3)
+                    </span>
+                    <h4 className="text-xl font-black mt-1">Conferência do Caixa</h4>
+                    <div className="mt-4 space-y-2 text-xs border-t border-neutral-800 pt-4">
+                      <div className="flex justify-between text-neutral-300">
+                        <span>Vendas Online:</span>
+                        <span className="font-bold">
+                          {displayedSummary.onlineCount} pedidos (
+                          {formatCurrency(displayedSummary.onlineRevenue)})
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-neutral-300">
+                        <span>Vendas Balcão:</span>
+                        <span className="font-bold">
+                          {displayedSummary.posCount} vendas (
+                          {formatCurrency(displayedSummary.posRevenue)})
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-neutral-300">
+                        <span>Vendas Mesas:</span>
+                        <span className="font-bold">
+                          {displayedSummary.mesaCount} contas (
+                          {formatCurrency(displayedSummary.mesaRevenue)})
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-neutral-300">
+                        <span>Taxa de serviço dos garçons:</span>
+                        <span className="font-mono font-bold text-amber-300">
+                          {formatCurrency(displayedSummary.serviceFeeTotal)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-neutral-300">
+                        <span>Descontos concedidos:</span>
+                        <span className="font-mono font-bold text-neutral-200">
+                          {formatCurrency(displayedSummary.discountTotal)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-neutral-300">
+                        <span>Pedidos cancelados (não somam):</span>
+                        <span className="font-mono font-bold text-red-400">
+                          {displayedSummary.cancelledCount}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-neutral-300 pt-2 border-t border-neutral-800">
+                        <span>Dinheiro inicial (troco):</span>
+                        <span className="font-mono font-bold text-neutral-200">
+                          {formatCurrency(displayedSummary.openingCash)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-neutral-300">
+                        <span>Vendas em Dinheiro:</span>
+                        <span className="font-mono font-bold text-emerald-400">
+                          {formatCurrency(displayedSummary.paymentBreakdown.dinheiro)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-white font-bold">
+                        <span>Dinheiro esperado na gaveta:</span>
+                        <span className="font-mono text-emerald-400">
+                          {formatCurrency(displayedSummary.expectedCash)}
+                        </span>
+                      </div>
+                      {displayedSummary.countedCash !== null && (
+                        <>
+                          <div className="flex justify-between text-neutral-300">
+                            <span>Dinheiro contado na gaveta:</span>
+                            <span className="font-mono font-bold text-white">
+                              {formatCurrency(displayedSummary.countedCash)}
+                            </span>
+                          </div>
+                          <div className="flex justify-between text-neutral-300">
+                            <span>Diferença do caixa:</span>
+                            <span className="font-mono font-black text-amber-400">
+                              {formatCashDifferenceLabel(displayedSummary.cashDifference).text}
+                            </span>
+                          </div>
+                        </>
+                      )}
+                    </div>
                   </div>
-                  <div className="w-full bg-neutral-100 rounded-full h-2.5 overflow-hidden">
-                    <div
-                      className="bg-emerald-500 h-2.5 rounded-full"
-                      style={{
-                        width: `${financialStats.totalRevenueToday > 0 ? (financialStats.paymentBreakdown.dinheiro / financialStats.totalRevenueToday) * 100 : 0}%`,
-                      }}
-                    ></div>
+
+                  <div className="mt-6 pt-4 border-t border-neutral-800 flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <span className="text-[10px] text-neutral-400 uppercase">
+                        Faturamento Total:
+                      </span>
+                      <div className="text-2xl font-black text-amber-400">
+                        {formatCurrency(displayedSummary.totalRevenue)}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {displayedCashSession && (
+                        <button
+                          type="button"
+                          onClick={() => setClosingReceiptSession(displayedCashSession)}
+                          className="flex items-center gap-2 px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-xl text-xs font-bold transition-colors cursor-pointer"
+                        >
+                          <Printer className="w-4 h-4" />
+                          <span>Imprimir Fechamento</span>
+                        </button>
+                      )}
+                      {currentCashSession &&
+                        (!displayedCashSession ||
+                          displayedCashSession.id === currentCashSession.id) && (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await refreshCashSessionsData(false);
+                              setIsCloseCashModalOpen(true);
+                            }}
+                            className="px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-black transition-colors cursor-pointer"
+                          >
+                            Fechar expediente
+                          </button>
+                        )}
+                    </div>
                   </div>
                 </div>
+              </div>
+
+              {/* 4b) Lista "Expedientes anteriores" */}
+              <div className="bg-white rounded-3xl border border-neutral-200 overflow-hidden shadow-xs">
+                <div className="p-5 border-b border-neutral-200 flex items-center justify-between">
+                  <div>
+                    <h4 className="font-black text-base text-neutral-900">
+                      Expedientes anteriores
+                    </h4>
+                    <p className="text-xs text-neutral-500 mt-0.5">
+                      Histórico de abertura e fechamento do caixa, duração, faturamento e conferência de gaveta.
+                    </p>
+                  </div>
+                </div>
+
+                {cashSessionsList.length === 0 ? (
+                  <div className="p-10 text-center text-xs text-neutral-500">
+                    Nenhum expediente foi aberto ainda. Clique em "Abrir expediente" no topo do painel.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs text-neutral-700">
+                      <thead className="bg-neutral-50 border-b border-neutral-200 text-neutral-500 uppercase tracking-wider font-bold">
+                        <tr>
+                          <th className="py-3 px-4">Abertura</th>
+                          <th className="py-3 px-4">Fechamento</th>
+                          <th className="py-3 px-4">Duração</th>
+                          <th className="py-3 px-4">Faturamento</th>
+                          <th className="py-3 px-4">Diferença do Caixa</th>
+                          <th className="py-3 px-4 text-right">Ações</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-neutral-100">
+                        {cashSessionsList.map((sess) => {
+                          const isOpen = !sess.closedAt;
+                          const diffInfo = formatCashDifferenceLabel(
+                            sess.summary?.cashDifference ?? null
+                          );
+                          return (
+                            <tr
+                              key={sess.id}
+                              className="hover:bg-neutral-50/80 transition-colors"
+                            >
+                              <td className="py-3.5 px-4 font-bold text-neutral-900 whitespace-nowrap">
+                                {formatCashSessionDateTime(sess.openedAt)}
+                              </td>
+                              <td className="py-3.5 px-4 whitespace-nowrap">
+                                {isOpen ? (
+                                  <span className="px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-black text-[10px] uppercase">
+                                    Aberto agora
+                                  </span>
+                                ) : (
+                                  <span className="font-medium text-neutral-700">
+                                    {formatCashSessionDateTime(sess.closedAt)}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-3.5 px-4 text-neutral-600 whitespace-nowrap">
+                                {formatCashSessionDuration(sess.openedAt, sess.closedAt)}
+                              </td>
+                              <td className="py-3.5 px-4 font-mono font-black text-neutral-900 whitespace-nowrap">
+                                {formatCurrency(sess.summary?.totalRevenue || 0)}
+                                <span className="block text-[10px] font-sans font-normal text-neutral-400">
+                                  {sess.summary?.ordersCount || 0} vendas
+                                </span>
+                              </td>
+                              <td className="py-3.5 px-4 whitespace-nowrap">
+                                {isOpen ? (
+                                  <span className="text-neutral-400">—</span>
+                                ) : (
+                                  <span
+                                    className={`px-2.5 py-1 rounded-lg font-bold text-xs ${
+                                      diffInfo.tone === 'emerald'
+                                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                        : diffInfo.tone === 'amber'
+                                        ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                                        : 'bg-red-50 text-red-700 border border-red-200'
+                                    }`}
+                                  >
+                                    {diffInfo.text}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                                <div className="flex items-center justify-end gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setFinanceiroFilterMode('session');
+                                      setSelectedFinanceiroSessionId(sess.id);
+                                      window.scrollTo({ top: 0, behavior: 'smooth' });
+                                    }}
+                                    className="px-3 py-1.5 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-800 font-bold text-xs transition-colors cursor-pointer"
+                                  >
+                                    Ver resumo
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setClosingReceiptSession(sess)}
+                                    className="px-3 py-1.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 text-white font-bold text-xs inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                                  >
+                                    <Printer className="w-3.5 h-3.5 text-amber-400" />
+                                    <span>Ver / Imprimir</span>
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </div>
-
-            <div className="bg-neutral-900 text-white rounded-3xl p-6 shadow-xs flex flex-col justify-between">
-              <div>
-                <span className="text-xs font-bold uppercase tracking-wider text-amber-400">
-                  Fechamento do Caixa
-                </span>
-                <h4 className="text-xl font-black mt-1">Resumo Financeiro do Depósito</h4>
-                <div className="mt-5 space-y-2 text-xs border-t border-neutral-800 pt-4">
-                  <div className="flex justify-between text-neutral-300">
-                    <span>Vendas Online:</span>
-                    <span className="font-bold">
-                      {financialStats.onlineOrdersCount} pedidos ({formatCurrency(financialStats.onlineRevenue)})
-                    </span>
-                  </div>
-                  <div className="flex justify-between text-neutral-300">
-                    <span>Vendas Balcão:</span>
-                    <span className="font-bold">
-                      {financialStats.posOrdersCount} vendas ({formatCurrency(financialStats.posRevenue)})
-                    </span>
-                  </div>
-                  <div className="flex justify-between text-neutral-300">
-                    <span>Vendas Mesas:</span>
-                    <span className="font-bold">
-                      {financialStats.mesaOrdersCount} contas ({formatCurrency(financialStats.mesaRevenue)})
-                    </span>
-                  </div>
-                  <div className="flex justify-between text-neutral-300">
-                    <span>Taxa de serviço (garçons):</span>
-                    <span className="font-mono font-bold text-amber-300">
-                      {formatCurrency(financialStats.serviceFeeTotalToday)}
-                    </span>
-                  </div>
-                  <div className="flex justify-between text-neutral-300 pt-1 border-t border-neutral-800">
-                    <span>Total em Dinheiro na Gaveta:</span>
-                    <span className="font-mono font-bold text-emerald-400">{formatCurrency(financialStats.paymentBreakdown.dinheiro)}</span>
-                  </div>
-                  <div className="flex justify-between text-neutral-300">
-                    <span>Total Digital (Pix + Cartões):</span>
-                    <span className="font-mono font-bold text-amber-400">
-                      {formatCurrency(financialStats.paymentBreakdown.pix + financialStats.paymentBreakdown.cartao_credito + financialStats.paymentBreakdown.cartao_debito)}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-6 pt-4 border-t border-neutral-800 flex items-center justify-between">
-                <div>
-                  <span className="text-[10px] text-neutral-400 uppercase">Total do Dia:</span>
-                  <div className="text-2xl font-black text-amber-400">{formatCurrency(financialStats.totalRevenueToday)}</div>
-                </div>
-                <button
-                  onClick={() => window.print()}
-                  className="flex items-center gap-2 px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-xl text-xs font-bold transition-colors"
-                >
-                  <Printer className="w-4 h-4" />
-                  <span>Imprimir Fechamento</span>
-                </button>
-              </div>
-            </div>
-          </div>
+          )}
         </div>
       )}
 
@@ -7328,6 +7999,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           }}
         />
       )}
+
+      {/* Cash Session Modals (Abrir / Fechar Expediente & Recibo 80mm) */}
+      <OpenCashSessionModal
+        isOpen={isOpenCashModalOpen}
+        onClose={() => setIsOpenCashModalOpen(false)}
+        onSuccess={handleOpenCashSessionSuccess}
+      />
+
+      <CloseCashSessionModal
+        isOpen={isCloseCashModalOpen}
+        session={currentCashSession}
+        openTablesCount={openTablesCountForCash}
+        onClose={() => setIsCloseCashModalOpen(false)}
+        onSuccess={handleCloseCashSessionSuccess}
+      />
+
+      <CashClosingReceiptModal
+        session={closingReceiptSession}
+        settings={settings}
+        onClose={() => setClosingReceiptSession(null)}
+      />
 
       {/* End Modals */}
     </div>
