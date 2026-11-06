@@ -1965,6 +1965,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       setPosError('');
       setPosCanRetry(false);
       setPosSubmittingStatus('');
+      setIsSubmittingPos(false);
       setPosClientRequestId(crypto.randomUUID());
     } catch (err: any) {
       console.error('Falha ao processar venda balcão:', err);

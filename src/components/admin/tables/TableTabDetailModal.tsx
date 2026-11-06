@@ -145,6 +145,11 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
   };
 
   useEffect(() => {
+    setIsAddingItem(false);
+    setIsCancellingItem(false);
+    setIsJoiningTable(false);
+    setIsUnjoiningTable(false);
+    setIsCancellingTab(false);
     if (isOpen && tabId) {
       setLoading(true);
       setActionError('');

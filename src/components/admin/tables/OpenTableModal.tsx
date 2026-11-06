@@ -32,6 +32,7 @@ export const OpenTableModal: React.FC<OpenTableModalProps> = ({
       setPeopleCount(2);
       setNotes('');
       setError('');
+      setIsSubmitting(false);
       setSelectedTableId(table ? table.id : (availableTables[0]?.id || ''));
     }
   }, [isOpen, table?.id]);
@@ -63,6 +64,7 @@ export const OpenTableModal: React.FC<OpenTableModalProps> = ({
         people_count: Number(peopleCount),
         notes: notes.trim() || undefined,
       });
+      setIsSubmitting(false);
       onSuccess(opened.id);
       onClose();
     } catch (err: any) {

@@ -57,6 +57,7 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
 
   React.useEffect(() => {
     setCurrentTab(tab);
+    setIsSubmitting(false);
     if (tab) {
       setSplitPeople(tab.peopleCount || 1);
       setDiscount('0');
@@ -67,6 +68,7 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
       setError('');
       setCanRetryClose(false);
       setSubmittingStatusText('');
+      setIsSubmitting(false);
     }
   }, [tab]);
 
@@ -244,6 +246,7 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
       setSubmittingStatusText('');
       setCanRetryClose(false);
       onSuccess(res.order);
+      setIsSubmitting(false);
     } catch (err: any) {
       setSubmittingStatusText('');
 
