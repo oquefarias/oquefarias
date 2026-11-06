@@ -14,6 +14,11 @@ import {
   PaymentMethod,
   ProductImportItem,
   ProductImportResult,
+  StockAdjustMode,
+  StockAdjustReason,
+  StockMovementsResponse,
+  isComboProduct,
+  calculateComboMetrics,
 } from '../types';
 import { initialProducts, initialOrders, initialSettings, initialDeliveryAreas, initialCustomers } from '../data/initialData';
 import { soundService } from '../utils/sound';
@@ -854,11 +859,34 @@ class ApiService {
     return saved;
   }
 
-  public async adjustStock(productId: string, delta: number, unit: 'unit' | 'case' = 'unit'): Promise<void> {
-    const res = await fetch(`/api/products/${productId}/stock`, {
+  public setLocalProductStock(productId: string, newStock: number): void {
+    const cleanStock = Math.max(0, Math.floor(Number(newStock) || 0));
+    const nextProducts = this.state.products.map((p) =>
+      p.id === productId ? { ...p, stock: cleanStock } : p
+    );
+    this.state.products = nextProducts.map((p) => {
+      if (isComboProduct(p.id, this.state.settings)) {
+        const metrics = calculateComboMetrics(p, this.state.settings, nextProducts);
+        return { ...p, stock: metrics.availableStock };
+      }
+      return p;
+    });
+    this.notifyListeners();
+  }
+
+  public async adjustProductStock(
+    productId: string,
+    payload: {
+      mode: StockAdjustMode;
+      value: number;
+      reason?: StockAdjustReason;
+      note?: string;
+    }
+  ): Promise<{ stock: number }> {
+    const res = await fetch(`/api/admin/products/${encodeURIComponent(productId)}/stock`, {
       method: 'POST',
       headers: this.getAdminHeaders(),
-      body: JSON.stringify({ delta, unit }),
+      body: JSON.stringify(payload),
     });
 
     if (res.status === 401) {
@@ -867,16 +895,69 @@ class ApiService {
     }
 
     if (!res.ok) {
-      let message = 'Não foi possível alterar o estoque no banco de dados.';
+      let message = 'Não foi possível alterar o estoque.';
       try {
         const json = await res.json();
-        if (json?.error) message = `Não foi possível alterar o estoque: ${json.error}`;
+        if (json?.error) message = json.error;
       } catch {}
-      this.notifyError(message);
       throw new Error(message);
     }
 
-    await this.reloadProducts();
+    const data = await res.json();
+    const updatedStock = Math.max(0, Math.floor(Number(data?.stock ?? 0)));
+    this.setLocalProductStock(productId, updatedStock);
+    return { stock: updatedStock };
+  }
+
+  public async adjustStock(productId: string, delta: number, unit: 'unit' | 'case' = 'unit'): Promise<void> {
+    const prod = this.state.products.find((p) => p.id === productId);
+    const mult = unit === 'case' && prod?.caseSize && prod.caseSize >= 2 ? Math.floor(prod.caseSize) : 1;
+    await this.adjustProductStock(productId, {
+      mode: 'delta',
+      value: Math.round(delta * mult),
+      reason: 'ajuste',
+    });
+  }
+
+  public async getStockMovements(params: {
+    productId?: string;
+    reason?: string;
+    direction?: 'in' | 'out' | '';
+    from?: string;
+    to?: string;
+    limit?: number;
+    before?: string;
+  }): Promise<StockMovementsResponse> {
+    const search = new URLSearchParams();
+    if (params.productId) search.set('productId', params.productId);
+    if (params.reason) search.set('reason', params.reason);
+    if (params.direction) search.set('direction', params.direction);
+    if (params.from) search.set('from', params.from);
+    if (params.to) search.set('to', params.to);
+    if (params.limit) search.set('limit', String(params.limit));
+    if (params.before) search.set('before', params.before);
+
+    const qs = search.toString();
+    const res = await fetch(`/api/admin/stock-movements${qs ? `?${qs}` : ''}`, {
+      headers: this.getAdminHeaders(),
+      cache: 'no-store',
+    });
+
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+
+    if (!res.ok) {
+      let message = 'Não foi possível carregar o histórico de estoque.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      throw new Error(message);
+    }
+
+    return await res.json();
   }
 
   public async deleteProduct(productId: string): Promise<void> {

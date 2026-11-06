@@ -9,6 +9,7 @@ import {
   getEffectiveProductPrice,
   getCategoryDisplayName,
   formatComboComponentProductName,
+  isProductHiddenFromStore,
 } from '../../types';
 import { api } from '../../services/api';
 import {
@@ -25,6 +26,8 @@ import {
   Eye,
   EyeOff,
   Boxes,
+  Truck,
+  Utensils,
 } from 'lucide-react';
 
 interface CombosManagerProps {
@@ -88,6 +91,7 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
   const [image, setImage] = useState('');
   const [isCold, setIsCold] = useState(true);
   const [active, setActive] = useState(true);
+  const [appearsInDelivery, setAppearsInDelivery] = useState(true);
   const [description, setDescription] = useState('');
   const [comboItems, setComboItems] = useState<ComboComponentItem[]>([]);
 
@@ -167,6 +171,7 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
     setImage('');
     setIsCold(true);
     setActive(true);
+    setAppearsInDelivery(true);
     setDescription('');
     setComboItems([]);
     setItemSearch('');
@@ -185,6 +190,7 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
     setImage(comboProd.image || '');
     setIsCold(comboProd.isCold !== false);
     setActive(comboProd.active !== false);
+    setAppearsInDelivery(!isProductHiddenFromStore(comboProd.id, settings));
     setDescription(comboProd.description || '');
     setComboItems(currentItems.map((it) => ({ productId: it.productId, quantity: it.quantity })));
     setItemSearch('');
@@ -401,7 +407,7 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
         nextCategories = [...categories, { id: 'combos', name: 'Combos' }].slice(0, 50);
       }
 
-      // 3. Persist settings.combos
+      // 3. Persist settings.combos & hiddenFromStoreIds
       const nextCombos: Record<string, ComboComponentItem[]> = {
         ...(settings.combos || {}),
         [comboId]: comboItems.map((ci) => ({
@@ -410,8 +416,16 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
         })),
       };
 
+      const currentHidden = Array.isArray(settings.hiddenFromStoreIds) ? settings.hiddenFromStoreIds : [];
+      const nextHiddenFromStoreIds = appearsInDelivery
+        ? currentHidden.filter((id) => id !== comboId)
+        : currentHidden.includes(comboId)
+        ? currentHidden
+        : [...currentHidden, comboId].slice(0, 2000);
+
       const settingsPayload: Partial<StoreSettings> = {
         combos: nextCombos,
+        hiddenFromStoreIds: nextHiddenFromStoreIds,
         ...(nextCategories ? { categories: nextCategories } : {}),
       };
 
@@ -436,6 +450,36 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
     }
   };
 
+  const handleToggleComboActive = async (combo: Product) => {
+    try {
+      const saved = await api.saveProduct({
+        ...combo,
+        active: !combo.active,
+      });
+      onProductSaved?.(saved, false);
+      onSavedFeedback(saved.active ? 'Combo ativado' : 'Combo desativado');
+    } catch (err: any) {
+      onErrorNotice(err?.message || 'Não foi possível alterar o status do combo.');
+    }
+  };
+
+  const handleToggleComboDeliveryVisibility = async (comboId: string) => {
+    const currentHidden = Array.isArray(settings.hiddenFromStoreIds) ? settings.hiddenFromStoreIds : [];
+    const isHidden = currentHidden.includes(comboId);
+    const nextHidden = isHidden
+      ? currentHidden.filter((id) => id !== comboId)
+      : [...currentHidden, comboId].slice(0, 2000);
+    onSettingsUpdated?.({ hiddenFromStoreIds: nextHidden });
+    try {
+      const updated = await api.updateSettings({ hiddenFromStoreIds: nextHidden });
+      onSettingsUpdated?.(updated);
+      onSavedFeedback(isHidden ? 'Combo liberado no delivery' : 'Combo definido para Só no balcão/mesa');
+    } catch (err: any) {
+      onSettingsUpdated?.({ hiddenFromStoreIds: currentHidden });
+      onErrorNotice(err?.message || 'Não foi possível atualizar a visibilidade no delivery.');
+    }
+  };
+
   const handleConfirmDeleteCombo = async () => {
     if (!confirmDeleteCombo) return;
     setIsDeleting(true);
@@ -443,7 +487,8 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
       await api.deleteProduct(confirmDeleteCombo.id);
       const nextCombos = { ...(settings.combos || {}) };
       delete nextCombos[confirmDeleteCombo.id];
-      onSettingsUpdated?.({ combos: nextCombos });
+      const nextHidden = (settings.hiddenFromStoreIds || []).filter((id) => id !== confirmDeleteCombo.id);
+      onSettingsUpdated?.({ combos: nextCombos, hiddenFromStoreIds: nextHidden });
       onProductDeleted?.(confirmDeleteCombo.id);
       setConfirmDeleteCombo(null);
       onSavedFeedback('Combo removido');
@@ -526,7 +571,13 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
                       </span>
                       {!combo.active && (
                         <span className="px-1.5 py-0.5 rounded bg-neutral-200 text-neutral-700 text-[10px] font-bold">
-                          Oculto
+                          Desativado
+                        </span>
+                      )}
+                      {isProductHiddenFromStore(combo.id, settings) && (
+                        <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 text-[10px] font-bold inline-flex items-center gap-1">
+                          <Utensils className="w-3 h-3 text-amber-700" />
+                          <span>Só no balcão/mesa</span>
                         </span>
                       )}
                     </div>
@@ -556,6 +607,67 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
                       >
                         Disponível: {metrics.availableStock}
                       </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => handleToggleComboActive(combo)}
+                        className={`px-2 py-1 rounded-lg text-[10px] font-bold inline-flex items-center gap-1 border transition-colors cursor-pointer ${
+                          combo.active !== false
+                            ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                            : 'bg-neutral-100 text-neutral-600 border-neutral-300 hover:bg-neutral-200'
+                        }`}
+                        title={
+                          combo.active !== false
+                            ? 'Ativo em todo lugar (clique para desativar)'
+                            : 'Desativado em todo lugar (clique para ativar)'
+                        }
+                      >
+                        {combo.active !== false ? (
+                          <>
+                            <Eye className="w-3 h-3 text-emerald-600" />
+                            <span>Ativo</span>
+                          </>
+                        ) : (
+                          <>
+                            <EyeOff className="w-3 h-3 text-neutral-500" />
+                            <span>Desativado</span>
+                          </>
+                        )}
+                      </button>
+
+                      {(() => {
+                        const isHiddenFromDelivery = isProductHiddenFromStore(combo.id, settings);
+                        return (
+                          <button
+                            type="button"
+                            onClick={() => handleToggleComboDeliveryVisibility(combo.id)}
+                            className={`px-2 py-1 rounded-lg text-[10px] font-bold inline-flex items-center gap-1 border transition-colors cursor-pointer ${
+                              !isHiddenFromDelivery
+                                ? 'bg-sky-50 text-sky-800 border-sky-200 hover:bg-sky-100'
+                                : 'bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100'
+                            }`}
+                            title={
+                              !isHiddenFromDelivery
+                                ? 'Aparece no delivery / loja online (clique para ocultar do delivery)'
+                                : 'Só no balcão/mesa (clique para ativar no delivery)'
+                            }
+                          >
+                            {!isHiddenFromDelivery ? (
+                              <>
+                                <Truck className="w-3 h-3 text-sky-600" />
+                                <span>Aparece no delivery</span>
+                              </>
+                            ) : (
+                              <>
+                                <Utensils className="w-3 h-3 text-amber-700" />
+                                <span>Só no balcão/mesa</span>
+                              </>
+                            )}
+                          </button>
+                        );
+                      })()}
                     </div>
                   </div>
                 </div>
@@ -711,7 +823,7 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
                   </div>
                 </div>
 
-                {/* Toggles: Gelada & Ativo/Oculto */}
+                {/* Toggles: Gelada, Ativo/Desativado & Aparece no delivery */}
                 <div className="flex items-center gap-3">
                   <button
                     type="button"
@@ -727,7 +839,7 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
                   </button>
                 </div>
 
-                <div className="flex items-center gap-3">
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                   <button
                     type="button"
                     onClick={() => setActive((v) => !v)}
@@ -738,7 +850,29 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
                     }`}
                   >
                     {active ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
-                    <span>{active ? 'Ativo na Loja' : 'Oculto na Loja'}</span>
+                    <span>{active ? 'Ativo' : 'Desativado'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setAppearsInDelivery((v) => !v)}
+                    className={`flex-1 py-2 px-3 rounded-xl border font-bold flex items-center justify-center gap-1.5 cursor-pointer ${
+                      appearsInDelivery
+                        ? 'bg-sky-50 border-sky-300 text-sky-800'
+                        : 'bg-amber-50 border-amber-300 text-amber-900'
+                    }`}
+                  >
+                    {appearsInDelivery ? (
+                      <>
+                        <Truck className="w-4 h-4 text-sky-600" />
+                        <span>Aparece no delivery</span>
+                      </>
+                    ) : (
+                      <>
+                        <Utensils className="w-4 h-4 text-amber-700" />
+                        <span>Só no balcão/mesa</span>
+                      </>
+                    )}
                   </button>
                 </div>
               </div>

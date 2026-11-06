@@ -4,6 +4,7 @@ import { Navbar } from './components/Navbar';
 import { AdminDashboard } from './components/admin/AdminDashboard';
 import { CustomerStorefront } from './components/customer/CustomerStorefront';
 import { AdminLoginModal } from './components/admin/AdminLoginModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { ShieldCheck, Lock, ArrowRight, AlertCircle, ArrowLeft } from 'lucide-react';
 
 export default function App() {
@@ -155,18 +156,19 @@ export default function App() {
         />
 
         <main className="flex-1 min-w-0">
-          {isAdminAuth ? (
-            /* Authenticated Admin Dashboard */
-            <AdminDashboard
-              products={products}
-              orders={orders}
-              settings={settings}
-              deliveryAreas={deliveryAreas}
-              customers={customers}
-              onLockDashboard={handleLockAdmin}
-              onPreviewCustomerView={() => navigateTo('/')}
-            />
-          ) : (
+          <ErrorBoundary key="admin-panel-boundary">
+            {isAdminAuth ? (
+              /* Authenticated Admin Dashboard */
+              <AdminDashboard
+                products={products}
+                orders={orders}
+                settings={settings}
+                deliveryAreas={deliveryAreas}
+                customers={customers}
+                onLockDashboard={handleLockAdmin}
+                onPreviewCustomerView={() => navigateTo('/')}
+              />
+            ) : (
             /* Dedicated Secure Login Screen for /control-panel */
             <div className="max-w-md mx-auto px-4 py-16">
               <div className="bg-white rounded-3xl shadow-xl border border-neutral-200 overflow-hidden">
@@ -248,7 +250,8 @@ export default function App() {
                 </form>
               </div>
             </div>
-          )}
+            )}
+          </ErrorBoundary>
         </main>
 
         <footer className="bg-neutral-900 text-neutral-500 py-4 text-center text-xs border-t border-neutral-800">
@@ -275,11 +278,13 @@ export default function App() {
 
       {/* Customer Storefront */}
       <main className="flex-1 min-w-0">
-        <CustomerStorefront
-          products={products}
-          settings={settings}
-          deliveryAreas={deliveryAreas}
-        />
+        <ErrorBoundary key="customer-store-boundary">
+          <CustomerStorefront
+            products={products}
+            settings={settings}
+            deliveryAreas={deliveryAreas}
+          />
+        </ErrorBoundary>
       </main>
 
       {/* Clean Customer Footer - NO admin buttons at all */}

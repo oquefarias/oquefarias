@@ -13,7 +13,10 @@ import {
   ShortcutAction,
   DEFAULT_SHORTCUTS,
   ProductSortMode,
+  StockAdjustReason,
+  hasProductStockCase,
   hasProductCase,
+  canSellProductCase,
   formatStockWithCases,
   isProductPromoActive,
   getEffectiveProductPrice,
@@ -31,6 +34,7 @@ import {
   isComboProduct,
   calculateComboMetrics,
   formatOrderItemComboLine,
+  isProductHiddenFromStore,
 } from '../../types';
 import { api } from '../../services/api';
 import { soundService } from '../../utils/sound';
@@ -42,6 +46,7 @@ import { CustomerModal } from './CustomerModal';
 import { ImportProductsModal } from './ImportProductsModal';
 import { TablesManager } from './tables/TablesManager';
 import { StoreOrganizationSection } from './StoreOrganizationSection';
+import { StockHistorySection } from './StockHistorySection';
 import {
   calculateDistanceKm,
   buildSingleDeliveryRouteUrl,
@@ -87,6 +92,7 @@ import {
   HelpCircle,
   Keyboard,
   Navigation,
+  History,
 } from 'lucide-react';
 
 const SHORTCUT_ACTION_ITEMS: Array<{
@@ -404,6 +410,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [isQRCodeModalOpen, setIsQRCodeModalOpen] = useState<boolean>(false);
 
   // Stock state
+  const [estoqueSubTab, setEstoqueSubTab] = useState<'produtos' | 'historico'>('produtos');
+  const [stockHistoryProductId, setStockHistoryProductId] = useState<string>('');
   const [stockSearch, setStockSearch] = useState<string>('');
   const [stockCategoryFilter, setStockCategoryFilter] = useState<ProductCategory | 'todas' | 'outros'>('todas');
   const [stockSortBy, setStockSortBy] = useState<'az' | 'price' | 'stock' | 'category'>('az');
@@ -413,6 +421,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [editingComboIdForModal, setEditingComboIdForModal] = useState<string | null>(null);
   const [stockRowUnits, setStockRowUnits] = useState<Record<string, SaleUnit>>({});
+  const [stockInlineErrorByProduct, setStockInlineErrorByProduct] = useState<Record<string, string>>({});
+  const [inlineStockEdit, setInlineStockEdit] = useState<{
+    productId: string;
+    value: string;
+    reason: StockAdjustReason;
+    saving?: boolean;
+  } | null>(null);
+  const pendingQuickStockRef = React.useRef<
+    Record<
+      string,
+      {
+        baseStock: number;
+        accumulatedDelta: number;
+        timerId: number;
+      }
+    >
+  >({});
   const [stockAdjustModal, setStockAdjustModal] = useState<{
     product: Product;
     unit: SaleUnit;
@@ -491,6 +516,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     ...settings,
     showOutOfStock: Boolean(settings.showOutOfStock),
     featuredProductIds: Array.isArray(settings.featuredProductIds) ? settings.featuredProductIds : [],
+    hiddenFromStoreIds: Array.isArray(settings.hiddenFromStoreIds) ? settings.hiddenFromStoreIds : [],
     categories: resolveStoreCategories(settings, products),
     productSortMode: settings.productSortMode || 'manual',
     productOrder: settings.productOrder || {},
@@ -516,6 +542,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       ...settings,
       showOutOfStock: Boolean(settings.showOutOfStock),
       featuredProductIds: Array.isArray(settings.featuredProductIds) ? settings.featuredProductIds : [],
+      hiddenFromStoreIds: Array.isArray(settings.hiddenFromStoreIds) ? settings.hiddenFromStoreIds : [],
       categories: resolveStoreCategories(settings, products),
       productSortMode: settings.productSortMode || 'manual',
       productOrder: settings.productOrder || {},
@@ -625,11 +652,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     sellsCase: boolean;
     caseSize: number;
     casePrice: number;
+    caseChannelStore: boolean;
+    caseChannelLocal: boolean;
     costPrice: number;
     stock: number;
     minStock: number;
     isCold: boolean;
     active: boolean;
+    appearsInDelivery: boolean;
     image: string;
     sku: string;
     description: string;
@@ -640,13 +670,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     volume: 'Lata 350ml',
     price: 0,
     sellsCase: false,
-    caseSize: 12,
+    caseSize: 0,
     casePrice: 0,
+    caseChannelStore: true,
+    caseChannelLocal: true,
     costPrice: 0,
     stock: 0,
     minStock: 12,
     isCold: true,
     active: true,
+    appearsInDelivery: true,
     image: '',
     sku: '',
     description: '',
@@ -805,9 +838,116 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     }
   };
 
-  // Stock quick adjust
-  const handleAdjustStock = async (productId: string, delta: number, unit: SaleUnit = 'unit') => {
-    await api.adjustStock(productId, delta, unit);
+  // Stock quick adjust: optimistic update + 600ms debounce per product without reloading the whole list
+  const handleAdjustStock = (productId: string, delta: number, unit: SaleUnit = 'unit') => {
+    const prod = products.find((p) => p.id === productId);
+    if (!prod) return;
+
+    const mult = unit === 'case' && prod.caseSize && prod.caseSize >= 2 ? Math.floor(prod.caseSize) : 1;
+    const unitDelta = Math.round(delta * mult);
+    if (unitDelta === 0) return;
+
+    setStockInlineErrorByProduct((prev) => {
+      if (!prev[productId]) return prev;
+      const next = { ...prev };
+      delete next[productId];
+      return next;
+    });
+
+    let entry = pendingQuickStockRef.current[productId];
+    if (!entry) {
+      entry = {
+        baseStock: prod.stock,
+        accumulatedDelta: 0,
+        timerId: 0,
+      };
+      pendingQuickStockRef.current[productId] = entry;
+    }
+
+    const nextAccumulated = entry.accumulatedDelta + unitDelta;
+    const optimisticStock = entry.baseStock + nextAccumulated;
+
+    entry.accumulatedDelta = nextAccumulated;
+    if (optimisticStock >= 0) {
+      api.setLocalProductStock(productId, optimisticStock);
+    }
+
+    if (entry.timerId) {
+      window.clearTimeout(entry.timerId);
+    }
+
+    entry.timerId = window.setTimeout(async () => {
+      const currentEntry = pendingQuickStockRef.current[productId];
+      delete pendingQuickStockRef.current[productId];
+      if (!currentEntry) return;
+
+      const { baseStock, accumulatedDelta } = currentEntry;
+      if (accumulatedDelta === 0) {
+        api.setLocalProductStock(productId, baseStock);
+        return;
+      }
+
+      try {
+        const res = await api.adjustProductStock(productId, {
+          mode: 'delta',
+          value: accumulatedDelta,
+          reason: 'ajuste',
+        });
+        api.setLocalProductStock(productId, res.stock);
+      } catch (err: any) {
+        api.setLocalProductStock(productId, baseStock);
+        setStockInlineErrorByProduct((prev) => ({
+          ...prev,
+          [productId]: err?.message || 'O estoque não pode ficar negativo',
+        }));
+      }
+    }, 600);
+  };
+
+  const handleSaveInlineStockEdit = async (product: Product) => {
+    if (!inlineStockEdit || inlineStockEdit.productId !== product.id || inlineStockEdit.saving) return;
+    const trimmed = inlineStockEdit.value.trim();
+    const parsedVal = Number(trimmed);
+
+    if (!trimmed || !Number.isInteger(parsedVal)) {
+      setStockInlineErrorByProduct((prev) => ({
+        ...prev,
+        [product.id]: 'Informe um número inteiro.',
+      }));
+      return;
+    }
+
+    setStockInlineErrorByProduct((prev) => {
+      if (!prev[product.id]) return prev;
+      const next = { ...prev };
+      delete next[product.id];
+      return next;
+    });
+
+    const previousStock = product.stock;
+    const chosenReason = inlineStockEdit.reason || 'ajuste';
+    setInlineStockEdit((prev) => (prev ? { ...prev, saving: true } : null));
+
+    if (parsedVal >= 0) {
+      api.setLocalProductStock(product.id, parsedVal);
+    }
+
+    try {
+      const res = await api.adjustProductStock(product.id, {
+        mode: 'set',
+        value: parsedVal,
+        reason: chosenReason,
+      });
+      api.setLocalProductStock(product.id, res.stock);
+      setInlineStockEdit(null);
+    } catch (err: any) {
+      api.setLocalProductStock(product.id, previousStock);
+      setInlineStockEdit((prev) => (prev ? { ...prev, saving: false } : null));
+      setStockInlineErrorByProduct((prev) => ({
+        ...prev,
+        [product.id]: err?.message || 'O estoque não pode ficar negativo',
+      }));
+    }
   };
 
   const handleConfirmCustomStockAdjust = async (e: React.FormEvent) => {
@@ -983,13 +1123,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       volume: 'Lata 350ml',
       price: 5.00,
       sellsCase: false,
-      caseSize: 12,
+      caseSize: 0,
       casePrice: 0,
+      caseChannelStore: true,
+      caseChannelLocal: true,
       costPrice: 3.50,
       stock: 24,
       minStock: 12,
       isCold: true,
       active: true,
+      appearsInDelivery: true,
       image: 'https://images.unsplash.com/photo-1535958636474-b021ee887b13?w=500&auto=format&fit=crop&q=80',
       sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
       description: '',
@@ -1011,7 +1154,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setProductModalError('');
     setProductModalSuccessNotice('');
     setShowDiscardProductConfirm(false);
-    const sellsCase = hasProductCase(p);
+    const chConfig = settings.caseSaleChannels?.[p.id];
+    const hasCasePrice = hasProductCase(p);
+    const sellsCase = hasCasePrice && (chConfig ? chConfig.store || chConfig.local : true);
     const initialForm = {
       id: p.id,
       name: p.name,
@@ -1019,13 +1164,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       volume: p.volume,
       price: p.price,
       sellsCase,
-      caseSize: p.caseSize || 12,
+      caseSize: hasProductStockCase(p) ? Number(p.caseSize) : 0,
       casePrice: p.casePrice || 0,
+      caseChannelStore: chConfig ? Boolean(chConfig.store) : true,
+      caseChannelLocal: chConfig ? Boolean(chConfig.local) : true,
       costPrice: p.costPrice,
       stock: p.stock,
       minStock: p.minStock,
       isCold: p.isCold,
       active: p.active !== false,
+      appearsInDelivery: !isProductHiddenFromStore(p.id, settings),
       image: p.image,
       sku: p.sku,
       description: p.description,
@@ -1043,7 +1191,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setProductModalError('');
     setProductModalSuccessNotice('');
     setShowDiscardProductConfirm(false);
-    const sellsCase = hasProductCase(p);
+    const chConfig = settings.caseSaleChannels?.[p.id];
+    const hasCasePrice = hasProductCase(p);
+    const sellsCase = hasCasePrice && (chConfig ? chConfig.store || chConfig.local : true);
     const dupForm = {
       id: `prod-${Date.now()}`,
       name: `${p.name} (cópia)`,
@@ -1051,13 +1201,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       volume: p.volume,
       price: p.price,
       sellsCase,
-      caseSize: p.caseSize || 12,
+      caseSize: hasProductStockCase(p) ? Number(p.caseSize) : 0,
       casePrice: p.casePrice || 0,
+      caseChannelStore: chConfig ? Boolean(chConfig.store) : true,
+      caseChannelLocal: chConfig ? Boolean(chConfig.local) : true,
       costPrice: p.costPrice,
       stock: 0,
       minStock: p.minStock,
       isCold: p.isCold,
       active: p.active !== false,
+      appearsInDelivery: !isProductHiddenFromStore(p.id, settings),
       image: p.image,
       sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
       description: p.description,
@@ -1093,22 +1246,39 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     let caseSize: number | null = null;
     let casePrice: number | null = null;
 
-    if (productForm.sellsCase) {
-      const parsedSize = Number(productForm.caseSize);
-      const parsedPrice = Number(productForm.casePrice);
-      if (!Number.isInteger(parsedSize) || parsedSize < 2 || parsedSize > 100) {
+    const rawSize = Number(productForm.caseSize || 0);
+    if (rawSize > 0) {
+      if (!Number.isInteger(rawSize) || rawSize < 2 || rawSize > 100) {
         setProductModalError('Unidades por caixa deve ser um número inteiro entre 2 e 100.');
         return;
       }
+      caseSize = rawSize;
+    }
+
+    if (productForm.sellsCase) {
+      if (!caseSize || caseSize < 2 || caseSize > 100) {
+        setProductModalError('Para vender caixa fechada, informe as unidades por caixa (2 a 100).');
+        return;
+      }
+      const parsedPrice = Number(productForm.casePrice);
       if (Number.isNaN(parsedPrice) || parsedPrice <= 0) {
         setProductModalError('O preço da caixa fechada deve ser maior que zero.');
         return;
       }
-      caseSize = parsedSize;
+      if (!productForm.caseChannelStore && !productForm.caseChannelLocal) {
+        setProductModalError('Marque pelo menos onde vender a caixa fechada (Delivery ou Balcão/Mesa), ou desative "Vender caixa fechada".');
+        return;
+      }
       casePrice = Math.round(parsedPrice * 100) / 100;
     }
 
-    const { sellsCase: _sellsCase, ...restForm } = productForm;
+    const {
+      sellsCase: _sellsCase,
+      appearsInDelivery: _appearsInDelivery,
+      caseChannelStore: _caseChannelStore,
+      caseChannelLocal: _caseChannelLocal,
+      ...restForm
+    } = productForm;
     const productToSave: Product = {
       ...restForm,
       name: productForm.name.trim(),
@@ -1117,7 +1287,40 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       active: productForm.active !== false,
     };
     try {
-      await api.saveProduct(productToSave);
+      const savedProd = await api.saveProduct(productToSave);
+
+      const settingsUpdates: Partial<StoreSettings> = {};
+
+      const currentHidden = Array.isArray(settings.hiddenFromStoreIds) ? settings.hiddenFromStoreIds : [];
+      const wasHidden = currentHidden.includes(savedProd.id);
+      const shouldHide = productForm.appearsInDelivery === false;
+      if (wasHidden !== shouldHide) {
+        settingsUpdates.hiddenFromStoreIds = shouldHide
+          ? [...currentHidden, savedProd.id].slice(0, 2000)
+          : currentHidden.filter((id) => id !== savedProd.id);
+      }
+
+      const currentCaseChannels = { ...(settings.caseSaleChannels || {}) };
+      const prevCh = currentCaseChannels[savedProd.id];
+      if (productForm.sellsCase && casePrice && casePrice > 0) {
+        const nextCh = {
+          store: Boolean(productForm.caseChannelStore),
+          local: Boolean(productForm.caseChannelLocal),
+        };
+        if (!prevCh || prevCh.store !== nextCh.store || prevCh.local !== nextCh.local) {
+          currentCaseChannels[savedProd.id] = nextCh;
+          settingsUpdates.caseSaleChannels = currentCaseChannels;
+        }
+      } else if (prevCh) {
+        delete currentCaseChannels[savedProd.id];
+        settingsUpdates.caseSaleChannels = currentCaseChannels;
+      }
+
+      if (Object.keys(settingsUpdates).length > 0) {
+        setSettingsForm((prev) => ({ ...prev, ...settingsUpdates }));
+        await api.updateSettings(settingsUpdates);
+      }
+
       if (mode === 'new') {
         setEditingProduct(null);
         setShowDiscardProductConfirm(false);
@@ -1128,13 +1331,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           volume: productForm.volume,
           price: 0,
           sellsCase: productForm.sellsCase,
-          caseSize: productForm.caseSize || 12,
+          caseSize: productForm.caseSize || 0,
           casePrice: productForm.casePrice || 0,
+          caseChannelStore: productForm.caseChannelStore,
+          caseChannelLocal: productForm.caseChannelLocal,
           costPrice: 0,
           stock: 0,
           minStock: productForm.minStock || 12,
           isCold: productForm.isCold,
           active: true,
+          appearsInDelivery: productForm.appearsInDelivery !== false,
           image: productForm.image,
           sku: `BEB-${Math.floor(100 + Math.random() * 900)}`,
           description: '',
@@ -1213,7 +1419,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         active: !p.active,
       });
     } catch (err: any) {
-      setPanelError(err?.message || 'Erro ao alterar visibilidade do produto.');
+      setPanelError(err?.message || 'Erro ao alterar status do produto.');
+    }
+  };
+
+  const handleToggleProductDeliveryVisibility = async (productId: string) => {
+    const currentHidden = Array.isArray(settings.hiddenFromStoreIds) ? settings.hiddenFromStoreIds : [];
+    const isHidden = currentHidden.includes(productId);
+    const nextHidden = isHidden
+      ? currentHidden.filter((id) => id !== productId)
+      : [...currentHidden, productId].slice(0, 2000);
+    setSettingsForm((prev) => ({ ...prev, hiddenFromStoreIds: nextHidden }));
+    try {
+      await api.updateSettings({ hiddenFromStoreIds: nextHidden });
+    } catch (err: any) {
+      setPanelError(err?.message || 'Erro ao alterar visibilidade do produto no delivery.');
     }
   };
 
@@ -1289,14 +1509,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // PDV Actions
   const getPosItemPrice = (product: Product, saleUnit: SaleUnit, addonsTotal: number = 0): number => {
     const base =
-      saleUnit === 'case' && hasProductCase(product)
+      saleUnit === 'case' && canSellProductCase(product, settings, 'local')
         ? Number(product.casePrice)
         : getEffectiveProductPrice(product);
     return Math.round((base + (Number(addonsTotal) || 0)) * 100) / 100;
   };
 
   const getPosUnitsPerSale = (product: Product, saleUnit: SaleUnit): number => {
-    if (saleUnit === 'case' && hasProductCase(product)) {
+    if (saleUnit === 'case' && canSellProductCase(product, settings, 'local')) {
       return Number(product.caseSize);
     }
     return 1;
@@ -1309,7 +1529,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     addons?: OrderItemAddon[],
     addonsTotal: number = 0
   ) => {
-    const actualUnit: SaleUnit = saleUnit === 'case' && hasProductCase(product) ? 'case' : 'unit';
+    const actualUnit: SaleUnit = saleUnit === 'case' && canSellProductCase(product, settings, 'local') ? 'case' : 'unit';
     const unitsPerSale = getPosUnitsPerSale(product, actualUnit);
     const sig = buildOrderItemAddonsSignature(addons);
     const lineId = `${product.id}::${actualUnit}::${sig}`;
@@ -1354,7 +1574,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const addToPosCart = (product: Product, saleUnit: SaleUnit = 'unit') => {
-    const actualUnit: SaleUnit = saleUnit === 'case' && hasProductCase(product) ? 'case' : 'unit';
+    const actualUnit: SaleUnit = saleUnit === 'case' && canSellProductCase(product, settings, 'local') ? 'case' : 'unit';
     const applicableAddonGroups = getProductAddonGroups(product, settings);
     if (applicableAddonGroups.length > 0) {
       setPosAddonModalState({ product, saleUnit: actualUnit });
@@ -1434,7 +1654,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         },
         deliveryType: 'retirada',
         items: posCart.map(i => {
-          const isCase = i.saleUnit === 'case' && hasProductCase(i.product);
+          const isCase = i.saleUnit === 'case' && canSellProductCase(i.product, settings, 'local');
           const unitsPerSale = isCase ? Number(i.product.caseSize) : 1;
           const baseUnitPrice = isCase
             ? Number(i.product.casePrice)
@@ -3115,469 +3335,714 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {/* ========================================================= */}
       {activeTab === 'estoque' && (
         <div className="space-y-6">
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            <div className="bg-white p-4 rounded-2xl border border-neutral-200">
-              <span className="text-xs font-medium text-neutral-500">Itens em Estoque</span>
-              <p className="text-xl sm:text-2xl font-black text-neutral-900 mt-1">
-                {products.reduce((s, p) => s + p.stock, 0)} <span className="text-xs font-normal text-neutral-500">un</span>
-              </p>
-            </div>
-            <div className="bg-white p-4 rounded-2xl border border-neutral-200">
-              <span className="text-xs font-medium text-neutral-500">Produtos Cadastrados</span>
-              <p className="text-xl sm:text-2xl font-black text-neutral-900 mt-1">{products.length}</p>
-            </div>
-            <div className="bg-white p-4 rounded-2xl border border-neutral-200">
-              <span className="text-xs font-medium text-neutral-500">Estoque Baixo</span>
-              <p className={`text-xl sm:text-2xl font-black mt-1 ${lowStockProducts.length > 0 ? 'text-amber-600' : 'text-emerald-600'}`}>
-                {lowStockProducts.length}
-              </p>
-            </div>
-            <div className="bg-white p-4 rounded-2xl border border-neutral-200">
-              <span className="text-xs font-medium text-neutral-500">Valor em Estoque</span>
-              <p className="text-xl sm:text-2xl font-black text-neutral-900 mt-1">
-                {formatCurrency(financialStats.totalStockValue)}
-              </p>
-            </div>
-          </div>
-
-          {/* Categorias, Combos, Ordem de Preferência e Organizar Loja (@dnd-kit) */}
-          <StoreOrganizationSection
-            products={products}
-            settings={settings}
-            onSettingsUpdated={(next) => setSettingsForm((prev) => ({ ...prev, ...next }))}
-            externalEditingComboId={editingComboIdForModal}
-            onClearExternalEditingComboId={() => setEditingComboIdForModal(null)}
-          />
-
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2 w-full sm:max-w-xl">
-              <div className="relative flex-1 min-w-[180px]">
-                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
-                <input
-                  type="text"
-                  data-admin-search="estoque"
-                  placeholder="Buscar produto ou SKU..."
-                  value={stockSearch}
-                  onChange={(e) => setStockSearch(e.target.value)}
-                  className="w-full pl-9 pr-3 py-2.5 bg-white border border-neutral-200 rounded-xl text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
-                />
-              </div>
-
-              <div className="flex items-center gap-1.5 bg-white px-3 py-2 rounded-xl border border-neutral-200 text-xs">
-                <span className="font-bold text-neutral-500 whitespace-nowrap">Ordenar por:</span>
-                <select
-                  value={stockSortBy}
-                  onChange={(e) => setStockSortBy(e.target.value as 'az' | 'price' | 'stock' | 'category')}
-                  className="bg-transparent font-bold text-neutral-900 focus:outline-none cursor-pointer"
-                >
-                  <option value="az">Nome A–Z</option>
-                  <option value="price">Preço</option>
-                  <option value="stock">Estoque</option>
-                  <option value="category">Categoria</option>
-                </select>
-              </div>
-
-              <button
-                onClick={() => setOnlyLowStock(!onlyLowStock)}
-                className={`px-3 py-2.5 rounded-xl text-xs font-bold border transition-colors whitespace-nowrap ${
-                  onlyLowStock
-                    ? 'bg-amber-500 text-white border-amber-600'
-                    : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-50'
-                }`}
-              >
-                ⚠️ Baixo Estoque
-              </button>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+          {/* Sub-navigation: Produtos vs Histórico de Estoque */}
+          <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-3 rounded-2xl border border-neutral-200 shadow-2xs">
+            <div className="flex items-center gap-1.5">
               <button
                 type="button"
-                onClick={() => setIsImportModalOpen(true)}
-                className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-white hover:bg-neutral-50 text-neutral-800 border border-neutral-300 font-bold rounded-xl text-xs shadow-2xs transition-colors cursor-pointer"
-              >
-                <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
-                <span>Importar planilha (.xlsx)</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={handleOpenNewProduct}
-                className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs shadow-xs transition-colors cursor-pointer"
-              >
-                <Plus className="w-4 h-4" />
-                <span>Novo Produto ({formatShortcutDisplay(activeShortcuts.newProduct || 'F6')})</span>
-              </button>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 overflow-x-auto pb-2 scrollbar-none">
-            {[
-              { id: 'todas', label: 'Todas as Categorias' },
-              ...storeCategories.map((c) => ({ id: c.id, label: c.name })),
-              ...(hasUnlistedCategoryProducts ? [{ id: 'outros', label: 'Outros' }] : []),
-            ].map((cat) => (
-              <button
-                key={cat.id}
-                onClick={() => setStockCategoryFilter(cat.id as ProductCategory | 'todas' | 'outros')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors whitespace-nowrap ${
-                  stockCategoryFilter === cat.id
-                    ? 'bg-neutral-900 text-white'
-                    : 'bg-white text-neutral-600 hover:bg-neutral-100 border border-neutral-200'
+                onClick={() => setEstoqueSubTab('produtos')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${
+                  estoqueSubTab === 'produtos'
+                    ? 'bg-neutral-900 text-white shadow-2xs'
+                    : 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
                 }`}
               >
-                {cat.label}
+                <Package className="w-4 h-4 text-amber-400" />
+                <span>Produtos & Controle de Estoque</span>
               </button>
-            ))}
+              <button
+                type="button"
+                onClick={() => setEstoqueSubTab('historico')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${
+                  estoqueSubTab === 'historico'
+                    ? 'bg-neutral-900 text-white shadow-2xs'
+                    : 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
+                }`}
+              >
+                <History className="w-4 h-4 text-amber-400" />
+                <span>Histórico</span>
+              </button>
+            </div>
+            {estoqueSubTab === 'historico' && (
+              <button
+                type="button"
+                onClick={() => setEstoqueSubTab('produtos')}
+                className="text-xs font-bold text-amber-700 hover:text-amber-800 cursor-pointer"
+              >
+                ← Voltar para lista de produtos
+              </button>
+            )}
           </div>
 
-          <div className="bg-white rounded-3xl border border-neutral-200 shadow-xs overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs text-neutral-700">
-                <thead className="bg-neutral-50 border-b border-neutral-200 text-neutral-500 font-bold uppercase tracking-wider">
-                  <tr>
-                    <th className="py-3 px-4">Produto</th>
-                    <th className="py-3 px-4">Categoria / SKU</th>
-                    <th className="py-3 px-4">Custo</th>
-                    <th className="py-3 px-4">Venda</th>
-                    <th className="py-3 px-4">Margem</th>
-                    <th className="py-3 px-4">Estoque Atual</th>
-                    <th className="py-3 px-4 text-center">Ajuste Rápido</th>
-                    <th className="py-3 px-4 text-right">Ações</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-neutral-100">
-                  {filteredProducts.length === 0 ? (
-                    <tr>
-                      <td colSpan={8} className="py-12 text-center text-neutral-400">
-                        <Package className="w-10 h-10 mx-auto mb-2 text-neutral-300" />
-                        <p className="font-bold text-neutral-700 text-sm">Nenhum produto cadastrado no estoque</p>
-                        <p className="text-xs text-neutral-400 mt-1">Clique no botão "+ Novo Produto" acima para cadastrar suas bebidas e definir estoque.</p>
-                      </td>
-                    </tr>
-                  ) : (
-                    filteredProducts.map(p => {
-                    const isCombo = isComboProduct(p.id, settings);
-                    const comboMetrics = isCombo ? calculateComboMetrics(p, settings, products) : null;
-                    const displayStock = comboMetrics ? comboMetrics.availableStock : p.stock;
-                    const isLow = isCombo ? displayStock <= 0 : p.stock <= p.minStock;
-                    const promoActive = isProductPromoActive(p);
-                    const effectivePrice = getEffectiveProductPrice(p);
-                    const displayCostPrice = comboMetrics ? comboMetrics.costPrice : p.costPrice;
-                    const margin = comboMetrics
-                      ? comboMetrics.marginPercent
-                      : effectivePrice > 0
-                      ? ((effectivePrice - p.costPrice) / effectivePrice) * 100
-                      : 0;
-                    const sellsCase = !isCombo && hasProductCase(p);
-                    const rowUnit: SaleUnit = sellsCase && stockRowUnits[p.id] === 'case' ? 'case' : 'unit';
+          {estoqueSubTab === 'historico' ? (
+            <StockHistorySection
+              products={products}
+              selectedProductId={stockHistoryProductId}
+              onSelectProductId={(pid) => setStockHistoryProductId(pid)}
+              onOpenOrderRef={(orderId) => {
+                const cleanId = orderId.replace(/^#/, '').trim();
+                const found = localOrders.find(
+                  (o) => o.id === cleanId || o.id === orderId
+                );
+                if (found) {
+                  setSelectedReceiptOrder(found);
+                } else {
+                  setActiveTab('pedidos');
+                  setOrderStatusFilter('todos');
+                }
+              }}
+            />
+          ) : (
+            <>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <div className="bg-white p-4 rounded-2xl border border-neutral-200">
+                  <span className="text-xs font-medium text-neutral-500">Itens em Estoque</span>
+                  <p className="text-xl sm:text-2xl font-black text-neutral-900 mt-1">
+                    {products.reduce((s, p) => s + p.stock, 0)} <span className="text-xs font-normal text-neutral-500">un</span>
+                  </p>
+                </div>
+                <div className="bg-white p-4 rounded-2xl border border-neutral-200">
+                  <span className="text-xs font-medium text-neutral-500">Produtos Cadastrados</span>
+                  <p className="text-xl sm:text-2xl font-black text-neutral-900 mt-1">{products.length}</p>
+                </div>
+                <div className="bg-white p-4 rounded-2xl border border-neutral-200">
+                  <span className="text-xs font-medium text-neutral-500">Estoque Baixo</span>
+                  <p className={`text-xl sm:text-2xl font-black mt-1 ${lowStockProducts.length > 0 ? 'text-amber-600' : 'text-emerald-600'}`}>
+                    {lowStockProducts.length}
+                  </p>
+                </div>
+                <div className="bg-white p-4 rounded-2xl border border-neutral-200">
+                  <span className="text-xs font-medium text-neutral-500">Valor em Estoque</span>
+                  <p className="text-xl sm:text-2xl font-black text-neutral-900 mt-1">
+                    {formatCurrency(financialStats.totalStockValue)}
+                  </p>
+                </div>
+              </div>
 
-                    return (
-                      <tr key={p.id} className="hover:bg-neutral-50 transition-colors">
-                        <td className="py-3 px-4">
-                          <div className="flex items-center gap-3">
-                            {p.image ? (
-                              <img
-                                src={p.image}
-                                alt={p.name}
-                                className="w-10 h-10 rounded-xl object-cover border border-neutral-200 shrink-0"
-                              />
-                            ) : (
-                              <div className="w-10 h-10 rounded-xl bg-neutral-100 border border-neutral-200 flex items-center justify-center text-neutral-400 shrink-0">
-                                <Package className="w-5 h-5" />
-                              </div>
-                            )}
-                            <div>
-                              <div className="flex items-center gap-2 flex-wrap">
-                                <span className="font-bold text-neutral-900 text-sm">{p.name}</span>
-                                {isCombo && (
-                                  <span className="px-1.5 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 text-[10px] font-black rounded uppercase tracking-wider">
-                                    Combo
-                                  </span>
+              {/* Categorias, Combos, Ordem de Preferência e Organizar Loja (@dnd-kit) */}
+              <StoreOrganizationSection
+                products={products}
+                settings={settings}
+                onSettingsUpdated={(next) => setSettingsForm((prev) => ({ ...prev, ...next }))}
+                externalEditingComboId={editingComboIdForModal}
+                onClearExternalEditingComboId={() => setEditingComboIdForModal(null)}
+              />
+
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2 w-full sm:max-w-xl">
+                  <div className="relative flex-1 min-w-[180px]">
+                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
+                    <input
+                      type="text"
+                      data-admin-search="estoque"
+                      placeholder="Buscar produto ou SKU..."
+                      value={stockSearch}
+                      onChange={(e) => setStockSearch(e.target.value)}
+                      className="w-full pl-9 pr-3 py-2.5 bg-white border border-neutral-200 rounded-xl text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-1.5 bg-white px-3 py-2 rounded-xl border border-neutral-200 text-xs">
+                    <span className="font-bold text-neutral-500 whitespace-nowrap">Ordenar por:</span>
+                    <select
+                      value={stockSortBy}
+                      onChange={(e) => setStockSortBy(e.target.value as 'az' | 'price' | 'stock' | 'category')}
+                      className="bg-transparent font-bold text-neutral-900 focus:outline-none cursor-pointer"
+                    >
+                      <option value="az">Nome A–Z</option>
+                      <option value="price">Preço</option>
+                      <option value="stock">Estoque</option>
+                      <option value="category">Categoria</option>
+                    </select>
+                  </div>
+
+                  <button
+                    onClick={() => setOnlyLowStock(!onlyLowStock)}
+                    className={`px-3 py-2.5 rounded-xl text-xs font-bold border transition-colors whitespace-nowrap ${
+                      onlyLowStock
+                        ? 'bg-amber-500 text-white border-amber-600'
+                        : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-50'
+                    }`}
+                  >
+                    ⚠️ Baixo Estoque
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                  <button
+                    type="button"
+                    onClick={() => setIsImportModalOpen(true)}
+                    className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-white hover:bg-neutral-50 text-neutral-800 border border-neutral-300 font-bold rounded-xl text-xs shadow-2xs transition-colors cursor-pointer"
+                  >
+                    <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                    <span>Importar planilha (.xlsx)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleOpenNewProduct}
+                    className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs shadow-xs transition-colors cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Novo Produto ({formatShortcutDisplay(activeShortcuts.newProduct || 'F6')})</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Category Filter Row: flex-wrap on desktop, horizontal scroll with right fade/chevron on mobile */}
+              <div className="relative">
+                <div className="flex items-center gap-2 overflow-x-auto sm:flex-wrap sm:overflow-visible pb-2 pr-8 sm:pr-0 scrollbar-none">
+                  {[
+                    { id: 'todas', label: 'Todas as Categorias' },
+                    ...storeCategories
+                      .filter((c) => products.some((p) => p.category === c.id))
+                      .map((c) => ({ id: c.id, label: c.name })),
+                    ...(hasUnlistedCategoryProducts ? [{ id: 'outros', label: 'Outros' }] : []),
+                  ].map((cat) => (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      onClick={() => setStockCategoryFilter(cat.id as ProductCategory | 'todas' | 'outros')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                        stockCategoryFilter === cat.id
+                          ? 'bg-neutral-900 text-white'
+                          : 'bg-white text-neutral-600 hover:bg-neutral-100 border border-neutral-200'
+                      }`}
+                    >
+                      {cat.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="pointer-events-none sm:hidden absolute right-0 top-0 bottom-2 w-8 bg-gradient-to-l from-neutral-100 via-neutral-100/90 to-transparent flex items-center justify-end pr-1">
+                  <span className="text-xs font-black text-neutral-500">›</span>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-3xl border border-neutral-200 shadow-xs overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs text-neutral-700">
+                    <thead className="bg-neutral-50 border-b border-neutral-200 text-neutral-500 font-bold uppercase tracking-wider">
+                      <tr>
+                        <th className="py-3 px-4">Produto</th>
+                        <th className="py-3 px-4">Categoria / SKU</th>
+                        <th className="py-3 px-4">Custo</th>
+                        <th className="py-3 px-4">Venda</th>
+                        <th className="py-3 px-4">Margem</th>
+                        <th className="py-3 px-4">Estoque Atual</th>
+                        <th className="py-3 px-4 text-center">Ajuste Rápido</th>
+                        <th className="py-3 px-4 text-right">Ações</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-neutral-100">
+                      {filteredProducts.length === 0 ? (
+                        <tr>
+                          <td colSpan={8} className="py-12 text-center text-neutral-400">
+                            <Package className="w-10 h-10 mx-auto mb-2 text-neutral-300" />
+                            <p className="font-bold text-neutral-700 text-sm">Nenhum produto cadastrado no estoque</p>
+                            <p className="text-xs text-neutral-400 mt-1">Clique no botão "+ Novo Produto" acima para cadastrar suas bebidas e definir estoque.</p>
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredProducts.map(p => {
+                        const isCombo = isComboProduct(p.id, settings);
+                        const comboMetrics = isCombo ? calculateComboMetrics(p, settings, products) : null;
+                        const displayStock = comboMetrics ? comboMetrics.availableStock : p.stock;
+                        const isLow = isCombo ? displayStock <= 0 : p.stock <= p.minStock;
+                        const promoActive = isProductPromoActive(p);
+                        const effectivePrice = getEffectiveProductPrice(p);
+                        const displayCostPrice = comboMetrics ? comboMetrics.costPrice : p.costPrice;
+                        const margin = comboMetrics
+                          ? comboMetrics.marginPercent
+                          : effectivePrice > 0
+                          ? ((effectivePrice - p.costPrice) / effectivePrice) * 100
+                          : 0;
+                        const hasStockCase = !isCombo && hasProductStockCase(p);
+                        const sellsStoreCase = !isCombo && canSellProductCase(p, settings, 'store');
+                        const sellsLocalCase = !isCombo && canSellProductCase(p, settings, 'local');
+                        const sellsCaseAnywhere = sellsStoreCase || sellsLocalCase;
+                        const rowUnit: SaleUnit = hasStockCase && stockRowUnits[p.id] === 'case' ? 'case' : 'unit';
+                        const isEditingInline = inlineStockEdit?.productId === p.id;
+                        const rowStockError = stockInlineErrorByProduct[p.id];
+
+                        return (
+                          <tr key={p.id} className="hover:bg-neutral-50 transition-colors">
+                            <td className="py-3 px-4">
+                              <div className="flex items-center gap-3">
+                                {p.image ? (
+                                  <img
+                                    src={p.image}
+                                    alt={p.name}
+                                    className="w-10 h-10 rounded-xl object-cover border border-neutral-200 shrink-0"
+                                  />
+                                ) : (
+                                  <div className="w-10 h-10 rounded-xl bg-neutral-100 border border-neutral-200 flex items-center justify-center text-neutral-400 shrink-0">
+                                    <Package className="w-5 h-5" />
+                                  </div>
                                 )}
-                                {promoActive && (
-                                  <span className="px-1.5 py-0.5 bg-red-600 text-white text-[10px] font-black rounded uppercase tracking-wider">
-                                    PROMO
-                                  </span>
-                                )}
-                                {sellsCase && (
-                                  <span className="px-1.5 py-0.5 bg-amber-100 text-amber-800 border border-amber-300 text-[10px] font-bold rounded">
-                                    Caixa c/{p.caseSize}
-                                  </span>
-                                )}
+                                <div>
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="font-bold text-neutral-900 text-sm">{p.name}</span>
+                                    {isCombo && (
+                                      <span className="px-1.5 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 text-[10px] font-black rounded uppercase tracking-wider">
+                                        Combo
+                                      </span>
+                                    )}
+                                    {promoActive && (
+                                      <span className="px-1.5 py-0.5 bg-red-600 text-white text-[10px] font-black rounded uppercase tracking-wider">
+                                        PROMO
+                                      </span>
+                                    )}
+                                    {hasStockCase && (
+                                      <span className="px-1.5 py-0.5 bg-amber-100 text-amber-800 border border-amber-300 text-[10px] font-bold rounded">
+                                        Caixa c/{p.caseSize}{!sellsCaseAnywhere ? ' (só estoque)' : ''}
+                                      </span>
+                                    )}
+                                    {p.active === false && (
+                                      <span className="px-1.5 py-0.5 bg-neutral-200 text-neutral-700 border border-neutral-300 text-[10px] font-bold rounded">
+                                        Desativado
+                                      </span>
+                                    )}
+                                    {isProductHiddenFromStore(p.id, settings) && (
+                                      <span className="px-1.5 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 text-[10px] font-bold rounded inline-flex items-center gap-1">
+                                        <Utensils className="w-3 h-3 text-amber-700" />
+                                        <span>Só no balcão/mesa</span>
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="text-[11px] text-neutral-500">
+                                    {isCombo && comboMetrics?.itemsSummaryText
+                                      ? comboMetrics.itemsSummaryText
+                                      : `${p.volume} ${p.isCold ? '• Gelada ❄️' : ''}`}
+                                  </div>
+                                </div>
                               </div>
-                              <div className="text-[11px] text-neutral-500">
-                                {isCombo && comboMetrics?.itemsSummaryText
-                                  ? comboMetrics.itemsSummaryText
-                                  : `${p.volume} ${p.isCold ? '• Gelada ❄️' : ''}`}
-                              </div>
-                            </div>
-                          </div>
-                        </td>
-                        <td className="py-3 px-4">
-                          <span className="font-semibold text-neutral-800 block">
-                            {storeCategoryIdSet.has(p.category)
-                              ? getCategoryDisplayName(p.category, settings, products)
-                              : 'Outros'}
-                          </span>
-                          <span className="text-[10px] font-mono text-neutral-400">{p.sku}</span>
-                        </td>
-                        <td className="py-3 px-4 font-mono text-neutral-600">
-                          {formatCurrency(displayCostPrice)}
-                        </td>
-                        <td className="py-3 px-4 font-mono">
-                          {promoActive ? (
-                            <div>
-                              <span className="text-[10px] text-neutral-400 line-through block">
-                                {formatCurrency(p.price)}
+                            </td>
+                            <td className="py-3 px-4">
+                              <span className="font-semibold text-neutral-800 block">
+                                {storeCategoryIdSet.has(p.category)
+                                  ? getCategoryDisplayName(p.category, settings, products)
+                                  : 'Outros'}
                               </span>
-                              <span className="font-black text-red-600">
-                                {formatCurrency(effectivePrice)}
-                              </span>
-                            </div>
-                          ) : (
-                            <span className="font-bold text-neutral-900">{formatCurrency(p.price)}</span>
-                          )}
-                          {sellsCase && p.casePrice && (
-                            <div className="text-[10px] text-amber-700 font-bold mt-0.5">
-                              Cx c/{p.caseSize}: {formatCurrency(p.casePrice)}
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-3 px-4">
-                          <span className={`font-bold px-1.5 py-0.5 rounded text-[11px] ${
-                            margin >= 30 ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
-                          }`}>
-                            {margin.toFixed(0)}%
-                          </span>
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="flex flex-col gap-0.5">
-                            <div className="flex items-center gap-2">
-                              {isCombo ? (
-                                <span className={`font-black text-sm ${displayStock <= 0 ? 'text-red-600' : 'text-neutral-900'}`}>
-                                  Disponível: {displayStock}
-                                </span>
+                              <span className="text-[10px] font-mono text-neutral-400">{p.sku}</span>
+                            </td>
+                            <td className="py-3 px-4 font-mono text-neutral-600">
+                              {formatCurrency(displayCostPrice)}
+                            </td>
+                            <td className="py-3 px-4 font-mono">
+                              {promoActive ? (
+                                <div>
+                                  <span className="text-[10px] text-neutral-400 line-through block">
+                                    {formatCurrency(p.price)}
+                                  </span>
+                                  <span className="font-black text-red-600">
+                                    {formatCurrency(effectivePrice)}
+                                  </span>
+                                </div>
                               ) : (
-                                <>
-                                  <span className={`font-black text-sm ${isLow ? 'text-red-600' : 'text-neutral-900'}`}>
-                                    {formatStockWithCases(p.stock, p.caseSize)}
-                                  </span>
-                                  {isLow && (
-                                    <span className="px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded">
-                                      Baixo (Min: {p.minStock})
-                                    </span>
-                                  )}
-                                </>
+                                <span className="font-bold text-neutral-900">{formatCurrency(p.price)}</span>
                               )}
-                            </div>
-                          </div>
-                        </td>
-                        <td className="py-3 px-4">
-                          {isCombo ? (
-                            <div className="flex items-center justify-center">
-                              <span className="px-2.5 py-1 rounded-lg bg-neutral-100 border border-neutral-200 text-neutral-500 text-[10px] font-bold">
-                                Estoque dos itens
-                              </span>
-                            </div>
-                          ) : (
-                            <div className="flex flex-col items-center gap-1.5">
-                              {sellsCase && (
-                                <div className="inline-flex bg-neutral-100 p-0.5 rounded-lg border border-neutral-200 text-[10px]">
-                                  <button
-                                    type="button"
-                                    onClick={() => setStockRowUnits(prev => ({ ...prev, [p.id]: 'unit' }))}
-                                    className={`px-2 py-0.5 rounded-md font-bold transition-colors cursor-pointer ${
-                                      rowUnit === 'unit'
-                                        ? 'bg-white text-neutral-900 shadow-2xs'
-                                        : 'text-neutral-500 hover:text-neutral-800'
-                                    }`}
-                                  >
-                                    Unidades
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => setStockRowUnits(prev => ({ ...prev, [p.id]: 'case' }))}
-                                    className={`px-2 py-0.5 rounded-md font-bold transition-colors cursor-pointer ${
-                                      rowUnit === 'case'
-                                        ? 'bg-amber-500 text-neutral-950 shadow-2xs'
-                                        : 'text-neutral-500 hover:text-neutral-800'
-                                    }`}
-                                  >
-                                    Caixas (c/{p.caseSize})
-                                  </button>
+                              {sellsCaseAnywhere && p.casePrice && (
+                                <div className="text-[10px] text-amber-700 font-bold mt-0.5">
+                                  Cx c/{p.caseSize}: {formatCurrency(p.casePrice)}
+                                  {sellsStoreCase && !sellsLocalCase ? ' (Delivery)' : !sellsStoreCase && sellsLocalCase ? ' (Balcão/Mesa)' : ''}
                                 </div>
                               )}
-                              <div className="flex items-center justify-center gap-1">
-                                {rowUnit === 'case' ? (
-                                  <>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleAdjustStock(p.id, -5, 'case')}
-                                      className="px-1.5 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
-                                      title={`Remover 5 caixas (${5 * (p.caseSize || 1)} un)`}
-                                    >
-                                      -5cx
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleAdjustStock(p.id, -1, 'case')}
-                                      className="px-1.5 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
-                                      title={`Remover 1 caixa (${p.caseSize} un)`}
-                                    >
-                                      -1cx
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleAdjustStock(p.id, 1, 'case')}
-                                      className="px-1.5 h-6 bg-amber-100 hover:bg-amber-200 text-amber-900 rounded font-bold text-[10px] cursor-pointer"
-                                      title={`Adicionar 1 caixa (${p.caseSize} un)`}
-                                    >
-                                      +1cx
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleAdjustStock(p.id, 5, 'case')}
-                                      className="px-1.5 h-6 bg-amber-500 hover:bg-amber-600 text-white rounded font-bold text-[10px] cursor-pointer"
-                                      title={`Adicionar 5 caixas (${5 * (p.caseSize || 1)} un)`}
-                                    >
-                                      +5cx
-                                    </button>
-                                  </>
-                                ) : (
-                                  <>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleAdjustStock(p.id, -10, 'unit')}
-                                      className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
-                                    >
-                                      -10
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleAdjustStock(p.id, -1, 'unit')}
-                                      className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-xs cursor-pointer"
-                                    >
-                                      -1
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleAdjustStock(p.id, 1, 'unit')}
-                                      className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-xs cursor-pointer"
-                                    >
-                                      +1
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleAdjustStock(p.id, 10, 'unit')}
-                                      className="w-6 h-6 bg-amber-500 hover:bg-amber-600 text-white rounded font-bold text-[10px] cursor-pointer"
-                                    >
-                                      +10
-                                    </button>
-                                  </>
+                            </td>
+                            <td className="py-3 px-4">
+                              <span className={`font-bold px-1.5 py-0.5 rounded text-[11px] ${
+                                margin >= 30 ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
+                              }`}>
+                                {margin.toFixed(0)}%
+                              </span>
+                            </td>
+                            <td className="py-3 px-4">
+                              <div className="flex flex-col gap-0.5">
+                                <div className="flex items-center gap-2">
+                                  {isCombo ? (
+                                    <span className={`font-black text-sm ${displayStock <= 0 ? 'text-red-600' : 'text-neutral-900'}`}>
+                                      Disponível: {displayStock}
+                                    </span>
+                                  ) : (
+                                    <>
+                                      <span className={`font-black text-sm ${isLow ? 'text-red-600' : 'text-neutral-900'}`}>
+                                        {formatStockWithCases(p.stock, p.caseSize)}
+                                      </span>
+                                      {isLow && (
+                                        <span className="px-1.5 py-0.5 bg-red-100 text-red-700 text-[10px] font-bold rounded">
+                                          Baixo (Min: {p.minStock})
+                                        </span>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+                            </td>
+                            <td className="py-3 px-4">
+                              {isCombo ? (
+                                <div className="flex items-center justify-center">
+                                  <span className="px-2.5 py-1 rounded-lg bg-neutral-100 border border-neutral-200 text-neutral-500 text-[10px] font-bold">
+                                    Estoque dos itens
+                                  </span>
+                                </div>
+                              ) : (
+                                <div className="flex flex-col items-center gap-1.5">
+                                  {isEditingInline ? (
+                                    <div className="flex flex-col gap-1.5 p-2 rounded-xl bg-neutral-100 border border-neutral-300 w-52">
+                                      <div className="flex items-center gap-1">
+                                        <input
+                                          type="number"
+                                          step={1}
+                                          min={0}
+                                          autoFocus
+                                          disabled={inlineStockEdit?.saving}
+                                          value={inlineStockEdit?.value ?? ''}
+                                          onChange={(e) =>
+                                            setInlineStockEdit((prev) =>
+                                              prev ? { ...prev, value: e.target.value } : null
+                                            )
+                                          }
+                                          onKeyDown={(e) => {
+                                            if (e.key === 'Enter') {
+                                              e.preventDefault();
+                                              e.stopPropagation();
+                                              handleSaveInlineStockEdit(p);
+                                            } else if (e.key === 'Escape') {
+                                              e.preventDefault();
+                                              e.stopPropagation();
+                                              setInlineStockEdit(null);
+                                            }
+                                          }}
+                                          placeholder="Estoque (un)"
+                                          className="w-20 px-2 py-1 bg-white border border-neutral-300 rounded-lg text-xs font-black text-neutral-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                                        />
+                                        <select
+                                          disabled={inlineStockEdit?.saving}
+                                          value={inlineStockEdit?.reason || 'ajuste'}
+                                          onChange={(e) =>
+                                            setInlineStockEdit((prev) =>
+                                              prev
+                                                ? { ...prev, reason: e.target.value as StockAdjustReason }
+                                                : null
+                                            )
+                                          }
+                                          onKeyDown={(e) => {
+                                            if (e.key === 'Enter') {
+                                              e.preventDefault();
+                                              e.stopPropagation();
+                                              handleSaveInlineStockEdit(p);
+                                            } else if (e.key === 'Escape') {
+                                              e.preventDefault();
+                                              e.stopPropagation();
+                                              setInlineStockEdit(null);
+                                            }
+                                          }}
+                                          className="flex-1 min-w-0 px-1.5 py-1 bg-white border border-neutral-300 rounded-lg text-[10px] font-bold text-neutral-800 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                                        >
+                                          <option value="ajuste">Ajuste</option>
+                                          <option value="entrada">Entrada de mercadoria</option>
+                                          <option value="perda">Perda/quebra</option>
+                                          <option value="contagem">Contagem</option>
+                                        </select>
+                                      </div>
+                                      <div className="flex items-center justify-end gap-1">
+                                        <button
+                                          type="button"
+                                          disabled={inlineStockEdit?.saving}
+                                          onClick={() => setInlineStockEdit(null)}
+                                          className="px-2 py-0.5 rounded bg-white hover:bg-neutral-200 text-neutral-600 text-[10px] font-bold border border-neutral-200 cursor-pointer"
+                                        >
+                                          Esc
+                                        </button>
+                                        <button
+                                          type="button"
+                                          disabled={inlineStockEdit?.saving}
+                                          onClick={() => handleSaveInlineStockEdit(p)}
+                                          className="px-2.5 py-0.5 rounded bg-amber-500 hover:bg-amber-600 text-neutral-950 text-[10px] font-black cursor-pointer"
+                                        >
+                                          {inlineStockEdit?.saving ? '...' : 'Salvar (Enter)'}
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <>
+                                      {hasStockCase && (
+                                        <div className="inline-flex bg-neutral-100 p-0.5 rounded-lg border border-neutral-200 text-[10px]">
+                                          <button
+                                            type="button"
+                                            onClick={() => setStockRowUnits(prev => ({ ...prev, [p.id]: 'unit' }))}
+                                            className={`px-2 py-0.5 rounded-md font-bold transition-colors cursor-pointer ${
+                                              rowUnit === 'unit'
+                                                ? 'bg-white text-neutral-900 shadow-2xs'
+                                                : 'text-neutral-500 hover:text-neutral-800'
+                                            }`}
+                                          >
+                                            Unidades
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => setStockRowUnits(prev => ({ ...prev, [p.id]: 'case' }))}
+                                            className={`px-2 py-0.5 rounded-md font-bold transition-colors cursor-pointer ${
+                                              rowUnit === 'case'
+                                                ? 'bg-amber-500 text-neutral-950 shadow-2xs'
+                                                : 'text-neutral-500 hover:text-neutral-800'
+                                            }`}
+                                          >
+                                            Caixas (c/{p.caseSize})
+                                          </button>
+                                        </div>
+                                      )}
+                                      <div className="flex items-center justify-center gap-1">
+                                        {rowUnit === 'case' ? (
+                                          <>
+                                            <button
+                                              type="button"
+                                              onClick={() => handleAdjustStock(p.id, -5, 'case')}
+                                              className="px-1.5 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
+                                              title={`Remover 5 caixas (${5 * (p.caseSize || 1)} un)`}
+                                            >
+                                              -5cx
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => handleAdjustStock(p.id, -1, 'case')}
+                                              className="px-1.5 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
+                                              title={`Remover 1 caixa (${p.caseSize} un)`}
+                                            >
+                                              −1cx
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => handleAdjustStock(p.id, 1, 'case')}
+                                              className="px-1.5 h-6 bg-amber-100 hover:bg-amber-200 text-amber-900 rounded font-bold text-[10px] cursor-pointer"
+                                              title={`Adicionar 1 caixa (${p.caseSize} un)`}
+                                            >
+                                              +1cx
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => handleAdjustStock(p.id, 5, 'case')}
+                                              className="px-1.5 h-6 bg-amber-500 hover:bg-amber-600 text-white rounded font-bold text-[10px] cursor-pointer"
+                                              title={`Adicionar 5 caixas (${5 * (p.caseSize || 1)} un)`}
+                                            >
+                                              +5cx
+                                            </button>
+                                          </>
+                                        ) : (
+                                          <>
+                                            <button
+                                              type="button"
+                                              onClick={() => handleAdjustStock(p.id, -10, 'unit')}
+                                              className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-[10px] cursor-pointer"
+                                            >
+                                              −10
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => handleAdjustStock(p.id, -1, 'unit')}
+                                              className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-xs cursor-pointer"
+                                            >
+                                              −1
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => handleAdjustStock(p.id, 1, 'unit')}
+                                              className="w-6 h-6 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 rounded font-bold text-xs cursor-pointer"
+                                            >
+                                              +1
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => handleAdjustStock(p.id, 10, 'unit')}
+                                              className="w-6 h-6 bg-amber-500 hover:bg-amber-600 text-white rounded font-bold text-[10px] cursor-pointer"
+                                            >
+                                              +10
+                                            </button>
+                                          </>
+                                        )}
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setStockInlineErrorByProduct((prev) => {
+                                              if (!prev[p.id]) return prev;
+                                              const next = { ...prev };
+                                              delete next[p.id];
+                                              return next;
+                                            });
+                                            setInlineStockEdit({
+                                              productId: p.id,
+                                              value: String(p.stock),
+                                              reason: 'ajuste',
+                                              saving: false,
+                                            });
+                                          }}
+                                          className="px-2 h-6 bg-neutral-900 hover:bg-neutral-800 text-white rounded font-bold text-[10px] cursor-pointer ml-0.5"
+                                          title="Digitar novo estoque na própria linha (Enter salva, Esc cancela)"
+                                        >
+                                          Digitar
+                                        </button>
+                                      </div>
+                                    </>
+                                  )}
+
+                                  {rowStockError && (
+                                    <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-red-50 border border-red-200 text-red-700 text-[10px] font-bold">
+                                      <span>{rowStockError}</span>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          setStockInlineErrorByProduct((prev) => {
+                                            const next = { ...prev };
+                                            delete next[p.id];
+                                            return next;
+                                          })
+                                        }
+                                        className="hover:text-red-900 cursor-pointer"
+                                      >
+                                        <X className="w-3 h-3" />
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </td>
+                            <td className="py-3 px-4 text-right">
+                              <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                                {!isCombo && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setStockHistoryProductId(p.id);
+                                      setEstoqueSubTab('historico');
+                                      window.scrollTo({ top: 0, behavior: 'smooth' });
+                                    }}
+                                    className="px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 border bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-100 transition-colors cursor-pointer"
+                                    title="Ver histórico de entradas e saídas deste produto"
+                                  >
+                                    <History className="w-3.5 h-3.5 text-amber-600" />
+                                    <span>Histórico</span>
+                                  </button>
                                 )}
+
+                                {(() => {
+                                  const isFeatured = validFeaturedIds.includes(p.id);
+                                  return (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleToggleFeaturedProduct(p.id)}
+                                      className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 border transition-colors cursor-pointer ${
+                                        isFeatured
+                                          ? 'bg-amber-100 text-amber-900 border-amber-300 hover:bg-amber-200'
+                                          : 'bg-white text-neutral-600 border-neutral-200 hover:bg-neutral-100'
+                                      }`}
+                                      title="Mostrar primeiro"
+                                    >
+                                      <ArrowUp
+                                        className={`w-3.5 h-3.5 ${
+                                          isFeatured ? 'text-amber-600' : 'text-neutral-400'
+                                        }`}
+                                      />
+                                      <span>Mostrar primeiro</span>
+                                    </button>
+                                  );
+                                })()}
+
                                 <button
                                   type="button"
-                                  onClick={() =>
-                                    setStockAdjustModal({
-                                      product: p,
-                                      unit: rowUnit,
-                                      mode: 'add',
-                                      quantity: '1',
-                                    })
+                                  onClick={() => handleToggleProductActive(p)}
+                                  className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 border transition-colors cursor-pointer ${
+                                    p.active !== false
+                                      ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                                      : 'bg-neutral-100 text-neutral-600 border-neutral-300 hover:bg-neutral-200'
+                                  }`}
+                                  title={
+                                    p.active !== false
+                                      ? 'Ativo em todo lugar (clique para desativar)'
+                                      : 'Desativado em todo lugar (clique para ativar)'
                                   }
-                                  className="px-2 h-6 bg-neutral-900 hover:bg-neutral-800 text-white rounded font-bold text-[10px] cursor-pointer ml-0.5"
-                                  title="Digitar quantidade personalizada em unidades ou caixas"
                                 >
-                                  Digitar
+                                  {p.active !== false ? (
+                                    <>
+                                      <Eye className="w-3.5 h-3.5 text-emerald-600" />
+                                      <span>Ativo</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <EyeOff className="w-3.5 h-3.5 text-neutral-500" />
+                                      <span>Desativado</span>
+                                    </>
+                                  )}
+                                </button>
+
+                                {(() => {
+                                  const isHiddenFromDelivery = isProductHiddenFromStore(p.id, settings);
+                                  return (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleToggleProductDeliveryVisibility(p.id)}
+                                      className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 border transition-colors cursor-pointer ${
+                                        !isHiddenFromDelivery
+                                          ? 'bg-sky-50 text-sky-800 border-sky-200 hover:bg-sky-100'
+                                          : 'bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100'
+                                      }`}
+                                      title={
+                                        !isHiddenFromDelivery
+                                          ? 'Aparece no delivery / loja online (clique para ocultar do delivery)'
+                                          : 'Só no balcão/mesa (clique para ativar no delivery)'
+                                      }
+                                    >
+                                      {!isHiddenFromDelivery ? (
+                                        <>
+                                          <Truck className="w-3.5 h-3.5 text-sky-600" />
+                                          <span>Aparece no delivery</span>
+                                        </>
+                                      ) : (
+                                        <>
+                                          <Utensils className="w-3.5 h-3.5 text-amber-700" />
+                                          <span>Só no balcão/mesa</span>
+                                        </>
+                                      )}
+                                    </button>
+                                  );
+                                })()}
+
+                                {!isCombo && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDuplicateProduct(p)}
+                                    className="px-2 py-1 text-neutral-600 hover:text-neutral-900 bg-white hover:bg-neutral-100 border border-neutral-200 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 transition-colors cursor-pointer"
+                                    title="Duplicar produto"
+                                  >
+                                    <Copy className="w-3.5 h-3.5 text-neutral-500" />
+                                    <span>Duplicar</span>
+                                  </button>
+                                )}
+
+                                <button
+                                  onClick={() => handleOpenEditProduct(p)}
+                                  className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 rounded-lg transition-colors"
+                                  title={isCombo ? 'Editar combo' : 'Editar produto'}
+                                >
+                                  <Edit2 className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteProduct(p.id)}
+                                  className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                                  title={isCombo ? 'Excluir combo' : 'Excluir produto'}
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
                                 </button>
                               </div>
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-right">
-                          <div className="flex items-center justify-end gap-1.5 flex-wrap">
-                            {(() => {
-                              const isFeatured = validFeaturedIds.includes(p.id);
-                              return (
-                                <button
-                                  type="button"
-                                  onClick={() => handleToggleFeaturedProduct(p.id)}
-                                  className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 border transition-colors cursor-pointer ${
-                                    isFeatured
-                                      ? 'bg-amber-100 text-amber-900 border-amber-300 hover:bg-amber-200'
-                                      : 'bg-white text-neutral-600 border-neutral-200 hover:bg-neutral-100'
-                                  }`}
-                                  title="Mostrar primeiro"
-                                >
-                                  <ArrowUp
-                                    className={`w-3.5 h-3.5 ${
-                                      isFeatured ? 'text-amber-600' : 'text-neutral-400'
-                                    }`}
-                                  />
-                                  <span>Mostrar primeiro</span>
-                                </button>
-                              );
-                            })()}
-
-                            <button
-                              type="button"
-                              onClick={() => handleToggleProductActive(p)}
-                              className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 border transition-colors cursor-pointer ${
-                                p.active !== false
-                                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
-                                  : 'bg-neutral-100 text-neutral-600 border-neutral-300 hover:bg-neutral-200'
-                              }`}
-                              title={p.active !== false ? 'Produto visível na loja (clique para ocultar)' : 'Produto oculto da loja (clique para mostrar)'}
-                            >
-                              {p.active !== false ? (
-                                <>
-                                  <Eye className="w-3.5 h-3.5 text-emerald-600" />
-                                  <span>Mostrar na loja</span>
-                                </>
-                              ) : (
-                                <>
-                                  <EyeOff className="w-3.5 h-3.5 text-neutral-500" />
-                                  <span>Oculto da loja</span>
-                                </>
-                              )}
-                            </button>
-
-                            {!isCombo && (
-                              <button
-                                type="button"
-                                onClick={() => handleDuplicateProduct(p)}
-                                className="px-2 py-1 text-neutral-600 hover:text-neutral-900 bg-white hover:bg-neutral-100 border border-neutral-200 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 transition-colors cursor-pointer"
-                                title="Duplicar produto"
-                              >
-                                <Copy className="w-3.5 h-3.5 text-neutral-500" />
-                                <span>Duplicar</span>
-                              </button>
-                            )}
-
-                            <button
-                              onClick={() => handleOpenEditProduct(p)}
-                              className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 rounded-lg transition-colors"
-                              title={isCombo ? 'Editar combo' : 'Editar produto'}
-                            >
-                              <Edit2 className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={() => handleDeleteProduct(p.id)}
-                              className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                              title={isCombo ? 'Excluir combo' : 'Excluir produto'}
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-              </table>
-            </div>
-          </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          )}
         </div>
       )}
 
@@ -3740,22 +4205,37 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   className="w-full pl-9 pr-3 py-2.5 bg-white border border-neutral-200 rounded-xl text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
                 />
               </div>
+            </div>
 
-              <select
-                value={posCategory}
-                onChange={(e) => setPosCategory(e.target.value as ProductCategory | 'todas')}
-                className="px-3 py-2.5 bg-white border border-neutral-200 rounded-xl text-xs font-bold"
-              >
-                <option value="todas">Todas Categorias</option>
-                {storeCategories.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
+            {/* PDV Category Filter Row: flex-wrap on desktop, horizontal scroll with right fade/chevron on mobile */}
+            <div className="relative">
+              <div className="flex items-center gap-1.5 overflow-x-auto sm:flex-wrap sm:overflow-visible pb-1.5 pr-8 sm:pr-0 scrollbar-none">
+                {[
+                  { id: 'todas', label: 'Todas Categorias' },
+                  ...storeCategories
+                    .filter((c) => products.some((p) => p.active !== false && p.category === c.id))
+                    .map((c) => ({ id: c.id, label: c.name })),
+                  ...(products.some((p) => p.active !== false && !storeCategoryIdSet.has(p.category))
+                    ? [{ id: 'outros', label: 'Outros' }]
+                    : []),
+                ].map((cat) => (
+                  <button
+                    key={`pdv-cat-${cat.id}`}
+                    type="button"
+                    onClick={() => setPosCategory(cat.id as ProductCategory | 'todas')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                      posCategory === cat.id
+                        ? 'bg-neutral-900 text-white'
+                        : 'bg-white text-neutral-600 hover:bg-neutral-100 border border-neutral-200'
+                    }`}
+                  >
+                    {cat.label}
+                  </button>
                 ))}
-                {hasUnlistedCategoryProducts && (
-                  <option value="outros">Outros</option>
-                )}
-              </select>
+              </div>
+              <div className="pointer-events-none sm:hidden absolute right-0 top-0 bottom-1.5 w-8 bg-gradient-to-l from-neutral-100 via-neutral-100/90 to-transparent flex items-center justify-end pr-1">
+                <span className="text-xs font-black text-neutral-500">›</span>
+              </div>
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 sm:gap-3 max-h-[600px] overflow-y-auto pr-1">
@@ -3768,6 +4248,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               ) : (
                 sortProductsForStore(
                   products.filter((p) => {
+                    if (p.active === false) return false;
                     if (posCategory === 'outros') {
                       if (storeCategoryIdSet.has(p.category)) return false;
                     } else if (posCategory !== 'todas' && p.category !== posCategory) {
@@ -3788,7 +4269,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 ).map(product => {
                     const isCombo = isComboProduct(product.id, settings);
                     const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
-                    const sellsCase = !isCombo && hasProductCase(product);
+                    const sellsCase = !isCombo && canSellProductCase(product, settings, 'local');
                     const hasCaseStock = sellsCase && product.stock >= (product.caseSize || 2);
                     const selectedUnit: SaleUnit =
                       sellsCase && posSelectedUnits[product.id] === 'case' && hasCaseStock ? 'case' : 'unit';
@@ -3952,7 +4433,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   </div>
                 ) : (
                   posCart.map(item => {
-                    const isCase = item.saleUnit === 'case' && hasProductCase(item.product);
+                    const isCase = item.saleUnit === 'case' && canSellProductCase(item.product, settings, 'local');
                     const effPrice = getPosItemPrice(item.product, item.saleUnit, item.addonsTotal || 0);
                     return (
                       <div key={item.lineId} className="flex items-start justify-between gap-2 p-2 bg-neutral-50 rounded-xl text-xs">
@@ -4946,131 +5427,202 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </div>
               </div>
 
-              {/* Vende Caixa Fechada (Engradado) */}
+              {/* Caixa para Entrada de Estoque vs. Vender Caixa Fechada */}
               <div className="p-3.5 rounded-2xl bg-amber-50/60 border border-amber-200 space-y-3">
-                <label className="flex items-center justify-between cursor-pointer">
-                  <div>
-                    <span className="font-black text-neutral-900 text-xs block">📦 Vende caixa fechada?</span>
-                    <span className="text-[10px] text-neutral-500">
-                      Permite vender fardo/engradado com preço próprio e dar entrada por caixas
-                    </span>
-                  </div>
-                  <input
-                    type="checkbox"
-                    checked={productForm.sellsCase}
-                    onChange={(e) =>
-                      setProductForm({
-                        ...productForm,
-                        sellsCase: e.target.checked,
-                        caseSize: productForm.caseSize >= 2 ? productForm.caseSize : 12,
-                        casePrice:
-                          productForm.casePrice > 0
-                            ? productForm.casePrice
-                            : Math.round((productForm.price || 0) * (productForm.caseSize >= 2 ? productForm.caseSize : 12) * 100) / 100,
-                      })
-                    }
-                    className="w-4 h-4 rounded text-amber-500 focus:ring-amber-500"
-                  />
-                </label>
-
-                {productForm.sellsCase && (
-                  <div className="pt-2 border-t border-amber-200/80 space-y-2.5">
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="font-bold text-neutral-700 block mb-1">
-                          Unidades por caixa (2 a 100) *
-                        </label>
-                        <input
-                          type="number"
-                          min={2}
-                          max={100}
-                          step={1}
-                          required={productForm.sellsCase}
-                          value={productForm.caseSize}
-                          onChange={(e) =>
-                            setProductForm({
-                              ...productForm,
-                              caseSize: parseInt(e.target.value, 10) || 0,
-                            })
-                          }
-                          className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl font-bold text-neutral-900"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="font-bold text-neutral-700 block mb-1">
-                          Preço da caixa (R$) *
-                        </label>
-                        <input
-                          type="number"
-                          step="0.01"
-                          min="0"
-                          required={productForm.sellsCase}
-                          value={productForm.casePrice}
-                          onChange={(e) =>
-                            setProductForm({
-                              ...productForm,
-                              casePrice: parseFloat(e.target.value) || 0,
-                            })
-                          }
-                          className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl font-bold text-neutral-900"
-                        />
-                      </div>
-                    </div>
-
-                    {productForm.caseSize >= 2 && productForm.casePrice > 0 && (
-                      <div className="p-2.5 rounded-xl bg-white border border-amber-200 text-[11px] flex flex-col gap-0.5">
-                        {(() => {
-                          const unitInCase = productForm.casePrice / productForm.caseSize;
-                          const looseTotal = (productForm.price || 0) * productForm.caseSize;
-                          const savingsCase = looseTotal - productForm.casePrice;
-                          const savingsUnit = (productForm.price || 0) - unitInCase;
-                          return (
-                            <>
-                              <div className="font-bold text-neutral-800">
-                                Na caixa, cada unidade sai por{' '}
-                                <span className="text-amber-700 font-black">{formatCurrency(unitInCase)}</span>
-                              </div>
-                              {savingsCase > 0.009 ? (
-                                <div className="text-emerald-700 font-semibold">
-                                  Economia de <strong>{formatCurrency(savingsUnit)}/un</strong> ({formatCurrency(savingsCase)} na caixa em relação à unidade avulsa)
-                                </div>
-                              ) : savingsCase < -0.009 ? (
-                                <div className="text-amber-700 font-semibold">
-                                  Atenção: o preço da caixa está maior que {productForm.caseSize} unidades avulsas ({formatCurrency(looseTotal)})
-                                </div>
-                              ) : (
-                                <div className="text-neutral-500">
-                                  Mesmo valor unitário da venda avulsa ({formatCurrency(looseTotal)} em {productForm.caseSize} un)
-                                </div>
-                              )}
-                            </>
-                          );
-                        })()}
-                      </div>
+                <div>
+                  <label className="font-black text-neutral-900 text-xs block mb-1">
+                    📦 Unidades por caixa (para entrada de estoque)
+                  </label>
+                  <p className="text-[10px] text-neutral-500 mb-1.5">
+                    Opcional (2 a 100). Libera os botões +1cx / −1cx no Estoque mesmo sem vender caixa fechada ao cliente.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={2}
+                      max={100}
+                      step={1}
+                      placeholder="Ex: 12, 15, 24 (deixe vazio se não usar caixa)"
+                      value={productForm.caseSize > 0 ? productForm.caseSize : ''}
+                      onChange={(e) => {
+                        const raw = e.target.value.trim();
+                        const parsed = raw === '' ? 0 : parseInt(raw, 10) || 0;
+                        setProductForm({
+                          ...productForm,
+                          caseSize: parsed,
+                          ...(parsed === 0 ? { sellsCase: false } : {}),
+                        });
+                      }}
+                      className="w-full sm:w-64 px-3 py-2 bg-white border border-amber-300 rounded-xl font-bold text-neutral-900"
+                    />
+                    {productForm.caseSize > 0 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setProductForm({
+                            ...productForm,
+                            caseSize: 0,
+                            sellsCase: false,
+                            casePrice: 0,
+                          })
+                        }
+                        className="px-2.5 py-2 rounded-xl bg-white hover:bg-neutral-100 text-neutral-600 border border-neutral-300 text-[11px] font-bold cursor-pointer"
+                      >
+                        Limpar
+                      </button>
                     )}
                   </div>
-                )}
+                </div>
+
+                <div className="pt-2.5 border-t border-amber-200/80 space-y-2.5">
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <div>
+                      <span className="font-black text-neutral-900 text-xs block">
+                        Vender caixa fechada
+                      </span>
+                      <span className="text-[10px] text-neutral-500">
+                        Habilita a venda do fardo/engradado fechado com preço próprio nos canais escolhidos
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={productForm.sellsCase}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        const nextSize = productForm.caseSize >= 2 ? productForm.caseSize : 12;
+                        setProductForm({
+                          ...productForm,
+                          sellsCase: checked,
+                          caseSize: checked ? nextSize : productForm.caseSize,
+                          casePrice:
+                            checked && productForm.casePrice <= 0
+                              ? Math.round((productForm.price || 0) * nextSize * 100) / 100
+                              : productForm.casePrice,
+                        });
+                      }}
+                      className="w-4 h-4 rounded text-amber-500 focus:ring-amber-500"
+                    />
+                  </label>
+
+                  {productForm.sellsCase && (
+                    <div className="space-y-2.5 pt-1">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                          <label className="font-bold text-neutral-700 block mb-1">
+                            Preço da caixa fechada (R$) *
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            required={productForm.sellsCase}
+                            value={productForm.casePrice}
+                            onChange={(e) =>
+                              setProductForm({
+                                ...productForm,
+                                casePrice: parseFloat(e.target.value) || 0,
+                              })
+                            }
+                            className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl font-bold text-neutral-900"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="font-bold text-neutral-700 block mb-1">
+                            Onde vender a caixa fechada
+                          </label>
+                          <div className="flex flex-wrap items-center gap-3 px-3 py-2 bg-white border border-amber-300 rounded-xl">
+                            <label className="inline-flex items-center gap-1.5 font-bold text-neutral-800 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={productForm.caseChannelStore}
+                                onChange={(e) =>
+                                  setProductForm({
+                                    ...productForm,
+                                    caseChannelStore: e.target.checked,
+                                  })
+                                }
+                                className="w-4 h-4 rounded text-amber-500 focus:ring-amber-500"
+                              />
+                              <span>Delivery</span>
+                            </label>
+                            <label className="inline-flex items-center gap-1.5 font-bold text-neutral-800 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={productForm.caseChannelLocal}
+                                onChange={(e) =>
+                                  setProductForm({
+                                    ...productForm,
+                                    caseChannelLocal: e.target.checked,
+                                  })
+                                }
+                                className="w-4 h-4 rounded text-amber-500 focus:ring-amber-500"
+                              />
+                              <span>Balcão/Mesa</span>
+                            </label>
+                          </div>
+                        </div>
+                      </div>
+
+                      {productForm.caseSize >= 2 && productForm.casePrice > 0 && (
+                        <div className="p-2.5 rounded-xl bg-white border border-amber-200 text-[11px] flex flex-col gap-0.5">
+                          {(() => {
+                            const unitInCase = productForm.casePrice / productForm.caseSize;
+                            const looseTotal = (productForm.price || 0) * productForm.caseSize;
+                            const savingsCase = looseTotal - productForm.casePrice;
+                            const savingsUnit = (productForm.price || 0) - unitInCase;
+                            return (
+                              <>
+                                <div className="font-bold text-neutral-800">
+                                  Na caixa, cada unidade sai por{' '}
+                                  <span className="text-amber-700 font-black">{formatCurrency(unitInCase)}</span>
+                                </div>
+                                {savingsCase > 0.009 ? (
+                                  <div className="text-emerald-700 font-semibold">
+                                    Economia de <strong>{formatCurrency(savingsUnit)}/un</strong> ({formatCurrency(savingsCase)} na caixa em relação à unidade avulsa)
+                                  </div>
+                                ) : savingsCase < -0.009 ? (
+                                  <div className="text-amber-700 font-semibold">
+                                    Atenção: o preço da caixa está maior que {productForm.caseSize} unidades avulsas ({formatCurrency(looseTotal)})
+                                  </div>
+                                ) : (
+                                  <div className="text-neutral-500">
+                                    Mesmo valor unitário da venda avulsa ({formatCurrency(looseTotal)} em {productForm.caseSize} un)
+                                  </div>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="font-bold text-neutral-700 block mb-1">
-                    {editingProduct ? 'Estoque Atual (Real do Banco)' : 'Estoque Inicial (em unidades) *'}
+                    {editingProduct ? 'Estoque Atual (em unidades) *' : 'Estoque Inicial (em unidades) *'}
                   </label>
-                  {editingProduct ? (
-                    <div className="px-3 py-2 bg-neutral-100 border border-neutral-300 rounded-xl font-bold text-neutral-800 flex items-center justify-between">
-                      <span>{formatStockWithCases(editingProduct.stock, productForm.sellsCase ? productForm.caseSize : editingProduct.caseSize)}</span>
-                      <span className="text-[10px] text-neutral-500 font-normal">Ajuste na aba Estoque</span>
-                    </div>
-                  ) : (
-                    <input
-                      type="number"
-                      required
-                      value={productForm.stock}
-                      onChange={(e) => setProductForm({ ...productForm, stock: parseInt(e.target.value, 10) || 0 })}
-                      className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-bold"
-                    />
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    required
+                    value={productForm.stock}
+                    onChange={(e) =>
+                      setProductForm({
+                        ...productForm,
+                        stock: Math.max(0, parseInt(e.target.value, 10) || 0),
+                      })
+                    }
+                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-bold"
+                  />
+                  {productForm.caseSize >= 2 && (
+                    <span className="text-[10px] text-neutral-500 block mt-0.5">
+                      Equivale a: {formatStockWithCases(productForm.stock, productForm.caseSize)}
+                    </span>
                   )}
                 </div>
 
@@ -5097,7 +5649,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   />
                 </div>
 
-                <div className="flex flex-col gap-2 pt-4">
+                <div className="flex flex-col gap-2 pt-2">
                   <label className="flex items-center gap-2 cursor-pointer font-bold text-neutral-800">
                     <input
                       type="checkbox"
@@ -5114,7 +5666,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       onChange={(e) => setProductForm({ ...productForm, active: e.target.checked })}
                       className="w-4 h-4 rounded text-emerald-600 focus:ring-emerald-500"
                     />
-                    <span>{productForm.active !== false ? '👁️ Mostrar na loja' : '🚫 Oculto da loja'}</span>
+                    <span>{productForm.active !== false ? '✅ Ativo' : '🚫 Desativado'}</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer font-bold text-neutral-800">
+                    <input
+                      type="checkbox"
+                      checked={productForm.appearsInDelivery !== false}
+                      onChange={(e) => setProductForm({ ...productForm, appearsInDelivery: e.target.checked })}
+                      className="w-4 h-4 rounded text-sky-600 focus:ring-sky-500"
+                    />
+                    <span>
+                      {productForm.appearsInDelivery !== false
+                        ? '🛵 Aparece no delivery'
+                        : '🍻 Aparece no delivery (Só no balcão/mesa)'}
+                    </span>
                   </label>
                 </div>
               </div>

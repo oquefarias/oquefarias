@@ -39,6 +39,9 @@ import {
   isComboProduct,
   calculateComboMetrics,
   formatComboComponentProductName,
+  canSellProductCase,
+  StockMovement,
+  StockMovementsResponse,
 } from '../types/index.js';
 
 dotenv.config();
@@ -570,7 +573,6 @@ function parseProductCaseFields(body: any): { error?: string; caseSize: number |
   }
 
   const sizeNum = Number(rawSize);
-  const priceNum = Number(rawPrice);
 
   if (!Number.isInteger(sizeNum) || sizeNum < 2 || sizeNum > 100) {
     return {
@@ -580,6 +582,14 @@ function parseProductCaseFields(body: any): { error?: string; caseSize: number |
     };
   }
 
+  if (!hasPrice) {
+    return {
+      caseSize: sizeNum,
+      casePrice: null,
+    };
+  }
+
+  const priceNum = Number(rawPrice);
   if (Number.isNaN(priceNum) || priceNum <= 0) {
     return {
       error: 'O preço da caixa fechada deve ser maior que zero.',
@@ -637,11 +647,13 @@ function productToDB(p: Product) {
 function productFromDB(row: any): Product {
   const rawCaseSize = row.case_size !== null && row.case_size !== undefined ? Number(row.case_size) : null;
   const rawCasePrice = row.case_price !== null && row.case_price !== undefined ? Number(row.case_price) : null;
-  const hasValidCase =
+  const hasValidCaseSize =
     rawCaseSize !== null &&
     Number.isInteger(rawCaseSize) &&
     rawCaseSize >= 2 &&
-    rawCaseSize <= 100 &&
+    rawCaseSize <= 100;
+  const hasValidCasePrice =
+    hasValidCaseSize &&
     rawCasePrice !== null &&
     rawCasePrice > 0;
 
@@ -656,8 +668,8 @@ function productFromDB(row: any): Product {
         ? Number(row.promo_price)
         : null,
     promoEndsAt: row.promo_ends_at ? String(row.promo_ends_at) : null,
-    caseSize: hasValidCase ? rawCaseSize : null,
-    casePrice: hasValidCase ? rawCasePrice : null,
+    caseSize: hasValidCaseSize ? rawCaseSize : null,
+    casePrice: hasValidCasePrice ? rawCasePrice : null,
     costPrice: Number(row.cost_price || 0),
     stock: Number(row.stock || 0),
     minStock: row.min_stock !== null && row.min_stock !== undefined ? Number(row.min_stock) : 10,
@@ -1417,6 +1429,45 @@ function sanitizePublicSettings(settings: StoreSettings): StoreSettings {
   }
   clean.combos = sanitizedCombos;
 
+  // Validate hiddenFromStoreIds (array of unique non-empty strings, max 2000 items, max 100 chars each)
+  if (Array.isArray((settings as any)?.hiddenFromStoreIds)) {
+    const seenHiddenIds = new Set<string>();
+    const validHiddenIds: string[] = [];
+    for (const rawId of (settings as any).hiddenFromStoreIds) {
+      if (typeof rawId === 'string') {
+        const trimmed = rawId.trim();
+        if (trimmed.length > 0 && trimmed.length <= 100 && !seenHiddenIds.has(trimmed)) {
+          seenHiddenIds.add(trimmed);
+          validHiddenIds.push(trimmed);
+          if (validHiddenIds.length >= 2000) break;
+        }
+      }
+    }
+    clean.hiddenFromStoreIds = validHiddenIds;
+  } else {
+    clean.hiddenFromStoreIds = [];
+  }
+
+  // Validate caseSaleChannels: { [productId]: { store: boolean, local: boolean } } (max 2000 items)
+  const rawCaseChannels = (settings as any)?.caseSaleChannels;
+  const sanitizedCaseChannels: Record<string, { store: boolean; local: boolean }> = {};
+  if (rawCaseChannels && typeof rawCaseChannels === 'object' && !Array.isArray(rawCaseChannels)) {
+    let channelCount = 0;
+    for (const [rawPid, rawCfg] of Object.entries(rawCaseChannels)) {
+      if (channelCount >= 2000) break;
+      const pid = String(rawPid || '').trim().slice(0, 100);
+      if (!pid || !rawCfg || typeof rawCfg !== 'object' || Array.isArray(rawCfg)) continue;
+      const storeFlag = (rawCfg as any).store !== false;
+      const localFlag = (rawCfg as any).local !== false;
+      sanitizedCaseChannels[pid] = {
+        store: Boolean(storeFlag),
+        local: Boolean(localFlag),
+      };
+      channelCount++;
+    }
+  }
+  clean.caseSaleChannels = sanitizedCaseChannels;
+
   return clean;
 }
 
@@ -1523,16 +1574,28 @@ function applyCombosStockAndCost(products: Product[], settings: StoreSettings): 
   });
 }
 
-function extractOrderStockItems(order: Order): { id: string; qty: number }[] {
+function extractOrderStockItems(
+  order: Order,
+  opts?: { reason?: string; refType?: string; refId?: string }
+): { id: string; qty: number; reason?: string; refType?: string; refId?: string; note?: string }[] {
   const unitsMap = new Map<string, number>();
+  const comboNamesByProduct = new Map<string, Set<string>>();
+  const channelLabel =
+    order.source === 'balcao' ? 'Balcão' : order.source === 'mesa' ? 'Mesa' : 'Delivery';
+
   for (const it of order.items || []) {
     const itemQty = Math.max(1, Math.floor(Number(it.quantity) || 1));
     if (Array.isArray(it.comboItems) && it.comboItems.length > 0) {
+      const comboTitle = String(it.name || 'Combo').trim();
       for (const ci of it.comboItems) {
         const compId = String(ci?.productId || '').trim();
         const compQty = Math.max(1, Math.floor(Number(ci?.quantity) || 1));
         if (compId) {
           unitsMap.set(compId, (unitsMap.get(compId) || 0) + itemQty * compQty);
+          if (!comboNamesByProduct.has(compId)) {
+            comboNamesByProduct.set(compId, new Set<string>());
+          }
+          comboNamesByProduct.get(compId)!.add(comboTitle);
         }
       }
     } else if (it.productId) {
@@ -1541,7 +1604,22 @@ function extractOrderStockItems(order: Order): { id: string; qty: number }[] {
       unitsMap.set(it.productId, (unitsMap.get(it.productId) || 0) + itemQty * unitsPerSale);
     }
   }
-  return Array.from(unitsMap.entries()).map(([id, qty]) => ({ id, qty }));
+  return Array.from(unitsMap.entries()).map(([id, qty]) => {
+    const combos = comboNamesByProduct.get(id);
+    const comboSuffix =
+      combos && combos.size > 0
+        ? `Combo: ${Array.from(combos).join(', ')}`
+        : '';
+    const note = comboSuffix ? `${channelLabel} — ${comboSuffix}` : channelLabel;
+    return {
+      id,
+      qty,
+      ...(opts?.reason ? { reason: opts.reason } : {}),
+      ...(opts?.refType ? { refType: opts.refType } : {}),
+      ...(opts?.refId ? { refId: opts.refId } : {}),
+      note,
+    };
+  });
 }
 
 function reconcileSettingsCategoriesAndOrders(
@@ -1550,6 +1628,41 @@ function reconcileSettingsCategoriesAndOrders(
 ): { settings: StoreSettings; changed: boolean } {
   let changed = false;
   const currentCategories = settings.categories || [];
+
+  const existingProdIdSet = new Set<string>();
+  let hasProductIds = false;
+  if (Array.isArray(products)) {
+    for (const p of products) {
+      if (p && typeof p.id === 'string' && p.id.trim()) {
+        existingProdIdSet.add(p.id.trim());
+        hasProductIds = true;
+      }
+    }
+  }
+
+  if (hasProductIds && Array.isArray(settings.hiddenFromStoreIds) && settings.hiddenFromStoreIds.length > 0) {
+    const filteredHidden = settings.hiddenFromStoreIds.filter((id) => existingProdIdSet.has(id));
+    if (filteredHidden.length !== settings.hiddenFromStoreIds.length) {
+      settings.hiddenFromStoreIds = filteredHidden;
+      changed = true;
+    }
+  }
+
+  if (hasProductIds && settings.caseSaleChannels && typeof settings.caseSaleChannels === 'object') {
+    const nextChannels: Record<string, { store: boolean; local: boolean }> = {};
+    let removedAny = false;
+    for (const [pid, cfg] of Object.entries(settings.caseSaleChannels)) {
+      if (existingProdIdSet.has(pid)) {
+        nextChannels[pid] = cfg;
+      } else {
+        removedAny = true;
+      }
+    }
+    if (removedAny) {
+      settings.caseSaleChannels = nextChannels;
+      changed = true;
+    }
+  }
 
   if (currentCategories.length === 0) {
     settings.categories = buildInitialCategoriesFromProducts(products as any);
@@ -1772,6 +1885,23 @@ function tableTabItemFromDB(row: any): TableTabItem {
     row.units_per_sale !== null && row.units_per_sale !== undefined && Number(row.units_per_sale) > 0
       ? Number(row.units_per_sale)
       : 1;
+  let comboItems: OrderItemComboComponent[] | undefined = undefined;
+  if (Array.isArray(row.combo_items) && row.combo_items.length > 0) {
+    const parsedComboItems: OrderItemComboComponent[] = [];
+    for (const ci of row.combo_items) {
+      if (ci && typeof ci === 'object') {
+        const pid = String((ci as any).productId || '').trim();
+        const cname = String((ci as any).name || '').trim();
+        const cqty = Math.max(1, Math.floor(Number((ci as any).quantity) || 1));
+        if (pid && cname) {
+          parsedComboItems.push({ productId: pid, name: cname, quantity: cqty });
+        }
+      }
+    }
+    if (parsedComboItems.length > 0) {
+      comboItems = parsedComboItems;
+    }
+  }
   return {
     id: String(row.id),
     tabId: String(row.tab_id),
@@ -1781,6 +1911,7 @@ function tableTabItemFromDB(row: any): TableTabItem {
     quantity: Number(row.quantity || 1),
     saleUnit,
     unitsPerSale,
+    ...(comboItems ? { comboItems } : {}),
     notes: row.notes || null,
     status: (row.status as 'active' | 'cancelled') || 'active',
     addedAt: row.added_at || new Date().toISOString(),
@@ -1792,6 +1923,7 @@ function translateTabRpcError(message: string): string {
   if (!message) return 'Erro ao processar operação da comanda.';
   if (message.includes('QUANTIDADE_INVALIDA')) return 'Quantidade inválida.';
   if (message.includes('COMANDA_NAO_ABERTA')) return 'A comanda não está aberta.';
+  if (message.includes('COMBO_INVALIDO')) return 'Combo com itens inválidos';
   if (message.includes('ESTOQUE_INSUFICIENTE')) return 'Estoque insuficiente para este produto.';
   if (message.includes('ITEM_INVALIDO')) return 'Item não encontrado ou já cancelado.';
   if (message.includes('MESMA_COMANDA')) return 'Não é possível transferir ou juntar para a mesma comanda.';
@@ -2731,7 +2863,7 @@ export function createApp(): express.Express {
           const sp = dbProds.find((p) => p.id === (it.productId || it.id));
           if (sp && sp.active) {
             const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
-            const isCase = it.saleUnit === 'case' && sp.caseSize && sp.caseSize >= 2 && sp.casePrice && sp.casePrice > 0;
+            const isCase = it.saleUnit === 'case' && canSellProductCase(sp, dbSettings, 'store');
             const baseUnitPrice = isCase ? Number(sp.casePrice) : getEffectivePrice(sp);
             const addonCalc = validateAndCalculateItemAddons(sp, it.addons, dbSettings);
             const unitPrice = Math.round((baseUnitPrice + (addonCalc.error ? 0 : addonCalc.addonsTotal)) * 100) / 100;
@@ -3052,8 +3184,19 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
+    const { data: existingRow, error: existingErr } = await supabase
+      .from('products')
+      .select('id, stock')
+      .eq('id', product.id)
+      .maybeSingle();
+    if (existingErr) {
+      return res.status(500).json({ error: existingErr.message });
+    }
+
+    const requestedStock = Math.max(0, Math.trunc(Number(product.stock) || 0));
     const normalizedProduct: Product = {
       ...product,
+      stock: existingRow ? Number(existingRow.stock || 0) : 0,
       caseSize: parsedCase.caseSize,
       casePrice: parsedCase.casePrice,
     };
@@ -3079,7 +3222,27 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: settingsErr.message });
     }
     const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
-    if (isComboProduct(savedProduct.id, dbSettings)) {
+    const isCombo = isComboProduct(savedProduct.id, dbSettings);
+
+    if (!isCombo && requestedStock !== Number(savedProduct.stock || 0)) {
+      const { data: newStockVal, error: adjErr } = await supabase.rpc('adjust_stock', {
+        p_product_id: savedProduct.id,
+        p_mode: 'set',
+        p_value: requestedStock,
+        p_reason: existingRow ? 'ajuste' : 'entrada',
+        p_note: existingRow ? null : 'Estoque inicial no cadastro',
+      });
+      if (adjErr) {
+        console.error('[RPC Error] adjust_stock in POST /products:', adjErr.message);
+        if (String(adjErr.message || '').includes('ESTOQUE_NEGATIVO')) {
+          return res.status(400).json({ error: 'O estoque não pode ficar negativo' });
+        }
+        return res.status(500).json({ error: adjErr.message });
+      }
+      savedProduct.stock = Number(newStockVal ?? requestedStock);
+    }
+
+    if (isCombo) {
       const { data: allRows, error: allErr } = await supabase.from('products').select('*');
       if (allErr) return res.status(500).json({ error: allErr.message });
       const withCombos = applyCombosStockAndCost((allRows || []).map(productFromDB), dbSettings);
@@ -3090,8 +3253,7 @@ export function createApp(): express.Express {
     res.status(201).json(savedProduct);
   });
 
-  // Requirement: Em PUT /api/products/:id NUNCA altere a coluna stock (ignore stock do corpo)
-  // e não apague a promoção sem querer (só altera promo_price e promo_ends_at se esses campos vierem explicitamente no corpo)
+  // Requirement: Em PUT /api/products/:id não grava stock direto em products: se mudou, chama adjust_stock com mode='set', reason='ajuste'
   router.put('/products/:id', requireAdmin, async (req, res) => {
     const { id } = req.params;
     const supabase = getSupabase();
@@ -3101,6 +3263,40 @@ export function createApp(): express.Express {
     const parsedCase = parseProductCaseFields(body);
     if (parsedCase.error) {
       return res.status(400).json({ error: parsedCase.error });
+    }
+
+    const [{ data: existingRow, error: fetchExistErr }, { data: settingsRow, error: settingsErr }] =
+      await Promise.all([
+        supabase.from('products').select('*').eq('id', id).maybeSingle(),
+        supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+      ]);
+
+    if (fetchExistErr) {
+      return res.status(500).json({ error: fetchExistErr.message });
+    }
+    if (settingsErr) {
+      return res.status(500).json({ error: settingsErr.message });
+    }
+    if (!existingRow) {
+      return res.status(404).json({ error: 'Produto não encontrado.' });
+    }
+
+    const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
+    const isCombo = isComboProduct(id, dbSettings);
+
+    let targetStock: number | null = null;
+    if (
+      !isCombo &&
+      Object.prototype.hasOwnProperty.call(body, 'stock') &&
+      body.stock !== undefined &&
+      body.stock !== null &&
+      String(body.stock).trim() !== ''
+    ) {
+      const parsedStock = Number(body.stock);
+      if (!Number.isInteger(parsedStock) || parsedStock < 0) {
+        return res.status(400).json({ error: 'O estoque não pode ficar negativo' });
+      }
+      targetStock = parsedStock;
     }
 
     const updateData: Record<string, any> = {
@@ -3143,17 +3339,30 @@ export function createApp(): express.Express {
     }
 
     let updatedProduct = productFromDB(data);
-    const { data: settingsRow, error: settingsErr } = await supabase
-      .from('store_settings')
-      .select('data')
-      .eq('id', 'default')
-      .maybeSingle();
-    if (settingsErr) {
-      console.error('[Supabase Error] store_settings in PUT /products/:id:', settingsErr.message);
-      return res.status(500).json({ error: settingsErr.message });
+
+    if (!isCombo && targetStock !== null && targetStock !== Number(existingRow.stock || 0)) {
+      const { data: newStockVal, error: adjErr } = await supabase.rpc('adjust_stock', {
+        p_product_id: id,
+        p_mode: 'set',
+        p_value: targetStock,
+        p_reason: 'ajuste',
+        p_note: null,
+      });
+      if (adjErr) {
+        console.error('[RPC Error] adjust_stock in PUT /products/:id:', adjErr.message);
+        const msg = String(adjErr.message || '');
+        if (msg.includes('ESTOQUE_NEGATIVO')) {
+          return res.status(400).json({ error: 'O estoque não pode ficar negativo' });
+        }
+        if (msg.includes('PRODUTO_NAO_ENCONTRADO')) {
+          return res.status(404).json({ error: 'Produto não encontrado.' });
+        }
+        return res.status(500).json({ error: msg });
+      }
+      updatedProduct.stock = Number(newStockVal ?? targetStock);
     }
-    const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
-    if (isComboProduct(updatedProduct.id, dbSettings)) {
+
+    if (isCombo) {
       const { data: allRows, error: allErr } = await supabase.from('products').select('*');
       if (allErr) return res.status(500).json({ error: allErr.message });
       const withCombos = applyCombosStockAndCost((allRows || []).map(productFromDB), dbSettings);
@@ -3238,13 +3447,9 @@ export function createApp(): express.Express {
     res.json(productFromDB(updated));
   });
 
-  // Requirement: Alteração de estoque manual via POST /api/products/:id/stock (decrement_stock para delta negativo e restore_stock para positivo)
-  // Aceita unit: 'unit' | 'case'. Em caixas, o servidor multiplica delta × case_size.
-  // O estoque de um combo não pode ser editado diretamente.
-  router.post('/products/:id/stock', requireAdmin, async (req, res) => {
+  // Requirement 2a: POST /api/admin/products/:id/stock (mode: 'delta'|'set', value: inteiro, reason: 'ajuste'|'entrada'|'perda'|'contagem', note)
+  const handleManualStockAdjust = async (req: express.Request, res: express.Response) => {
     const { id } = req.params;
-    const rawDelta = Math.trunc(Number(req.body?.delta) || 0);
-    const unit = req.body?.unit === 'case' ? 'case' : 'unit';
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
@@ -3264,45 +3469,289 @@ export function createApp(): express.Express {
       });
     }
 
-    if (rawDelta === 0) {
-      return res.json(productFromDB(existingRow));
-    }
+    const body = req.body || {};
+    let mode: 'delta' | 'set' = body.mode === 'set' ? 'set' : 'delta';
+    let value: number;
 
-    let effectiveDelta = rawDelta;
-    if (unit === 'case') {
-      const caseSize = existingRow.case_size !== null && existingRow.case_size !== undefined ? Number(existingRow.case_size) : 0;
-      if (!Number.isInteger(caseSize) || caseSize < 2) {
-        return res.status(400).json({ error: 'Este produto não é vendido em caixa fechada.' });
+    if (body.value !== undefined && body.value !== null && String(body.value).trim() !== '') {
+      const parsedVal = Number(body.value);
+      if (!Number.isInteger(parsedVal)) {
+        return res.status(400).json({ error: 'O valor de estoque deve ser um número inteiro.' });
       }
-      effectiveDelta = rawDelta * caseSize;
-    }
-
-    if (effectiveDelta > 0) {
-      const { error: rpcErr } = await supabase.rpc('restore_stock', {
-        p_items: [{ id, qty: effectiveDelta }],
-      });
-      if (rpcErr) {
-        console.error('[RPC Error] restore_stock:', rpcErr.message);
-        return res.status(500).json({ error: rpcErr.message });
+      value = parsedVal;
+    } else if (body.delta !== undefined) {
+      mode = 'delta';
+      const rawDelta = Math.trunc(Number(body.delta) || 0);
+      const unit = body.unit === 'case' ? 'case' : 'unit';
+      if (unit === 'case') {
+        const caseSize = existingRow.case_size !== null && existingRow.case_size !== undefined ? Number(existingRow.case_size) : 0;
+        if (!Number.isInteger(caseSize) || caseSize < 2) {
+          return res.status(400).json({ error: 'Este produto não possui unidades por caixa configuradas.' });
+        }
+        value = rawDelta * caseSize;
+      } else {
+        value = rawDelta;
       }
     } else {
-      const { error: rpcErr } = await supabase.rpc('decrement_stock', {
-        p_items: [{ id, qty: Math.abs(effectiveDelta) }],
-      });
-      if (rpcErr) {
-        if (rpcErr.message?.includes('ESTOQUE_INSUFICIENTE')) {
-          return res.status(409).json({ error: 'Estoque insuficiente para esta redução.' });
+      return res.status(400).json({ error: 'Informe o valor de ajuste de estoque.' });
+    }
+
+    if (mode === 'set' && value < 0) {
+      return res.status(400).json({ error: 'O estoque não pode ficar negativo' });
+    }
+
+    if (mode === 'delta' && value === 0) {
+      return res.json({ stock: Number(existingRow.stock || 0) });
+    }
+
+    const validReasons = new Set(['ajuste', 'entrada', 'perda', 'contagem']);
+    const rawReason = typeof body.reason === 'string' ? body.reason.trim().toLowerCase() : 'ajuste';
+    const reason = validReasons.has(rawReason) ? rawReason : 'ajuste';
+    const note =
+      typeof body.note === 'string' && body.note.trim().length > 0
+        ? body.note.trim().slice(0, 200)
+        : null;
+
+    const { data: newStock, error: rpcErr } = await supabase.rpc('adjust_stock', {
+      p_product_id: id,
+      p_mode: mode,
+      p_value: value,
+      p_reason: reason,
+      p_note: note,
+    });
+
+    if (rpcErr) {
+      console.error('[RPC Error] adjust_stock:', rpcErr.message);
+      const msg = String(rpcErr.message || '');
+      if (msg.includes('ESTOQUE_NEGATIVO') || msg.includes('ESTOQUE_INSUFICIENTE')) {
+        return res.status(400).json({ error: 'O estoque não pode ficar negativo' });
+      }
+      if (msg.includes('PRODUTO_NAO_ENCONTRADO')) {
+        return res.status(404).json({ error: 'Produto não encontrado.' });
+      }
+      return res.status(400).json({ error: msg || 'Não foi possível ajustar o estoque.' });
+    }
+
+    return res.json({ stock: Number(newStock ?? 0) });
+  };
+
+  router.post('/admin/products/:id/stock', requireAdmin, handleManualStockAdjust);
+  router.post('/products/:id/stock', requireAdmin, handleManualStockAdjust);
+
+  // ---------------------------------------------------------------------------
+  // STOCK MOVEMENTS HISTORY: GET /admin/stock-movements
+  // ---------------------------------------------------------------------------
+  router.get('/admin/stock-movements', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const productId = typeof req.query.productId === 'string' ? req.query.productId.trim() : '';
+    const reason = typeof req.query.reason === 'string' ? req.query.reason.trim().toLowerCase() : '';
+    const direction = typeof req.query.direction === 'string' ? req.query.direction.trim().toLowerCase() : '';
+    const fromRaw = typeof req.query.from === 'string' ? req.query.from.trim() : '';
+    const toRaw = typeof req.query.to === 'string' ? req.query.to.trim() : '';
+    const beforeRaw = typeof req.query.before === 'string' ? req.query.before.trim() : '';
+    const parsedLimit = parseInt(String(req.query.limit || '100'), 10);
+    const limit = Number.isNaN(parsedLimit) ? 100 : Math.max(1, Math.min(500, parsedLimit));
+
+    const toIsoRange = (raw: string, isEnd: boolean): string | null => {
+      if (!raw) return null;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        return isEnd ? `${raw}T23:59:59.999-03:00` : `${raw}T00:00:00.000-03:00`;
+      }
+      const d = new Date(raw);
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    };
+
+    const fromIso = toIsoRange(fromRaw, false);
+    const toIso = toIsoRange(toRaw, true);
+    const beforeIso = beforeRaw ? toIsoRange(beforeRaw, true) || beforeRaw : null;
+
+    const applyCommonFilters = (q: any) => {
+      let query = q;
+      if (productId) {
+        query = query.eq('product_id', productId);
+      }
+      if (reason && reason !== 'todos') {
+        if (reason === 'cancelamento') {
+          query = query.in('reason', ['cancelamento', 'mesa_cancelamento', 'estorno_erro']);
+        } else {
+          query = query.eq('reason', reason);
         }
-        return res.status(500).json({ error: rpcErr.message });
+      }
+      if (direction === 'in' || direction === 'entradas') {
+        query = query.gt('delta', 0);
+      } else if (direction === 'out' || direction === 'saidas') {
+        query = query.lt('delta', 0);
+      }
+      if (fromIso) {
+        query = query.gte('created_at', fromIso);
+      }
+      if (toIso) {
+        query = query.lte('created_at', toIso);
+      }
+      return query;
+    };
+
+    let listQuery = applyCommonFilters(
+      supabase
+        .from('stock_movements')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+    );
+
+    if (beforeIso) {
+      listQuery = listQuery.lt('created_at', beforeIso);
+    }
+
+    const summaryQuery = applyCommonFilters(
+      supabase
+        .from('stock_movements')
+        .select('delta')
+        .limit(5000)
+    );
+
+    const [listRes, summaryRes] = await Promise.all([
+      listQuery.limit(limit + 1),
+      summaryQuery,
+    ]);
+
+    if (listRes.error) {
+      console.error('[Supabase Error] stock_movements list:', listRes.error.message);
+      return res.status(500).json({ error: listRes.error.message });
+    }
+    if (summaryRes.error) {
+      console.error('[Supabase Error] stock_movements summary:', summaryRes.error.message);
+      return res.status(500).json({ error: summaryRes.error.message });
+    }
+
+    const rawRows = Array.isArray(listRes.data) ? listRes.data : [];
+    const hasMore = rawRows.length > limit;
+    const pageRows = hasMore ? rawRows.slice(0, limit) : rawRows;
+
+    // Resolve table numbers for any comanda movements
+    const comandaRefIds: string[] = Array.from(
+      new Set<string>(
+        pageRows
+          .filter((r: any) => r.ref_type === 'comanda' && r.ref_id)
+          .map((r: any) => String(r.ref_id).trim())
+          .filter(Boolean)
+      )
+    );
+
+    const tableNumberByRefId = new Map<string, number>();
+    if (comandaRefIds.length > 0) {
+      const { data: tabsData, error: tabsErr } = await supabase
+        .from('table_tabs')
+        .select('id, table_id')
+        .in('id', comandaRefIds);
+
+      if (tabsErr) {
+        console.error('[Supabase Error] table_tabs lookup for stock_movements:', tabsErr.message);
+      } else {
+        const foundTabIds = new Set<string>((tabsData || []).map((t: any) => String(t.id)));
+        const missingRefIds = comandaRefIds.filter((rid: string) => !foundTabIds.has(rid));
+        const tabIdByItemRef = new Map<string, string>();
+        let allTabsList: Array<{ id: string; table_id: string }> = [...(tabsData || [])];
+
+        if (missingRefIds.length > 0) {
+          const { data: tabItemsData, error: tabItemsErr } = await supabase
+            .from('table_tab_items')
+            .select('id, tab_id')
+            .in('id', missingRefIds);
+          if (!tabItemsErr && tabItemsData && tabItemsData.length > 0) {
+            const extraTabIds = Array.from(
+              new Set(tabItemsData.map((ti: any) => String(ti.tab_id)).filter(Boolean))
+            );
+            for (const ti of tabItemsData) {
+              tabIdByItemRef.set(String(ti.id), String(ti.tab_id));
+            }
+            if (extraTabIds.length > 0) {
+              const { data: extraTabs, error: extraTabsErr } = await supabase
+                .from('table_tabs')
+                .select('id, table_id')
+                .in('id', extraTabIds);
+              if (!extraTabsErr && extraTabs) {
+                allTabsList = [...allTabsList, ...extraTabs];
+              }
+            }
+          }
+        }
+
+        const tableIds = Array.from(
+          new Set(allTabsList.map((t: any) => String(t.table_id)).filter(Boolean))
+        );
+        if (tableIds.length > 0) {
+          const { data: tablesData, error: tablesErr } = await supabase
+            .from('dining_tables')
+            .select('id, number')
+            .in('id', tableIds);
+          if (!tablesErr && tablesData) {
+            const numberByTableId = new Map<string, number>(
+              tablesData.map((tb: any) => [String(tb.id), Number(tb.number)])
+            );
+            const numberByTabId = new Map<string, number>();
+            for (const tbTab of allTabsList) {
+              const num = numberByTableId.get(String(tbTab.table_id));
+              if (num !== undefined) {
+                numberByTabId.set(String(tbTab.id), num);
+                tableNumberByRefId.set(String(tbTab.id), num);
+              }
+            }
+            for (const [itemId, tId] of tabIdByItemRef.entries()) {
+              const num = numberByTabId.get(tId);
+              if (num !== undefined) {
+                tableNumberByRefId.set(itemId, num);
+              }
+            }
+          }
+        }
       }
     }
 
-    const { data: updatedRow, error: fetchErr } = await supabase.from('products').select('*').eq('id', id).single();
-    if (fetchErr || !updatedRow) {
-      return res.status(500).json({ error: 'Produto não encontrado após atualização.' });
+    const items: StockMovement[] = pageRows.map((r: any) => {
+      const refIdStr = r.ref_id ? String(r.ref_id) : null;
+      const tblNum =
+        r.ref_type === 'comanda' && refIdStr ? tableNumberByRefId.get(refIdStr) ?? null : null;
+      return {
+        id: String(r.id),
+        createdAt: r.created_at || new Date().toISOString(),
+        productId: String(r.product_id || ''),
+        productName: String(r.product_name || ''),
+        delta: Number(r.delta || 0),
+        stockAfter: Number(r.stock_after || 0),
+        reason: String(r.reason || 'ajuste'),
+        refType: r.ref_type ? String(r.ref_type) : null,
+        refId: refIdStr,
+        note: r.note ? String(r.note) : null,
+        tableNumber: tblNum,
+      };
+    });
+
+    let totalIn = 0;
+    let totalOut = 0;
+    for (const sRow of summaryRes.data || []) {
+      const d = Number((sRow as any).delta || 0);
+      if (d > 0) totalIn += d;
+      else if (d < 0) totalOut += Math.abs(d);
     }
 
-    res.json(productFromDB(updatedRow));
+    const nextBefore =
+      hasMore && items.length > 0 ? items[items.length - 1].createdAt : null;
+
+    const responsePayload: StockMovementsResponse = {
+      items,
+      summary: {
+        totalIn,
+        totalOut,
+        balance: totalIn - totalOut,
+      },
+      hasMore,
+      nextBefore,
+    };
+
+    return res.json(responsePayload);
   });
 
   router.delete('/products/:id', requireAdmin, async (req, res) => {
@@ -3316,7 +3765,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
-    // If deleted product was a combo in store_settings, remove its combo entry
+    // If deleted product was in store_settings (combos, hiddenFromStoreIds, featuredProductIds, caseSaleChannels), clean it up
     const { data: settingsRow, error: settingsErr } = await supabase
       .from('store_settings')
       .select('data')
@@ -3324,15 +3773,31 @@ export function createApp(): express.Express {
       .maybeSingle();
     if (!settingsErr && settingsRow?.data) {
       const cleanSettings = sanitizePublicSettings(settingsRow.data);
+      let settingsChanged = false;
       if (cleanSettings.combos && cleanSettings.combos[id]) {
         delete cleanSettings.combos[id];
+        settingsChanged = true;
+      }
+      if (Array.isArray(cleanSettings.hiddenFromStoreIds) && cleanSettings.hiddenFromStoreIds.includes(id)) {
+        cleanSettings.hiddenFromStoreIds = cleanSettings.hiddenFromStoreIds.filter((pid) => pid !== id);
+        settingsChanged = true;
+      }
+      if (Array.isArray(cleanSettings.featuredProductIds) && cleanSettings.featuredProductIds.includes(id)) {
+        cleanSettings.featuredProductIds = cleanSettings.featuredProductIds.filter((pid) => pid !== id);
+        settingsChanged = true;
+      }
+      if (cleanSettings.caseSaleChannels && cleanSettings.caseSaleChannels[id]) {
+        delete cleanSettings.caseSaleChannels[id];
+        settingsChanged = true;
+      }
+      if (settingsChanged) {
         const { error: saveSetErr } = await supabase.from('store_settings').upsert({
           id: 'default',
           data: cleanSettings,
           updated_at: new Date().toISOString(),
         });
         if (saveSetErr) {
-          console.error('[Supabase Error] store_settings cleanup after combo delete:', saveSetErr.message);
+          console.error('[Supabase Error] store_settings cleanup after product delete:', saveSetErr.message);
         }
       }
     }
@@ -3461,8 +3926,8 @@ export function createApp(): express.Express {
       if (sKey) bySku.set(sKey, r);
     }
 
-    const toInsert: any[] = [];
-    const toUpdate: { id: string; price: number; cost_price: number; stock: number; updated_at: string }[] = [];
+    const toInsert: { dbRow: any; initialStock: number }[] = [];
+    const toUpdate: { id: string; price: number; cost_price: number; stock: number; oldStock: number; updated_at: string }[] = [];
     let skipped = 0;
     const errors: { rowNumber: number; name?: string; reason: string }[] = [];
 
@@ -3529,6 +3994,7 @@ export function createApp(): express.Express {
               price,
               cost_price: costPrice,
               stock: stockParsed.value,
+              oldStock: Number(existing.stock || 0),
               updated_at: new Date().toISOString(),
             });
           }
@@ -3548,7 +4014,7 @@ export function createApp(): express.Express {
         case_size: null,
         case_price: null,
         cost_price: costPrice,
-        stock: stockParsed.value,
+        stock: 0,
         min_stock: minStockParsed.value,
         is_cold: true,
         image: null,
@@ -3558,7 +4024,7 @@ export function createApp(): express.Express {
         updated_at: new Date().toISOString(),
       };
 
-      toInsert.push(newDbRow);
+      toInsert.push({ dbRow: newDbRow, initialStock: stockParsed.value });
       byName.set(nameKey, newDbRow);
       if (skuKey) bySku.set(skuKey, newDbRow);
     }
@@ -3567,10 +4033,25 @@ export function createApp(): express.Express {
     const BATCH_SIZE = 100;
     for (let start = 0; start < toInsert.length; start += BATCH_SIZE) {
       const chunk = toInsert.slice(start, start + BATCH_SIZE);
-      const { error: insertErr } = await supabase.from('products').insert(chunk);
+      const { error: insertErr } = await supabase.from('products').insert(chunk.map((c) => c.dbRow));
       if (insertErr) {
         console.error('[Supabase Error] products batch import insert:', insertErr.message);
         return res.status(500).json({ error: `Erro ao gravar produtos importados: ${insertErr.message}` });
+      }
+      for (const item of chunk) {
+        if (item.initialStock > 0) {
+          const { error: adjErr } = await supabase.rpc('adjust_stock', {
+            p_product_id: item.dbRow.id,
+            p_mode: 'set',
+            p_value: item.initialStock,
+            p_reason: 'importacao',
+            p_note: 'Importação de planilha',
+          });
+          if (adjErr) {
+            console.error('[RPC Error] adjust_stock on import insert:', adjErr.message);
+            return res.status(500).json({ error: `Erro ao registrar estoque importado: ${adjErr.message}` });
+          }
+        }
       }
       created += chunk.length;
     }
@@ -3582,13 +4063,25 @@ export function createApp(): express.Express {
         .update({
           price: upd.price,
           cost_price: upd.cost_price,
-          stock: upd.stock,
           updated_at: upd.updated_at,
         })
         .eq('id', upd.id);
       if (updErr) {
         console.error('[Supabase Error] products import update:', updErr.message);
         return res.status(500).json({ error: `Erro ao atualizar produto existente: ${updErr.message}` });
+      }
+      if (upd.stock !== upd.oldStock) {
+        const { error: adjErr } = await supabase.rpc('adjust_stock', {
+          p_product_id: upd.id,
+          p_mode: 'set',
+          p_value: upd.stock,
+          p_reason: 'importacao',
+          p_note: 'Importação de planilha',
+        });
+        if (adjErr) {
+          console.error('[RPC Error] adjust_stock on import update:', adjErr.message);
+          return res.status(500).json({ error: `Erro ao atualizar estoque do produto: ${adjErr.message}` });
+        }
       }
       updated++;
     }
@@ -4015,14 +4508,25 @@ export function createApp(): express.Express {
     let recalculatedSubtotal = 0;
     const validatedItems: OrderItem[] = [];
     const unitsByProductId = new Map<string, number>();
+    const comboNamesByProductId = new Map<string, Set<string>>();
     const comboCheckList: Array<{ comboProduct: Product; comboDef: ComboComponentItem[] }> = [];
     const nonComboCheckList: Product[] = [];
+    const orderCaseChannel: 'store' | 'local' = effectiveSource === 'balcao' ? 'local' : 'store';
 
     for (const item of rawOrder.items) {
       const serverProduct = dbProducts.find((p) => p.id === item.productId);
       if (!serverProduct || !serverProduct.active) {
         return res.status(400).json({
           error: `O produto "${item.name || item.productId}" não está disponível no momento.`,
+        });
+      }
+      if (
+        effectiveSource !== 'balcao' &&
+        Array.isArray(dbSettings.hiddenFromStoreIds) &&
+        dbSettings.hiddenFromStoreIds.includes(serverProduct.id)
+      ) {
+        return res.status(400).json({
+          error: 'Produto indisponível no delivery',
         });
       }
 
@@ -4038,24 +4542,9 @@ export function createApp(): express.Express {
       let originalPrice = serverProduct.price;
 
       if (saleUnit === 'case') {
-        if (isCombo) {
+        if (isCombo || !canSellProductCase(serverProduct, dbSettings, orderCaseChannel)) {
           return res.status(400).json({
-            error: 'Este produto não é vendido em caixa fechada.',
-          });
-        }
-        const hasCase =
-          serverProduct.caseSize !== null &&
-          serverProduct.caseSize !== undefined &&
-          Number.isInteger(Number(serverProduct.caseSize)) &&
-          Number(serverProduct.caseSize) >= 2 &&
-          Number(serverProduct.caseSize) <= 100 &&
-          serverProduct.casePrice !== null &&
-          serverProduct.casePrice !== undefined &&
-          Number(serverProduct.casePrice) > 0;
-
-        if (!hasCase) {
-          return res.status(400).json({
-            error: 'Este produto não é vendido em caixa fechada.',
+            error: 'Venda por caixa não disponível',
           });
         }
 
@@ -4099,6 +4588,10 @@ export function createApp(): express.Express {
 
           const neededForComp = requestedQty * compQty;
           unitsByProductId.set(comp.id, (unitsByProductId.get(comp.id) || 0) + neededForComp);
+          if (!comboNamesByProductId.has(comp.id)) {
+            comboNamesByProductId.set(comp.id, new Set<string>());
+          }
+          comboNamesByProductId.get(comp.id)!.add(serverProduct.name);
 
           comboCostSum += (Number(comp.costPrice) || 0) * compQty;
           resolvedComboItems.push({
@@ -4176,9 +4669,32 @@ export function createApp(): express.Express {
       }
     }
 
-    const stockPayload: { id: string; qty: number }[] = Array.from(unitsByProductId.entries()).map(
-      ([id, qty]) => ({ id, qty })
-    );
+    // Número do pedido sempre gerado pelo servidor antes da baixa de estoque para gravar refId no histórico
+    const orderId = `PED-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    const orderSourceLabel = effectiveSource === 'balcao' ? 'Balcão' : 'Delivery';
+
+    const stockPayload = Array.from(unitsByProductId.entries()).map(([id, qty]) => {
+      const combosForProd = comboNamesByProductId.get(id);
+      const comboNote =
+        combosForProd && combosForProd.size > 0
+          ? `Combo: ${Array.from(combosForProd).join(', ')}`
+          : '';
+      const note = comboNote ? `${orderSourceLabel} — ${comboNote}` : orderSourceLabel;
+      return {
+        id,
+        qty,
+        reason: 'venda',
+        refType: 'pedido',
+        refId: orderId,
+        note,
+      };
+    });
+    const rollbackStockPayload = stockPayload.map((it) => ({
+      ...it,
+      reason: 'estorno_erro',
+      refType: 'pedido',
+      refId: orderId,
+    }));
 
     // 3. Recalculate Delivery Fee & Enforce Delivery Radius on Server
     const deliveryType = rawOrder.deliveryType === 'retirada' ? 'retirada' : 'delivery';
@@ -4309,15 +4825,12 @@ export function createApp(): express.Express {
       if (redeemErr) {
         console.error('[RPC Error] redeem_coupon:', redeemErr.message);
         // Rollback stock decrement!
-        await supabase.rpc('restore_stock', { p_items: stockPayload });
+        await supabase.rpc('restore_stock', { p_items: rollbackStockPayload });
         return res.status(400).json({ error: 'Não foi possível resgatar o cupom: ' + redeemErr.message });
       }
     }
 
     // 7. Persist Order in database
-    // Número do pedido sempre gerado pelo servidor (nunca aceito do navegador)
-    const orderId = `PED-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-
     const newOrder: Order = {
       id: orderId,
       source: effectiveSource,
@@ -4343,7 +4856,7 @@ export function createApp(): express.Express {
     if (orderErr) {
       console.error('[Supabase Error] orders insert:', orderErr.message);
       // Rollback stock decrement!
-      await supabase.rpc('restore_stock', { p_items: stockPayload });
+      await supabase.rpc('restore_stock', { p_items: rollbackStockPayload });
 
       if (orderErr.code === '23505' && rawClientRequestId) {
         const { data: dupRow, error: dupErr } = await supabase
@@ -4478,10 +4991,13 @@ export function createApp(): express.Express {
     }
 
     // 2. Adjust stock ONLY after conditional status transition succeeded (using saved comboItems for combos)
-    const stockItems = extractOrderStockItems(existingOrder);
-
-    if (stockItems.length > 0) {
-      if (oldStatus !== 'cancelado' && newStatus === 'cancelado') {
+    if (oldStatus !== 'cancelado' && newStatus === 'cancelado') {
+      const stockItems = extractOrderStockItems(existingOrder, {
+        reason: 'cancelamento',
+        refType: 'pedido',
+        refId: id,
+      });
+      if (stockItems.length > 0) {
         const { error: restErr } = await supabase.rpc('restore_stock', { p_items: stockItems });
         if (restErr) {
           console.error('[RPC Error] restore_stock on cancel:', restErr.message);
@@ -4495,7 +5011,14 @@ export function createApp(): express.Express {
             .eq('id', id);
           return res.status(500).json({ error: 'Erro ao devolver estoque: ' + restErr.message });
         }
-      } else if (oldStatus === 'cancelado' && newStatus !== 'cancelado') {
+      }
+    } else if (oldStatus === 'cancelado' && newStatus !== 'cancelado') {
+      const stockItems = extractOrderStockItems(existingOrder, {
+        reason: 'reativacao',
+        refType: 'pedido',
+        refId: id,
+      });
+      if (stockItems.length > 0) {
         const { error: decErr } = await supabase.rpc('decrement_stock', { p_items: stockItems });
         if (decErr) {
           console.error('[RPC Error] decrement_stock on uncancel:', decErr.message);
@@ -4537,7 +5060,11 @@ export function createApp(): express.Express {
     if (existingRow) {
       const existingOrder = orderFromDB(existingRow);
       if (existingOrder.status !== 'cancelado') {
-        const stockItems = extractOrderStockItems(existingOrder);
+        const stockItems = extractOrderStockItems(existingOrder, {
+          reason: 'cancelamento',
+          refType: 'pedido',
+          refId: id,
+        });
         if (stockItems.length > 0) {
           const { error: restErr } = await supabase.rpc('restore_stock', { p_items: stockItems });
           if (restErr) {
@@ -4619,6 +5146,10 @@ export function createApp(): express.Express {
       cleanSettings.featuredProductIds = cleanSettings.featuredProductIds.filter((id) => existingIds.has(id));
     }
 
+    if (cleanSettings.hiddenFromStoreIds && cleanSettings.hiddenFromStoreIds.length > 0) {
+      cleanSettings.hiddenFromStoreIds = cleanSettings.hiddenFromStoreIds.filter((id) => existingIds.has(id));
+    }
+
     if (cleanSettings.productOrder && typeof cleanSettings.productOrder === 'object') {
       const filteredOrder: Record<string, string[]> = {};
       let totalCount = 0;
@@ -4649,6 +5180,16 @@ export function createApp(): express.Express {
         }
       }
       cleanSettings.combos = filteredCombos;
+    }
+
+    if (cleanSettings.caseSaleChannels && typeof cleanSettings.caseSaleChannels === 'object') {
+      const filteredChannels: Record<string, { store: boolean; local: boolean }> = {};
+      for (const [pid, cfg] of Object.entries(cleanSettings.caseSaleChannels)) {
+        if (existingIds.has(pid)) {
+          filteredChannels[pid] = cfg;
+        }
+      }
+      cleanSettings.caseSaleChannels = filteredChannels;
     }
 
     const { error } = await supabase.from('store_settings').upsert({
@@ -5226,7 +5767,7 @@ export function createApp(): express.Express {
     res.json(tableTabFromDB(updated));
   });
 
-  // 8. Add item to tab (decrement stock via RPC add_table_tab_item)
+  // 8. Add item to tab (decrement stock via RPC add_table_tab_item or add_table_tab_combo)
   router.post('/admin/tabs/:id/items', requireAdmin, async (req, res) => {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
@@ -5249,10 +5790,10 @@ export function createApp(): express.Express {
     if (tabErr) return res.status(500).json({ error: tabErr.message });
     if (!tab) return res.status(404).json({ error: 'Comanda não encontrada.' });
     if (tab.status !== 'open') {
-      return res.status(400).json({ error: 'A comanda não está aberta para novos itens.' });
+      return res.status(409).json({ error: 'A comanda não está aberta para novos itens.' });
     }
 
-    // Fetch product and store_settings to verify product is not a combo and calculate effective price
+    // Fetch product and store_settings to calculate effective price and check if product is a combo
     const [{ data: prodData, error: prodErr }, { data: settingsRow, error: settingsErr }] = await Promise.all([
       supabase.from('products').select('*').eq('id', product_id).maybeSingle(),
       supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
@@ -5265,25 +5806,105 @@ export function createApp(): express.Express {
     }
 
     const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
+    const productName = `${prodData.name}${prodData.volume ? ` ${prodData.volume}` : ''}`;
+    const itemNotes = notes ? String(notes).trim() : null;
+
     if (isComboProduct(String(prodData.id), dbSettings)) {
-      return res.status(400).json({ error: 'Combo: venda no balcão ou na loja.' });
+      const rawComboItems = dbSettings.combos?.[String(prodData.id)];
+      if (!Array.isArray(rawComboItems) || rawComboItems.length === 0) {
+        return res.status(400).json({ error: 'Combo com itens inválidos' });
+      }
+
+      const compIds: string[] = [];
+      for (const ci of rawComboItems) {
+        const cid = String(ci?.productId || '').trim();
+        const cqty = Number(ci?.quantity);
+        if (
+          !cid ||
+          cid === String(prodData.id) ||
+          isComboProduct(cid, dbSettings) ||
+          !Number.isInteger(cqty) ||
+          cqty < 1 ||
+          cqty > 99
+        ) {
+          return res.status(400).json({ error: 'Combo com itens inválidos' });
+        }
+        compIds.push(cid);
+      }
+
+      const { data: compRows, error: compErr } = await supabase
+        .from('products')
+        .select('*')
+        .in('id', Array.from(new Set(compIds)));
+
+      if (compErr) return res.status(500).json({ error: compErr.message });
+
+      const compById = new Map<string, any>((compRows || []).map((r: any) => [String(r.id), r]));
+      const p_components: OrderItemComboComponent[] = [];
+
+      for (const ci of rawComboItems) {
+        const cid = String(ci.productId).trim();
+        const compRow = compById.get(cid);
+        if (!compRow || compRow.active === false) {
+          return res.status(400).json({ error: 'Combo com itens inválidos' });
+        }
+        const compProd = productFromDB(compRow);
+        p_components.push({
+          productId: compProd.id,
+          name: formatComboComponentProductName(compProd),
+          quantity: Number(ci.quantity),
+        });
+      }
+
+      const comboUnitPrice = getEffectivePrice(prodData);
+
+      const { data: itemId, error: rpcErr } = await supabase.rpc('add_table_tab_combo', {
+        p_tab_id: req.params.id,
+        p_product_id: String(prodData.id),
+        p_product_name: productName,
+        p_unit_price: comboUnitPrice,
+        p_qty: qty,
+        p_notes: itemNotes,
+        p_components,
+      });
+
+      if (rpcErr) {
+        console.error('[Supabase RPC Error] add_table_tab_combo:', rpcErr.message);
+        const msg = String(rpcErr.message || '');
+        if (msg.includes('ESTOQUE_INSUFICIENTE')) {
+          const match = msg.match(/ESTOQUE_INSUFICIENTE:([^\s,)]+)/);
+          const missingId = match?.[1]?.trim() || '';
+          const missingCompRow = missingId ? compById.get(missingId) : undefined;
+          const missingProdName = missingCompRow?.name
+            ? String(missingCompRow.name)
+            : p_components.find((c) => c.productId === missingId)?.name || missingId || 'item do combo';
+          return res.status(409).json({
+            error: `Estoque insuficiente para o combo ${prodData.name}: falta ${missingProdName}`,
+          });
+        }
+        if (msg.includes('COMBO_INVALIDO')) {
+          return res.status(400).json({ error: 'Combo com itens inválidos' });
+        }
+        if (msg.includes('COMANDA_NAO_ABERTA')) {
+          return res.status(409).json({ error: translateTabRpcError(msg) });
+        }
+        return res.status(400).json({ error: translateTabRpcError(msg) });
+      }
+
+      return res.status(201).json({ success: true, itemId });
     }
 
     let unitPrice = getEffectivePrice(prodData);
     let unitsPerSale = 1;
 
     if (saleUnit === 'case') {
-      const rawCaseSize = prodData.case_size !== null && prodData.case_size !== undefined ? Number(prodData.case_size) : 0;
-      const rawCasePrice = prodData.case_price !== null && prodData.case_price !== undefined ? Number(prodData.case_price) : 0;
-      if (!Number.isInteger(rawCaseSize) || rawCaseSize < 2 || rawCaseSize > 100 || rawCasePrice <= 0) {
-        return res.status(400).json({ error: 'Este produto não é vendido em caixa fechada.' });
+      const mappedProduct = productFromDB(prodData);
+      if (!canSellProductCase(mappedProduct, dbSettings, 'local')) {
+        return res.status(400).json({ error: 'Venda por caixa não disponível' });
       }
-      unitPrice = rawCasePrice;
-      unitsPerSale = rawCaseSize;
+      unitPrice = Number(mappedProduct.casePrice);
+      unitsPerSale = Number(mappedProduct.caseSize);
     }
-
-    const productName = `${prodData.name}${prodData.volume ? ` ${prodData.volume}` : ''}`;
-    const itemNotes = notes ? String(notes).trim() : null;
 
     // Call Supabase RPC add_table_tab_item
     const { data: itemId, error: rpcErr } = await supabase.rpc('add_table_tab_item', {
@@ -5299,6 +5920,9 @@ export function createApp(): express.Express {
 
     if (rpcErr) {
       console.error('[Supabase RPC Error] add_table_tab_item:', rpcErr.message);
+      if (String(rpcErr.message || '').includes('COMANDA_NAO_ABERTA')) {
+        return res.status(409).json({ error: translateTabRpcError(rpcErr.message) });
+      }
       return res.status(400).json({ error: translateTabRpcError(rpcErr.message) });
     }
 
@@ -5641,8 +6265,17 @@ export function createApp(): express.Express {
       ? `Mesa ${allTableNumbers.join(' + ')}`
       : `Mesa ${tableData?.number || '?'}${tableData?.label ? ` (${tableData.label})` : ''}`;
 
-    // 5. Fetch products for active items only
-    const productIds = Array.from(new Set(activeItems.map((it) => it.productId)));
+    // 5. Fetch products for active items (and any inner combo component products)
+    const productIdsSet = new Set<string>();
+    for (const it of activeItems) {
+      if (it.productId) productIdsSet.add(it.productId);
+      if (Array.isArray(it.comboItems)) {
+        for (const ci of it.comboItems) {
+          if (ci?.productId) productIdsSet.add(String(ci.productId));
+        }
+      }
+    }
+    const productIds = Array.from(productIdsSet);
     const { data: prodRows, error: prodErr } = await supabase
       .from('products')
       .select('*')
@@ -5710,23 +6343,46 @@ export function createApp(): express.Express {
       }
     }
 
-    // 7. Map order items (name = product name only without volume, volume goes in volume field)
+    // 7. Map order items (name = product name only without volume, volume goes in volume field, combos carry comboItems and summed inner costPrice)
     const orderItems: OrderItem[] = activeItems.map((it) => {
       const p = prodMap.get(it.productId);
-      const saleUnit = it.saleUnit === 'case' ? 'case' : 'unit';
-      const unitsPerSale = it.unitsPerSale && it.unitsPerSale > 0 ? it.unitsPerSale : 1;
-      return {
+      const hasComboItems = Array.isArray(it.comboItems) && it.comboItems.length > 0;
+      const saleUnit = hasComboItems ? 'unit' : it.saleUnit === 'case' ? 'case' : 'unit';
+      const unitsPerSale = hasComboItems ? 1 : it.unitsPerSale && it.unitsPerSale > 0 ? it.unitsPerSale : 1;
+
+      let itemCostPrice = (p?.cost_price ? Number(p.cost_price) : 0) * unitsPerSale;
+      if (hasComboItems && it.comboItems) {
+        const comboCostSum = it.comboItems.reduce((sum, ci) => {
+          const compProd = prodMap.get(String(ci.productId));
+          const compCost = compProd?.cost_price ? Number(compProd.cost_price) : 0;
+          const compQty = Math.max(1, Math.floor(Number(ci.quantity) || 1));
+          return sum + compCost * compQty;
+        }, 0);
+        itemCostPrice = Math.round(comboCostSum * 100) / 100;
+      }
+
+      const orderItem: OrderItem = {
         productId: it.productId,
         name: p?.name || it.productName,
         volume: p?.volume || '',
         price: it.unitPrice,
         originalPrice: saleUnit === 'case' ? it.unitPrice : (p?.price ? Number(p.price) : it.unitPrice),
-        costPrice: (p?.cost_price ? Number(p.cost_price) : 0) * unitsPerSale,
+        costPrice: itemCostPrice,
         quantity: it.quantity,
         saleUnit,
         unitsPerSale,
         isCold: p?.is_cold ?? true,
       };
+
+      if (hasComboItems && it.comboItems) {
+        orderItem.comboItems = it.comboItems.map((ci) => ({
+          productId: String(ci.productId),
+          name: String(ci.name),
+          quantity: Math.max(1, Math.floor(Number(ci.quantity) || 1)),
+        }));
+      }
+
+      return orderItem;
     });
 
     const customerName = lockedTab.customer_name?.trim() ? `${lockedTab.customer_name} - ${tableName}` : tableName;

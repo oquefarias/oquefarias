@@ -29,11 +29,27 @@ export interface Product {
   description: string;
 }
 
-export function hasProductCase(product?: Pick<Product, 'caseSize' | 'casePrice'> | null): boolean {
+export function hasProductStockCase(product?: Pick<Product, 'caseSize'> | null): boolean {
   if (!product) return false;
   const size = Number(product.caseSize) || 0;
+  return Number.isInteger(size) && size >= 2 && size <= 100;
+}
+
+export function hasProductCase(product?: Pick<Product, 'caseSize' | 'casePrice'> | null): boolean {
+  if (!product) return false;
   const price = Number(product.casePrice) || 0;
-  return Number.isInteger(size) && size >= 2 && size <= 100 && price > 0;
+  return hasProductStockCase(product) && price > 0;
+}
+
+export function canSellProductCase(
+  product?: Pick<Product, 'id' | 'caseSize' | 'casePrice'> | null,
+  settings?: Pick<StoreSettings, 'caseSaleChannels'> | null,
+  channel: 'store' | 'local' = 'store'
+): boolean {
+  if (!product || !hasProductCase(product)) return false;
+  const cfg = settings?.caseSaleChannels?.[product.id];
+  if (!cfg || typeof cfg !== 'object') return true;
+  return channel === 'store' ? cfg.store !== false : cfg.local !== false;
 }
 
 export function formatStockWithCases(stock: number, caseSize?: number | null): string {
@@ -254,6 +270,7 @@ export interface TableTabItem {
   quantity: number;
   saleUnit?: SaleUnit;
   unitsPerSale?: number;
+  comboItems?: OrderItemComboComponent[];
   notes?: string | null;
   status: 'active' | 'cancelled';
   addedAt: string;
@@ -348,6 +365,92 @@ export interface StoreSettings {
   shortcuts?: Record<string, string>; // Atalhos do teclado customizados no painel
   addonGroups?: AddonGroup[]; // Grupos de adicionais na escolha do produto (máx 30)
   combos?: Record<string, ComboComponentItem[]>; // Composição dos combos: { idDoProdutoCombo: [{ productId, quantity }] } (máx 100)
+  hiddenFromStoreIds?: string[]; // Produtos ocultos apenas da loja online / delivery (máx 2000)
+  caseSaleChannels?: Record<string, { store: boolean; local: boolean }>; // Canais onde a caixa fechada está liberada por produto
+}
+
+export type StockAdjustMode = 'delta' | 'set';
+export type StockAdjustReason = 'ajuste' | 'entrada' | 'perda' | 'contagem';
+export type StockMovementReason =
+  | 'venda'
+  | 'mesa'
+  | 'cancelamento'
+  | 'mesa_cancelamento'
+  | 'reativacao'
+  | 'estorno_erro'
+  | 'ajuste'
+  | 'entrada'
+  | 'perda'
+  | 'contagem'
+  | 'importacao'
+  | (string & {});
+
+export interface StockMovement {
+  id: string;
+  createdAt: string;
+  productId: string;
+  productName: string;
+  delta: number;
+  stockAfter: number;
+  reason: StockMovementReason;
+  refType?: string | null;
+  refId?: string | null;
+  note?: string | null;
+  tableNumber?: number | null;
+}
+
+export interface StockMovementsSummary {
+  totalIn: number;
+  totalOut: number;
+  balance: number;
+}
+
+export interface StockMovementsResponse {
+  items: StockMovement[];
+  summary: StockMovementsSummary;
+  hasMore: boolean;
+  nextBefore: string | null;
+}
+
+export function formatStockMovementReason(reason?: string | null): string {
+  switch (String(reason || '').toLowerCase()) {
+    case 'venda':
+      return 'Venda delivery/balcão';
+    case 'mesa':
+      return 'Mesa';
+    case 'cancelamento':
+      return 'Cancelamento de pedido';
+    case 'mesa_cancelamento':
+      return 'Cancelamento na mesa';
+    case 'reativacao':
+      return 'Reativação de pedido';
+    case 'estorno_erro':
+      return 'Estorno automático';
+    case 'ajuste':
+      return 'Ajuste manual';
+    case 'entrada':
+      return 'Entrada de mercadoria';
+    case 'perda':
+      return 'Perda / quebra';
+    case 'contagem':
+      return 'Contagem de estoque';
+    case 'importacao':
+      return 'Importação de planilha';
+    default:
+      return reason || 'Ajuste';
+  }
+}
+
+export function isProductHiddenFromStore(
+  productOrId?: Pick<Product, 'id'> | string | null,
+  settings?: StoreSettings | null
+): boolean {
+  if (!productOrId || !Array.isArray(settings?.hiddenFromStoreIds) || settings!.hiddenFromStoreIds.length === 0) {
+    return false;
+  }
+  const id = typeof productOrId === 'string' ? productOrId.trim() : String(productOrId.id || '').trim();
+  if (!id) return false;
+  return settings!.hiddenFromStoreIds.includes(id);
 }
 
 export function isComboProduct(

@@ -27,6 +27,7 @@ import {
   getCategoryDisplayName,
   getEffectiveProductPrice,
   isComboProduct,
+  isProductHiddenFromStore,
 } from '../../types';
 import { api } from '../../services/api';
 import {
@@ -657,7 +658,12 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
                               </span>
                               {!fp.active && (
                                 <span className="px-1.5 py-0.5 rounded bg-neutral-200 text-neutral-700 text-[10px] font-bold">
-                                  Oculto da loja
+                                  Desativado
+                                </span>
+                              )}
+                              {isProductHiddenFromStore(fp.id, settings) && (
+                                <span className="px-1.5 py-0.5 rounded bg-amber-100 border border-amber-300 text-amber-900 text-[10px] font-bold">
+                                  Só no balcão/mesa
                                 </span>
                               )}
                               {fp.active && isHiddenByStock && (
@@ -934,25 +940,30 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
             )}
 
             {/* Category selector for organizing products */}
-            <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none">
-              {localCategories.map((cat) => {
-                const count = productCountByCategory.get(cat.id) || 0;
-                const isSelected = selectedOrgCategoryId === cat.id;
-                return (
-                  <button
-                    key={`org-tab-${cat.id}`}
-                    type="button"
-                    onClick={() => setSelectedOrgCategoryId(cat.id)}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap transition-colors cursor-pointer ${
-                      isSelected
-                        ? 'bg-neutral-900 text-white'
-                        : 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
-                    }`}
-                  >
-                    {cat.name} ({count})
-                  </button>
-                );
-              })}
+            <div className="relative">
+              <div className="flex items-center gap-1.5 overflow-x-auto sm:flex-wrap sm:overflow-visible pb-1 pr-8 sm:pr-0 scrollbar-none">
+                {localCategories.map((cat) => {
+                  const count = productCountByCategory.get(cat.id) || 0;
+                  const isSelected = selectedOrgCategoryId === cat.id;
+                  return (
+                    <button
+                      key={`org-tab-${cat.id}`}
+                      type="button"
+                      onClick={() => setSelectedOrgCategoryId(cat.id)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                        isSelected
+                          ? 'bg-neutral-900 text-white'
+                          : 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
+                      }`}
+                    >
+                      {cat.name} ({count})
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="pointer-events-none sm:hidden absolute right-0 top-0 bottom-1 w-8 bg-gradient-to-l from-white via-white/90 to-transparent flex items-center justify-end pr-1">
+                <span className="text-xs font-black text-neutral-400">›</span>
+              </div>
             </div>
 
             {/* Sortable Products within Selected Category */}
@@ -994,11 +1005,21 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
                                 </div>
                               )}
                               <div className="min-w-0">
-                                <div className="font-bold text-neutral-900 text-xs truncate flex items-center gap-1.5">
+                                <div className="font-bold text-neutral-900 text-xs truncate flex items-center gap-1.5 flex-wrap">
                                   <span className="truncate">{prod.name}</span>
                                   {isPreferred && (
                                     <span className="px-1.5 py-0.2 rounded bg-amber-100 text-amber-900 border border-amber-300 text-[9px] font-black shrink-0">
                                       Mostrar primeiro
+                                    </span>
+                                  )}
+                                  {!prod.active && (
+                                    <span className="px-1.5 py-0.2 rounded bg-neutral-200 text-neutral-700 text-[9px] font-bold shrink-0">
+                                      Desativado
+                                    </span>
+                                  )}
+                                  {isProductHiddenFromStore(prod.id, settings) && (
+                                    <span className="px-1.5 py-0.2 rounded bg-amber-100 text-amber-900 border border-amber-300 text-[9px] font-bold shrink-0">
+                                      Só no balcão/mesa
                                     </span>
                                   )}
                                 </div>

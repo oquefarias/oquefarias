@@ -31,6 +31,7 @@ export const initialSettings: StoreSettings = {
   shortcuts: { ...DEFAULT_SHORTCUTS },
   addonGroups: [],
   combos: {},
+  hiddenFromStoreIds: [],
 };
 
 // All simulation data wiped clean for real depot operation

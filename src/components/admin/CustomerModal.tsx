@@ -70,6 +70,7 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
     text: string;
   } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [formError, setFormError] = useState<string>('');
 
   useEffect(() => {
     setShowMap(false);
@@ -326,8 +327,6 @@ export const CustomerModal: React.FC<CustomerModalProps> = ({
       // Ignored
     }
   };
-
-  const [formError, setFormError] = useState<string>('');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

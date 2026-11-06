@@ -5,17 +5,21 @@ import {
   Product,
   ProductCategory,
   TableTabItem,
+  OrderItemComboComponent,
   LinkedTable,
   SaleUnit,
   StoreSettings,
   isProductPromoActive,
   getEffectiveProductPrice,
   hasProductCase,
+  canSellProductCase,
   formatStockWithCases,
   resolveStoreCategories,
   sortProductsForStore,
   getProductAddonGroups,
   isComboProduct,
+  calculateComboMetrics,
+  formatOrderItemComboLine,
 } from '../../../types';
 import { api } from '../../../services/api';
 import {
@@ -325,7 +329,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
       setAddItemError('A quantidade deve ser maior que zero.');
       return;
     }
-    const isCase = itemSaleUnit === 'case' && hasProductCase(selectedProduct);
+    const isCase = itemSaleUnit === 'case' && canSellProductCase(selectedProduct, settings, 'local');
     const unitsPerSale = isCase ? Number(selectedProduct.caseSize) : 1;
     const totalUnitsNeeded = itemQuantity * unitsPerSale;
 
@@ -336,8 +340,9 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
       return;
     }
 
+    const isSelectedCombo = isComboProduct(selectedProduct.id, settings);
     const launchedProductId = selectedProduct.id;
-    const launchedSaleUnit: SaleUnit = isCase ? 'case' : 'unit';
+    const launchedSaleUnit: SaleUnit = !isSelectedCombo && isCase ? 'case' : 'unit';
 
     setIsAddingItem(true);
     setAddItemError('');
@@ -346,7 +351,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
       await api.addTabItem(tabId, {
         product_id: launchedProductId,
         quantity: itemQuantity,
-        sale_unit: launchedSaleUnit,
+        ...(isSelectedCombo ? {} : { sale_unit: launchedSaleUnit }),
         notes: itemNotes.trim() || undefined,
       });
 
@@ -504,6 +509,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
         unitsPerSale: number;
         unitPrice: number;
         quantity: number;
+        comboItems?: OrderItemComboComponent[];
         notesList: string[];
         items: TableTabItem[];
       }
@@ -516,6 +522,9 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
       const existing = map.get(key);
       if (existing) {
         existing.quantity += item.quantity;
+        if (!existing.comboItems && item.comboItems && item.comboItems.length > 0) {
+          existing.comboItems = item.comboItems;
+        }
         if (item.notes && !existing.notesList.includes(item.notes)) {
           existing.notesList.push(item.notes);
         }
@@ -529,6 +538,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
           unitsPerSale,
           unitPrice: item.unitPrice,
           quantity: item.quantity,
+          comboItems: item.comboItems && item.comboItems.length > 0 ? item.comboItems : undefined,
           notesList: item.notes ? [item.notes] : [],
           items: [item],
         });
@@ -772,6 +782,18 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                                 ? `${group.quantity} cx ${group.productName} (${totalUnits} un)`
                                 : group.productName}
                             </span>
+                            {group.comboItems && group.comboItems.length > 0 && (
+                              <div className="mt-0.5 space-y-0.5">
+                                {group.comboItems.map((ci, ciIdx) => (
+                                  <p
+                                    key={`${ci.productId}-${ciIdx}`}
+                                    className="text-[11px] font-bold text-amber-800 leading-tight"
+                                  >
+                                    {formatOrderItemComboLine(ci)}
+                                  </p>
+                                ))}
+                              </div>
+                            )}
                             <div className="flex items-center gap-2 text-[11px] text-neutral-400 mt-0.5 flex-wrap">
                               <span>
                                 R$ {group.unitPrice.toFixed(2)}{' '}
@@ -937,20 +959,26 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                 </div>
 
                 {/* Category Pills */}
-                <div className="flex items-center gap-1 overflow-x-auto pb-1 text-[11px]">
-                  {categoryPills.map((c) => (
-                    <button
-                      key={c.id}
-                      onClick={() => setCategoryFilter(c.id as any)}
-                      className={`px-2.5 py-1 rounded-lg font-bold whitespace-nowrap transition-colors ${
-                        categoryFilter === c.id
-                          ? 'bg-neutral-900 text-white'
-                          : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'
-                      }`}
-                    >
-                      {c.label}
-                    </button>
-                  ))}
+                <div className="relative">
+                  <div className="flex items-center gap-1 overflow-x-auto sm:flex-wrap sm:overflow-visible pb-1 pr-8 sm:pr-0 text-[11px] scrollbar-none">
+                    {categoryPills.map((c) => (
+                      <button
+                        key={c.id}
+                        type="button"
+                        onClick={() => setCategoryFilter(c.id as any)}
+                        className={`px-2.5 py-1 rounded-lg font-bold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                          categoryFilter === c.id
+                            ? 'bg-neutral-900 text-white'
+                            : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'
+                        }`}
+                      >
+                        {c.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="pointer-events-none sm:hidden absolute right-0 top-0 bottom-1 w-7 bg-gradient-to-l from-white via-white/90 to-transparent flex items-center justify-end pr-0.5">
+                    <span className="text-[10px] font-black text-neutral-400">›</span>
+                  </div>
                 </div>
               </div>
 
@@ -965,8 +993,9 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                     const isSelected = selectedProduct?.id === p.id;
                     const isPromo = isProductPromoActive(p);
                     const effectivePrice = getEffectiveProductPrice(p);
-                    const hasCase = hasProductCase(p);
+                    const hasCase = canSellProductCase(p, settings, 'local');
                     const isCombo = isComboProduct(p.id, settings);
+                    const comboMetrics = isCombo ? calculateComboMetrics(p, settings, products) : null;
                     const isOutOfStock = p.stock <= 0;
                     const hasAddons = getProductAddonGroups(p, settings).length > 0;
 
@@ -974,7 +1003,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                       <div
                         key={p.id}
                         onClick={() => {
-                          if (!isOutOfStock && !isCombo) {
+                          if (!isOutOfStock) {
                             setSelectedProduct(p);
                             setItemSaleUnit('unit');
                             setItemQuantity(1);
@@ -982,9 +1011,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                           }
                         }}
                         className={`p-2.5 rounded-2xl border transition-all flex items-center justify-between gap-3 ${
-                          isCombo
-                            ? 'opacity-55 bg-neutral-50 border-neutral-200 cursor-not-allowed'
-                            : isSelected
+                          isSelected
                             ? 'border-amber-500 bg-amber-500/10 shadow-xs cursor-pointer'
                             : isOutOfStock
                             ? 'opacity-40 bg-neutral-50 border-neutral-200 cursor-not-allowed'
@@ -1021,9 +1048,24 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                               )}
                             </div>
                             {isCombo ? (
-                              <span className="inline-block mt-0.5 text-[10px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md">
-                                Combo: venda no balcão ou na loja
-                              </span>
+                              <div className="mt-0.5 space-y-0.5">
+                                {comboMetrics?.itemsSummaryText && (
+                                  <span className="block text-[10px] font-semibold text-amber-900 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-md truncate">
+                                    {comboMetrics.itemsSummaryText}
+                                  </span>
+                                )}
+                                <span
+                                  className={`inline-block text-[10px] font-bold ${
+                                    isOutOfStock
+                                      ? 'text-red-600'
+                                      : p.stock <= 5
+                                      ? 'text-amber-600'
+                                      : 'text-neutral-500'
+                                  }`}
+                                >
+                                  Disponível: {p.stock}
+                                </span>
+                              </div>
                             ) : (
                               <>
                                 <div className="flex items-center gap-2 text-[10px] text-neutral-400 mt-0.5 flex-wrap">
@@ -1066,7 +1108,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
 
               {/* Launch Form Bar (Fixed bottom drawer on <640px, bottom of right column on >=640px) */}
               {selectedProduct && (() => {
-                const hasCase = hasProductCase(selectedProduct);
+                const hasCase = canSellProductCase(selectedProduct, settings, 'local');
                 const caseUnavailable = hasCase && selectedProduct.stock < Number(selectedProduct.caseSize);
                 const isCase = itemSaleUnit === 'case' && hasCase && !caseUnavailable;
                 const unitEffPrice = getEffectiveProductPrice(selectedProduct);
@@ -1330,6 +1372,13 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                                   ? `${it.quantity} cx ${it.productName} (c/${it.unitsPerSale})`
                                   : `${it.quantity}x ${it.productName}`}
                               </span>
+                              {it.comboItems && it.comboItems.length > 0 && (
+                                <div className="pl-2 mt-0.5 space-y-0.5 text-[10px] text-neutral-600 font-semibold">
+                                  {it.comboItems.map((ci, ciIdx) => (
+                                    <div key={`${ci.productId}-${ciIdx}`}>{formatOrderItemComboLine(ci)}</div>
+                                  ))}
+                                </div>
+                              )}
                               <div className="text-[10px] text-neutral-400">
                                 {it.quantity} {isCase ? 'cx' : 'x'} R$ {it.unitPrice.toFixed(2)}
                               </div>

@@ -14,6 +14,7 @@ import {
   getEffectiveProductPrice,
   getPromoDiscountPercent,
   hasProductCase,
+  canSellProductCase,
   resolveStoreCategories,
   sortProductsForStore,
   OrderItemAddon,
@@ -24,6 +25,7 @@ import {
   isComboProduct,
   calculateComboMetrics,
   formatOrderItemComboLine,
+  isProductHiddenFromStore,
 } from '../../types';
 import { api, CouponValidationResult, CustomerDeliveryQuoteResult } from '../../services/api';
 import { CustomerAuthModal } from './CustomerAuthModal';
@@ -499,7 +501,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return () => clearInterval(interval);
   }, [cart.length, isCartOpen]);
 
-  // If a product in the cart goes out of stock (stock < 1) or becomes inactive, remove it and notify the customer
+  // If a product in the cart goes out of stock (stock < 1), becomes inactive, or is hidden from online store, remove it and notify the customer
   useEffect(() => {
     if (cart.length === 0 || products.length === 0) return;
     const productMap = new Map<string, Product>(products.map((p) => [p.id, p]));
@@ -508,7 +510,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
     for (const item of cart) {
       const fresh = productMap.get(item.product.id);
-      if (!fresh || !fresh.active || fresh.stock < 1) {
+      if (!fresh || !fresh.active || fresh.stock < 1 || isProductHiddenFromStore(item.product.id, settings)) {
         hasExhausted = true;
         exhaustedNames.add(fresh?.name || item.product.name);
       }
@@ -518,7 +520,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setCart((prev) => {
         const next = prev.filter((item) => {
           const fresh = productMap.get(item.product.id);
-          return Boolean(fresh && fresh.active && fresh.stock >= 1);
+          return Boolean(
+            fresh &&
+              fresh.active &&
+              fresh.stock >= 1 &&
+              !isProductHiddenFromStore(item.product.id, settings)
+          );
         });
         if (next.length === 0) {
           setCheckoutClientRequestId(crypto.randomUUID());
@@ -526,7 +533,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         return next;
       });
       const messages = Array.from(exhaustedNames).map(
-        (name) => `${name} esgotou e saiu do carrinho`
+        (name) => `${name} ficou indisponível no delivery e saiu do carrinho`
       );
       setOutOfStockNotices((prev) => {
         const combined = [...prev];
@@ -536,16 +543,17 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         return combined;
       });
     }
-  }, [products, cart]);
+  }, [products, cart, settings]);
 
-  // Visible products in the store (respecting showOutOfStock setting)
+  // Visible products in the store (respecting showOutOfStock and hiddenFromStoreIds settings)
   const storeVisibleProducts = useMemo(() => {
     return products.filter((p) => {
       if (!p.active) return false;
+      if (isProductHiddenFromStore(p.id, settings)) return false;
       if (!showOutOfStock && p.stock < 1) return false;
       return true;
     });
-  }, [products, showOutOfStock]);
+  }, [products, showOutOfStock, settings]);
 
   const storeCategories = useMemo(
     () => resolveStoreCategories(settings, products),
@@ -618,14 +626,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   }, [selectedCategory, searchQuery, storeCategories, baseVisibleProducts, knownCategoryIds, settings, storeVisibleProducts]);
 
   const getSelectedUnit = (product: Product): SaleUnit => {
-    if (!hasProductCase(product)) return 'unit';
+    if (!canSellProductCase(product, settings, 'store')) return 'unit';
     if (product.stock < Number(product.caseSize)) return 'unit';
     return selectedUnits[product.id] || 'unit';
   };
 
   const getCartItemUnitPrice = (product: Product, saleUnit: SaleUnit, addonsTotal = 0): number => {
     const base =
-      saleUnit === 'case' && hasProductCase(product)
+      saleUnit === 'case' && canSellProductCase(product, settings, 'store')
         ? Number(product.casePrice)
         : getEffectiveProductPrice(product);
     return Math.round((base + (Number(addonsTotal) || 0)) * 100) / 100;
@@ -636,7 +644,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       .filter((i) => i.product.id === productId)
       .reduce((sum, i) => {
         const cp = products.find((p) => p.id === i.product.id) || i.product;
-        const mult = i.saleUnit === 'case' && hasProductCase(cp) ? Number(cp.caseSize) : 1;
+        const mult = i.saleUnit === 'case' && canSellProductCase(cp, settings, 'store') ? Number(cp.caseSize) : 1;
         return sum + i.quantity * mult;
       }, 0);
   };
@@ -780,7 +788,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     addons?: OrderItemAddon[],
     addonsTotal?: number
   ) => {
-    const isCase = saleUnit === 'case' && hasProductCase(product);
+    const isCase = saleUnit === 'case' && canSellProductCase(product, settings, 'store');
     const unitsPerSale = isCase ? Number(product.caseSize) : 1;
     const addonsSig = buildOrderItemAddonsSignature(addons);
     const lineId = `${product.id}::${saleUnit}::${addonsSig}`;
@@ -830,7 +838,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       const existing = prev.find((i) => i.lineId === lineId);
       if (!existing) return prev;
       const currentProd = products.find((p) => p.id === existing.product.id) || existing.product;
-      const isCase = existing.saleUnit === 'case' && hasProductCase(currentProd);
+      const isCase = existing.saleUnit === 'case' && canSellProductCase(currentProd, settings, 'store');
       const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
 
       if (delta > 0) {
@@ -965,7 +973,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         deliveryType,
         items: cart.map((i) => {
           const currentProd = products.find((p) => p.id === i.product.id) || i.product;
-          const isCase = i.saleUnit === 'case' && hasProductCase(currentProd);
+          const isCase = i.saleUnit === 'case' && canSellProductCase(currentProd, settings, 'store');
           const effPrice = getCartItemUnitPrice(currentProd, i.saleUnit, i.addonsTotal);
           const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
           return {
@@ -1047,7 +1055,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
               continue;
             }
             const avail = remainingByProd.has(fp.id) ? remainingByProd.get(fp.id)! : fp.stock;
-            const isCase = item.saleUnit === 'case' && hasProductCase(fp);
+            const isCase = item.saleUnit === 'case' && canSellProductCase(fp, settings, 'store');
             const mult = isCase ? Number(fp.caseSize) : 1;
             const requestedUnits = item.quantity * mult;
 
@@ -1693,7 +1701,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             {promoProducts.map((product) => {
               const isCombo = isComboProduct(product.id, settings);
               const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
-              const hasCase = !isCombo && hasProductCase(product);
+              const hasCase = !isCombo && canSellProductCase(product, settings, 'store');
               const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
               const activeUnit = getSelectedUnit(product);
               const isCaseSelected = activeUnit === 'case' && hasCase;
@@ -1978,7 +1986,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 {section.items.map((product) => {
                   const isCombo = isComboProduct(product.id, settings);
                   const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
-                  const hasCase = !isCombo && hasProductCase(product);
+                  const hasCase = !isCombo && canSellProductCase(product, settings, 'store');
                   const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
                   const activeUnit = getSelectedUnit(product);
                   const isCaseSelected = activeUnit === 'case' && hasCase;
@@ -2191,7 +2199,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
           {filteredProducts.map((product) => {
             const isCombo = isComboProduct(product.id, settings);
             const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
-            const hasCase = !isCombo && hasProductCase(product);
+            const hasCase = !isCombo && canSellProductCase(product, settings, 'store');
             const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
             const activeUnit = getSelectedUnit(product);
             const isCaseSelected = activeUnit === 'case' && hasCase;
@@ -2485,7 +2493,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 </h4>
                 {cart.map((item) => {
                   const currentProd = products.find((p) => p.id === item.product.id) || item.product;
-                  const isCase = item.saleUnit === 'case' && hasProductCase(currentProd);
+                  const isCase = item.saleUnit === 'case' && canSellProductCase(currentProd, settings, 'store');
                   const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
                   const promoActive = !isCase && isProductPromoActive(currentProd);
                   const effPrice = getCartItemUnitPrice(currentProd, item.saleUnit, item.addonsTotal);

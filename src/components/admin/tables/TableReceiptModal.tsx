@@ -1,5 +1,5 @@
 import React from 'react';
-import { Order, StoreSettings } from '../../../types';
+import { Order, OrderItemComboComponent, StoreSettings, formatOrderItemComboLine } from '../../../types';
 import { X, Printer, CheckCircle2 } from 'lucide-react';
 
 interface TableReceiptModalProps {
@@ -39,6 +39,7 @@ export const TableReceiptModal: React.FC<TableReceiptModalProps> = ({
         quantity: number;
         saleUnit?: 'unit' | 'case';
         unitsPerSale?: number;
+        comboItems?: OrderItemComboComponent[];
       }
     >();
 
@@ -49,6 +50,9 @@ export const TableReceiptModal: React.FC<TableReceiptModalProps> = ({
       const existing = map.get(key);
       if (existing) {
         existing.quantity += it.quantity;
+        if (!existing.comboItems && it.comboItems && it.comboItems.length > 0) {
+          existing.comboItems = it.comboItems;
+        }
       } else {
         map.set(key, {
           key,
@@ -58,6 +62,7 @@ export const TableReceiptModal: React.FC<TableReceiptModalProps> = ({
           quantity: it.quantity,
           saleUnit,
           unitsPerSale,
+          comboItems: it.comboItems && it.comboItems.length > 0 ? it.comboItems : undefined,
         });
       }
     }
@@ -145,6 +150,13 @@ export const TableReceiptModal: React.FC<TableReceiptModalProps> = ({
                         : `${it.quantity}x ${it.name}`}
                     </span>
                     {it.volume && <span className="text-[10px] text-neutral-500"> ({it.volume})</span>}
+                    {it.comboItems && it.comboItems.length > 0 && (
+                      <div className="pl-2 mt-0.5 space-y-0.5 text-[10px] text-neutral-600 font-semibold">
+                        {it.comboItems.map((ci, ciIdx) => (
+                          <div key={`${ci.productId}-${ciIdx}`}>{formatOrderItemComboLine(ci)}</div>
+                        ))}
+                      </div>
+                    )}
                     <div className="text-[10px] text-neutral-400">
                       {it.quantity} {isCase ? 'cx' : 'x'} R$ {it.price.toFixed(2)}
                     </div>

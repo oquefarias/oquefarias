@@ -1,5 +1,13 @@
 import React, { useState } from 'react';
-import { TabDetail, PaymentMethod, Order, StoreSettings, DEFAULT_SHORTCUTS } from '../../../types';
+import {
+  TabDetail,
+  PaymentMethod,
+  Order,
+  OrderItemComboComponent,
+  StoreSettings,
+  DEFAULT_SHORTCUTS,
+  formatOrderItemComboLine,
+} from '../../../types';
 import { api } from '../../../services/api';
 import {
   X,
@@ -111,6 +119,7 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
         unitsPerSale: number;
         unitPrice: number;
         quantity: number;
+        comboItems?: OrderItemComboComponent[];
       }
     >();
 
@@ -121,6 +130,9 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
       const existing = map.get(key);
       if (existing) {
         existing.quantity += it.quantity;
+        if (!existing.comboItems && it.comboItems && it.comboItems.length > 0) {
+          existing.comboItems = it.comboItems;
+        }
       } else {
         map.set(key, {
           key,
@@ -129,6 +141,7 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
           unitsPerSale,
           unitPrice: it.unitPrice,
           quantity: it.quantity,
+          comboItems: it.comboItems && it.comboItems.length > 0 ? it.comboItems : undefined,
         });
       }
     }
@@ -136,9 +149,7 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
     return Array.from(map.values());
   }, [currentTab]);
 
-  if (!isOpen || !currentTab) return null;
-
-  const subtotal = currentTab.subtotal || 0;
+  const subtotal = currentTab?.subtotal || 0;
   const feePercentVal = includeServiceFee ? Math.max(0, Math.min(20, serviceFeePercent)) : 0;
   const serviceFeeAmount = Math.round(subtotal * (feePercentVal / 100) * 100) / 100;
   const maxDiscountAllowed = Math.round((subtotal + serviceFeeAmount) * 100) / 100;
@@ -174,7 +185,7 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
       : `${normalPeople} × R$ ${(baseCents / 100).toFixed(2).replace('.', ',')} + ${extraPeople} × R$ ${((baseCents + 1) / 100).toFixed(2).replace('.', ',')}`;
 
   const submitCloseTab = async () => {
-    if (isSubmitting || isDiscountInvalid || isCashShort) return;
+    if (!currentTab || isSubmitting || isDiscountInvalid || isCashShort) return;
     setIsSubmitting(true);
     setError('');
 
@@ -246,6 +257,8 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown, true);
   }, [isOpen, currentTab, onClose, settings?.shortcuts]);
 
+  if (!isOpen || !currentTab) return null;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-4 bg-black/60 backdrop-blur-xs animate-in fade-in duration-200">
       <div className="bg-white rounded-3xl w-full max-w-lg max-h-[92vh] shadow-2xl border border-neutral-100 overflow-hidden flex flex-col">
@@ -289,15 +302,24 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
                   const isCase = it.saleUnit === 'case' && it.unitsPerSale > 1;
                   const totalUnits = it.quantity * it.unitsPerSale;
                   return (
-                    <div key={it.key} className="flex justify-between items-center">
-                      <span className="truncate pr-2">
-                        {isCase
-                          ? `${it.quantity} cx ${it.productName} (${totalUnits} un)`
-                          : `${it.quantity}x ${it.productName}`}
-                      </span>
-                      <span className="font-bold text-neutral-800 shrink-0">
-                        R$ {(it.unitPrice * it.quantity).toFixed(2)}
-                      </span>
+                    <div key={it.key}>
+                      <div className="flex justify-between items-center">
+                        <span className="truncate pr-2">
+                          {isCase
+                            ? `${it.quantity} cx ${it.productName} (${totalUnits} un)`
+                            : `${it.quantity}x ${it.productName}`}
+                        </span>
+                        <span className="font-bold text-neutral-800 shrink-0">
+                          R$ {(it.unitPrice * it.quantity).toFixed(2)}
+                        </span>
+                      </div>
+                      {it.comboItems && it.comboItems.length > 0 && (
+                        <div className="pl-2 mt-0.5 space-y-0.5 text-[10px] text-amber-800 font-semibold">
+                          {it.comboItems.map((ci, ciIdx) => (
+                            <div key={`${ci.productId}-${ciIdx}`}>{formatOrderItemComboLine(ci)}</div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
