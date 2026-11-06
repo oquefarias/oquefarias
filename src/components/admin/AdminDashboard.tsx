@@ -425,16 +425,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [stockCategoryFilter, setStockCategoryFilter] = useState<ProductCategory | 'todas' | 'outros'>('todas');
   const [stockSortBy, setStockSortBy] = useState<'az' | 'price' | 'stock' | 'category'>('az');
   const [onlyLowStock, setOnlyLowStock] = useState<boolean>(false);
+  const [onlyZeroCost, setOnlyZeroCost] = useState<boolean>(false);
+  const [showStockValueHelp, setShowStockValueHelp] = useState<boolean>(false);
   const [isProductModalOpen, setIsProductModalOpen] = useState<boolean>(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState<boolean>(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [editingComboIdForModal, setEditingComboIdForModal] = useState<string | null>(null);
   const [stockRowUnits, setStockRowUnits] = useState<Record<string, SaleUnit>>({});
   const [stockInlineErrorByProduct, setStockInlineErrorByProduct] = useState<Record<string, string>>({});
+  const [stockInlineSuccessByProduct, setStockInlineSuccessByProduct] = useState<Record<string, string>>({});
+  const stockInlineSuccessTimersRef = React.useRef<Record<string, number>>({});
   const [inlineStockEdit, setInlineStockEdit] = useState<{
     productId: string;
     value: string;
     reason: StockAdjustReason;
+    unit: SaleUnit;
     saving?: boolean;
   } | null>(null);
   const pendingQuickStockRef = React.useRef<
@@ -882,10 +887,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     return localOrders.filter(o => o.status === 'pendente');
   }, [localOrders]);
 
-  // Low stock products count
+  // Low stock products count (only active non-combo products with stock <= minStock)
   const lowStockProducts = useMemo(() => {
-    return products.filter(p => p.stock <= p.minStock);
-  }, [products]);
+    return products.filter(
+      (p) => p.active && !isComboProduct(p.id, settings) && p.stock <= p.minStock
+    );
+  }, [products, settings]);
+
+  // Active non-combo products with stock > 0 and costPrice === 0
+  const zeroCostStockProducts = useMemo(() => {
+    return products.filter(
+      (p) =>
+        p.active &&
+        !isComboProduct(p.id, settings) &&
+        p.stock > 0 &&
+        (!p.costPrice || Number(p.costPrice) <= 0)
+    );
+  }, [products, settings]);
 
   // Filtered orders list (instant UI responsiveness without F5)
   const filteredOrders = useMemo(() => {
@@ -901,7 +919,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       } else if (stockCategoryFilter !== 'todas' && p.category !== stockCategoryFilter) {
         return false;
       }
-      if (onlyLowStock && p.stock > p.minStock) return false;
+      if (onlyLowStock && (!p.active || isComboProduct(p.id, settings) || p.stock > p.minStock)) {
+        return false;
+      }
+      if (
+        onlyZeroCost &&
+        (!p.active || isComboProduct(p.id, settings) || p.stock <= 0 || (Number(p.costPrice) || 0) > 0)
+      ) {
+        return false;
+      }
       if (stockSearch.trim()) {
         const q = stockSearch.toLowerCase();
         return (
@@ -935,7 +961,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       // default 'az'
       return a.name.localeCompare(b.name, 'pt-BR', { sensitivity: 'base' });
     });
-  }, [products, stockCategoryFilter, onlyLowStock, stockSearch, stockSortBy, storeCategories, storeCategoryIdSet]);
+  }, [
+    products,
+    settings,
+    stockCategoryFilter,
+    onlyLowStock,
+    onlyZeroCost,
+    stockSearch,
+    stockSortBy,
+    storeCategories,
+    storeCategoryIdSet,
+  ]);
 
   // Order status actions - Instant optimistic update without requiring page reload
   const handleUpdateStatus = async (orderId: string, newStatus: OrderStatus, notes?: string) => {
@@ -1049,8 +1085,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     }, 600);
   };
 
+  const showInlineStockSuccess = (productId: string, message: string) => {
+    if (stockInlineSuccessTimersRef.current[productId]) {
+      window.clearTimeout(stockInlineSuccessTimersRef.current[productId]);
+    }
+    setStockInlineSuccessByProduct((prev) => ({
+      ...prev,
+      [productId]: message,
+    }));
+    stockInlineSuccessTimersRef.current[productId] = window.setTimeout(() => {
+      delete stockInlineSuccessTimersRef.current[productId];
+      setStockInlineSuccessByProduct((prev) => {
+        if (!prev[productId]) return prev;
+        const next = { ...prev };
+        delete next[productId];
+        return next;
+      });
+    }, 3000);
+  };
+
   const handleSaveInlineStockEdit = async (product: Product) => {
     if (!inlineStockEdit || inlineStockEdit.productId !== product.id || inlineStockEdit.saving) return;
+    const chosenReason: StockAdjustReason = inlineStockEdit.reason || 'entrada';
+    const isDeltaReason = chosenReason === 'entrada' || chosenReason === 'perda';
     const trimmed = inlineStockEdit.value.trim();
     const parsedVal = Number(trimmed);
 
@@ -1062,6 +1119,38 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       return;
     }
 
+    if (isDeltaReason && parsedVal <= 0) {
+      setStockInlineErrorByProduct((prev) => ({
+        ...prev,
+        [product.id]: 'Informe uma quantidade maior que zero.',
+      }));
+      return;
+    }
+
+    if (!isDeltaReason && parsedVal < 0) {
+      setStockInlineErrorByProduct((prev) => ({
+        ...prev,
+        [product.id]: 'O estoque não pode ficar negativo.',
+      }));
+      return;
+    }
+
+    const previousStock = product.stock;
+    const hasStockCase = hasProductStockCase(product);
+    const unitMultiplier =
+      isDeltaReason && inlineStockEdit.unit === 'case' && hasStockCase
+        ? Number(product.caseSize)
+        : 1;
+    const totalUnits = parsedVal * unitMultiplier;
+
+    if (chosenReason === 'perda' && previousStock - totalUnits < 0) {
+      setStockInlineErrorByProduct((prev) => ({
+        ...prev,
+        [product.id]: 'A perda não pode deixar o estoque negativo.',
+      }));
+      return;
+    }
+
     setStockInlineErrorByProduct((prev) => {
       if (!prev[product.id]) return prev;
       const next = { ...prev };
@@ -1069,22 +1158,44 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       return next;
     });
 
-    const previousStock = product.stock;
-    const chosenReason = inlineStockEdit.reason || 'ajuste';
+    const mode: 'delta' | 'set' = isDeltaReason ? 'delta' : 'set';
+    const apiValue =
+      chosenReason === 'entrada'
+        ? totalUnits
+        : chosenReason === 'perda'
+        ? -totalUnits
+        : parsedVal;
+    const optimisticStock =
+      chosenReason === 'entrada'
+        ? previousStock + totalUnits
+        : chosenReason === 'perda'
+        ? previousStock - totalUnits
+        : parsedVal;
+
+    const successMessage =
+      chosenReason === 'entrada'
+        ? `Entrada de ${totalUnits} un registrada`
+        : chosenReason === 'perda'
+        ? `Perda de ${totalUnits} un registrada`
+        : chosenReason === 'contagem'
+        ? `Contagem de ${parsedVal} un registrada`
+        : `Ajuste para ${parsedVal} un registrado`;
+
     setInlineStockEdit((prev) => (prev ? { ...prev, saving: true } : null));
 
-    if (parsedVal >= 0) {
-      api.setLocalProductStock(product.id, parsedVal);
+    if (optimisticStock >= 0) {
+      api.setLocalProductStock(product.id, optimisticStock);
     }
 
     try {
       const res = await api.adjustProductStock(product.id, {
-        mode: 'set',
-        value: parsedVal,
+        mode,
+        value: apiValue,
         reason: chosenReason,
       });
       api.setLocalProductStock(product.id, res.stock);
       setInlineStockEdit(null);
+      showInlineStockSuccess(product.id, successMessage);
     } catch (err: any) {
       api.setLocalProductStock(product.id, previousStock);
       setInlineStockEdit((prev) => (prev ? { ...prev, saving: false } : null));
@@ -1916,7 +2027,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       dinheiro: todayOrders.filter(o => o.paymentMethod === 'dinheiro').reduce((s, o) => s + o.total, 0),
     };
 
-    const totalStockValue = products.reduce((sum, p) => sum + p.price * p.stock, 0);
+    const activeNonComboProducts = products.filter(
+      (p) => p.active && !isComboProduct(p.id, settings)
+    );
+    const totalStockUnits = activeNonComboProducts.reduce(
+      (sum, p) => sum + Math.max(0, Number(p.stock) || 0),
+      0
+    );
+    const totalStockCostValue =
+      Math.round(
+        activeNonComboProducts.reduce(
+          (sum, p) => sum + Math.max(0, Number(p.costPrice) || 0) * Math.max(0, Number(p.stock) || 0),
+          0
+        ) * 100
+      ) / 100;
+    const totalStockSaleValue =
+      Math.round(
+        activeNonComboProducts.reduce(
+          (sum, p) => sum + Math.max(0, Number(p.price) || 0) * Math.max(0, Number(p.stock) || 0),
+          0
+        ) * 100
+      ) / 100;
+    const totalStockValue = totalStockCostValue;
 
     return {
       todayOrdersCount: todayOrders.length,
@@ -1931,9 +2063,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       mesaRevenue,
       serviceFeeTotalToday: Math.round(serviceFeeTotalToday * 100) / 100,
       paymentBreakdown,
+      totalStockUnits,
+      totalStockCostValue,
+      totalStockSaleValue,
       totalStockValue,
     };
-  }, [localOrders, products]);
+  }, [localOrders, products, settings]);
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -2682,6 +2817,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             }`}>
                               {order.source === 'online' ? '📱 Site Online' : order.source === 'mesa' ? '🍽️ Mesa' : '🏪 Venda Balcão'}
                             </span>
+                            {order.source === 'online' && !order.customerId && (
+                              <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 border border-amber-300">
+                                Sem cadastro
+                              </span>
+                            )}
                             <span className="text-xs text-neutral-400 font-medium">{formatDate(order.createdAt)}</span>
                           </div>
 
@@ -3572,7 +3712,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <div className="bg-white p-4 rounded-2xl border border-neutral-200">
                   <span className="text-xs font-medium text-neutral-500">Itens em Estoque</span>
                   <p className="text-xl sm:text-2xl font-black text-neutral-900 mt-1">
-                    {products.reduce((s, p) => s + p.stock, 0)} <span className="text-xs font-normal text-neutral-500">un</span>
+                    {financialStats.totalStockUnits} <span className="text-xs font-normal text-neutral-500">un</span>
                   </p>
                 </div>
                 <div className="bg-white p-4 rounded-2xl border border-neutral-200">
@@ -3585,11 +3725,50 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     {lowStockProducts.length}
                   </p>
                 </div>
-                <div className="bg-white p-4 rounded-2xl border border-neutral-200">
-                  <span className="text-xs font-medium text-neutral-500">Valor em Estoque</span>
+                <div className="bg-white p-4 rounded-2xl border border-neutral-200 relative">
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-xs font-medium text-neutral-500">Custo do estoque</span>
+                    <button
+                      type="button"
+                      onClick={() => setShowStockValueHelp((prev) => !prev)}
+                      title="Soma de estoque × custo de cada produto ativo. Combos não entram porque o estoque deles é o dos produtos de dentro."
+                      aria-label="Explicação do cálculo do custo do estoque"
+                      className="w-4 h-4 rounded-full bg-neutral-100 hover:bg-neutral-200 text-neutral-600 text-[10px] font-black flex items-center justify-center transition-colors cursor-pointer shrink-0"
+                    >
+                      ?
+                    </button>
+                  </div>
+                  {showStockValueHelp && (
+                    <div className="mt-1.5 p-2 rounded-xl bg-neutral-900 text-white text-[11px] font-medium leading-snug">
+                      Soma de estoque × custo de cada produto ativo. Combos não entram porque o estoque deles é o dos produtos de dentro.
+                    </div>
+                  )}
                   <p className="text-xl sm:text-2xl font-black text-neutral-900 mt-1">
-                    {formatCurrency(financialStats.totalStockValue)}
+                    {formatCurrency(financialStats.totalStockCostValue)}
                   </p>
+                  <p className="text-[11px] font-semibold text-neutral-500 mt-0.5">
+                    Valor de venda: <span className="font-bold text-neutral-700">{formatCurrency(financialStats.totalStockSaleValue)}</span>
+                  </p>
+                  {zeroCostStockProducts.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = !onlyZeroCost;
+                        setOnlyZeroCost(next);
+                        if (next) {
+                          setOnlyLowStock(false);
+                          setStockCategoryFilter('todas');
+                        }
+                      }}
+                      className={`mt-1.5 text-[11px] font-bold underline text-left transition-colors cursor-pointer block ${
+                        onlyZeroCost ? 'text-red-700' : 'text-amber-700 hover:text-amber-800'
+                      }`}
+                    >
+                      {zeroCostStockProducts.length}{' '}
+                      {zeroCostStockProducts.length === 1 ? 'produto sem custo cadastrado' : 'produtos sem custo cadastrado'}
+                      {onlyZeroCost ? ' (ver todos)' : ''}
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -3631,8 +3810,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   </div>
 
                   <button
-                    onClick={() => setOnlyLowStock(!onlyLowStock)}
-                    className={`px-3 py-2.5 rounded-xl text-xs font-bold border transition-colors whitespace-nowrap ${
+                    onClick={() => {
+                      const next = !onlyLowStock;
+                      setOnlyLowStock(next);
+                      if (next) setOnlyZeroCost(false);
+                    }}
+                    className={`px-3 py-2.5 rounded-xl text-xs font-bold border transition-colors whitespace-nowrap cursor-pointer ${
                       onlyLowStock
                         ? 'bg-amber-500 text-white border-amber-600'
                         : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-50'
@@ -3640,6 +3823,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   >
                     ⚠️ Baixo Estoque
                   </button>
+
+                  {onlyZeroCost && (
+                    <button
+                      type="button"
+                      onClick={() => setOnlyZeroCost(false)}
+                      className="px-3 py-2.5 rounded-xl text-xs font-bold border bg-red-600 text-white border-red-700 transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      ✕ Sem custo cadastrado ({zeroCostStockProducts.length})
+                    </button>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
@@ -3909,82 +4102,211 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               ) : (
                                 <div className="flex flex-col items-center gap-1.5">
                                   {isEditingInline ? (
-                                    <div className="flex flex-col gap-1.5 p-2 rounded-xl bg-neutral-100 border border-neutral-300 w-52">
-                                      <div className="flex items-center gap-1">
-                                        <input
-                                          type="number"
-                                          step={1}
-                                          min={0}
-                                          autoFocus
-                                          disabled={inlineStockEdit?.saving}
-                                          value={inlineStockEdit?.value ?? ''}
-                                          onChange={(e) =>
-                                            setInlineStockEdit((prev) =>
-                                              prev ? { ...prev, value: e.target.value } : null
-                                            )
-                                          }
-                                          onKeyDown={(e) => {
-                                            if (e.key === 'Enter') {
-                                              e.preventDefault();
-                                              e.stopPropagation();
-                                              handleSaveInlineStockEdit(p);
-                                            } else if (e.key === 'Escape') {
-                                              e.preventDefault();
-                                              e.stopPropagation();
-                                              setInlineStockEdit(null);
-                                            }
-                                          }}
-                                          placeholder="Estoque (un)"
-                                          className="w-20 px-2 py-1 bg-white border border-neutral-300 rounded-lg text-xs font-black text-neutral-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
-                                        />
-                                        <select
-                                          disabled={inlineStockEdit?.saving}
-                                          value={inlineStockEdit?.reason || 'ajuste'}
-                                          onChange={(e) =>
-                                            setInlineStockEdit((prev) =>
-                                              prev
-                                                ? { ...prev, reason: e.target.value as StockAdjustReason }
-                                                : null
-                                            )
-                                          }
-                                          onKeyDown={(e) => {
-                                            if (e.key === 'Enter') {
-                                              e.preventDefault();
-                                              e.stopPropagation();
-                                              handleSaveInlineStockEdit(p);
-                                            } else if (e.key === 'Escape') {
-                                              e.preventDefault();
-                                              e.stopPropagation();
-                                              setInlineStockEdit(null);
-                                            }
-                                          }}
-                                          className="flex-1 min-w-0 px-1.5 py-1 bg-white border border-neutral-300 rounded-lg text-[10px] font-bold text-neutral-800 focus:outline-none focus:ring-2 focus:ring-amber-500"
-                                        >
-                                          <option value="ajuste">Ajuste</option>
-                                          <option value="entrada">Entrada de mercadoria</option>
-                                          <option value="perda">Perda/quebra</option>
-                                          <option value="contagem">Contagem</option>
-                                        </select>
-                                      </div>
-                                      <div className="flex items-center justify-end gap-1">
-                                        <button
-                                          type="button"
-                                          disabled={inlineStockEdit?.saving}
-                                          onClick={() => setInlineStockEdit(null)}
-                                          className="px-2 py-0.5 rounded bg-white hover:bg-neutral-200 text-neutral-600 text-[10px] font-bold border border-neutral-200 cursor-pointer"
-                                        >
-                                          Esc
-                                        </button>
-                                        <button
-                                          type="button"
-                                          disabled={inlineStockEdit?.saving}
-                                          onClick={() => handleSaveInlineStockEdit(p)}
-                                          className="px-2.5 py-0.5 rounded bg-amber-500 hover:bg-amber-600 text-neutral-950 text-[10px] font-black cursor-pointer"
-                                        >
-                                          {inlineStockEdit?.saving ? '...' : 'Salvar (Enter)'}
-                                        </button>
-                                      </div>
-                                    </div>
+                                    (() => {
+                                      const curReason: StockAdjustReason = inlineStockEdit?.reason || 'entrada';
+                                      const isDeltaMode = curReason === 'entrada' || curReason === 'perda';
+                                      const curUnit: SaleUnit =
+                                        isDeltaMode && hasStockCase && inlineStockEdit?.unit === 'case'
+                                          ? 'case'
+                                          : 'unit';
+                                      const rawTyped = (inlineStockEdit?.value ?? '').trim();
+                                      const parsedTyped = rawTyped !== '' ? Number(rawTyped) : NaN;
+                                      const isValidInt =
+                                        rawTyped !== '' &&
+                                        Number.isInteger(parsedTyped) &&
+                                        (isDeltaMode ? parsedTyped > 0 : parsedTyped >= 0);
+                                      const caseMult = curUnit === 'case' && hasStockCase ? Number(p.caseSize) : 1;
+                                      const deltaUnits = isValidInt ? parsedTyped * caseMult : 0;
+                                      const resultingStock =
+                                        curReason === 'entrada'
+                                          ? p.stock + deltaUnits
+                                          : curReason === 'perda'
+                                          ? p.stock - deltaUnits
+                                          : isValidInt
+                                          ? parsedTyped
+                                          : p.stock;
+                                      const isNegativeLoss = curReason === 'perda' && isValidInt && resultingStock < 0;
+
+                                      const fieldLabel =
+                                        curReason === 'entrada'
+                                          ? 'Quantidade que chegou'
+                                          : curReason === 'perda'
+                                          ? 'Quantidade perdida'
+                                          : 'Estoque contado (novo total)';
+
+                                      return (
+                                        <div className="flex flex-col gap-2 p-2.5 rounded-xl bg-neutral-100 border border-neutral-300 w-64 text-left shadow-xs">
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-neutral-600 mb-0.5">
+                                              Motivo
+                                            </label>
+                                            <select
+                                              disabled={inlineStockEdit?.saving}
+                                              value={curReason}
+                                              onChange={(e) => {
+                                                const nextReason = e.target.value as StockAdjustReason;
+                                                const nextIsDelta =
+                                                  nextReason === 'entrada' || nextReason === 'perda';
+                                                setStockInlineErrorByProduct((prev) => {
+                                                  if (!prev[p.id]) return prev;
+                                                  const next = { ...prev };
+                                                  delete next[p.id];
+                                                  return next;
+                                                });
+                                                setInlineStockEdit((prev) =>
+                                                  prev
+                                                    ? {
+                                                        ...prev,
+                                                        reason: nextReason,
+                                                        value: nextIsDelta ? '' : String(p.stock),
+                                                        unit: nextIsDelta ? prev.unit : 'unit',
+                                                      }
+                                                    : null
+                                                );
+                                              }}
+                                              onKeyDown={(e) => {
+                                                if (e.key === 'Escape') {
+                                                  e.preventDefault();
+                                                  e.stopPropagation();
+                                                  setInlineStockEdit(null);
+                                                }
+                                              }}
+                                              className="w-full px-2 py-1.5 bg-white border border-neutral-300 rounded-lg text-xs font-bold text-neutral-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                                            >
+                                              <option value="entrada">Entrada de mercadoria</option>
+                                              <option value="perda">Perda/quebra</option>
+                                              <option value="contagem">Contagem</option>
+                                              <option value="ajuste">Ajuste</option>
+                                            </select>
+                                          </div>
+
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-neutral-600 mb-0.5">
+                                              {fieldLabel}
+                                            </label>
+                                            <div className="flex items-center gap-1.5">
+                                              <input
+                                                type="number"
+                                                step={1}
+                                                min={isDeltaMode ? 1 : 0}
+                                                autoFocus
+                                                disabled={inlineStockEdit?.saving}
+                                                value={inlineStockEdit?.value ?? ''}
+                                                onChange={(e) =>
+                                                  setInlineStockEdit((prev) =>
+                                                    prev ? { ...prev, value: e.target.value } : null
+                                                  )
+                                                }
+                                                onKeyDown={(e) => {
+                                                  if (e.key === 'Enter') {
+                                                    e.preventDefault();
+                                                    e.stopPropagation();
+                                                    if (!isNegativeLoss) {
+                                                      handleSaveInlineStockEdit(p);
+                                                    }
+                                                  } else if (e.key === 'Escape') {
+                                                    e.preventDefault();
+                                                    e.stopPropagation();
+                                                    setInlineStockEdit(null);
+                                                  }
+                                                }}
+                                                placeholder={isDeltaMode ? 'Ex: 50' : String(p.stock)}
+                                                className="flex-1 min-w-0 px-2.5 py-1.5 bg-white border border-neutral-300 rounded-lg text-xs font-black text-neutral-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                                              />
+
+                                              {isDeltaMode && hasStockCase && (
+                                                <div className="inline-flex bg-white p-0.5 rounded-lg border border-neutral-300 text-[10px] shrink-0">
+                                                  <button
+                                                    type="button"
+                                                    onClick={() =>
+                                                      setInlineStockEdit((prev) =>
+                                                        prev ? { ...prev, unit: 'unit' } : null
+                                                      )
+                                                    }
+                                                    className={`px-2 py-1 rounded-md font-black transition-colors cursor-pointer ${
+                                                      curUnit === 'unit'
+                                                        ? 'bg-neutral-900 text-white'
+                                                        : 'text-neutral-600 hover:text-neutral-900'
+                                                    }`}
+                                                  >
+                                                    un
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    onClick={() =>
+                                                      setInlineStockEdit((prev) =>
+                                                        prev ? { ...prev, unit: 'case' } : null
+                                                      )
+                                                    }
+                                                    className={`px-2 py-1 rounded-md font-black transition-colors cursor-pointer ${
+                                                      curUnit === 'case'
+                                                        ? 'bg-amber-500 text-neutral-950'
+                                                        : 'text-neutral-600 hover:text-neutral-900'
+                                                    }`}
+                                                  >
+                                                    cx
+                                                  </button>
+                                                </div>
+                                              )}
+                                            </div>
+
+                                            {isDeltaMode && curUnit === 'case' && hasStockCase && isValidInt && (
+                                              <p className="text-[11px] font-bold text-amber-800 mt-1">
+                                                {parsedTyped} cx de {p.caseSize} = {deltaUnits} un
+                                              </p>
+                                            )}
+                                          </div>
+
+                                          {isValidInt && (
+                                            <div
+                                              className={`px-2.5 py-1.5 rounded-lg border text-center ${
+                                                isNegativeLoss
+                                                  ? 'bg-red-50 border-red-300 text-red-800'
+                                                  : curReason === 'entrada'
+                                                  ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
+                                                  : curReason === 'perda'
+                                                  ? 'bg-amber-50 border-amber-300 text-amber-950'
+                                                  : 'bg-white border-neutral-300 text-neutral-900'
+                                              }`}
+                                            >
+                                              <p className="text-sm font-black tracking-tight">
+                                                {curReason === 'entrada'
+                                                  ? `${p.stock} + ${deltaUnits} = ${resultingStock} un`
+                                                  : curReason === 'perda'
+                                                  ? `${p.stock} − ${deltaUnits} = ${resultingStock} un`
+                                                  : `Novo total: ${parsedTyped} un (antes ${p.stock})`}
+                                              </p>
+                                              {isNegativeLoss && (
+                                                <p className="text-[10px] font-bold text-red-700 mt-0.5">
+                                                  Estoque não pode ficar negativo
+                                                </p>
+                                              )}
+                                            </div>
+                                          )}
+
+                                          <div className="flex items-center justify-end gap-1.5 pt-0.5">
+                                            <button
+                                              type="button"
+                                              disabled={inlineStockEdit?.saving}
+                                              onClick={() => setInlineStockEdit(null)}
+                                              className="px-2.5 py-1 rounded-lg bg-white hover:bg-neutral-200 text-neutral-600 text-[10px] font-bold border border-neutral-200 cursor-pointer"
+                                            >
+                                              Esc
+                                            </button>
+                                            <button
+                                              type="button"
+                                              disabled={
+                                                inlineStockEdit?.saving || !isValidInt || isNegativeLoss
+                                              }
+                                              onClick={() => handleSaveInlineStockEdit(p)}
+                                              className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 disabled:text-neutral-500 text-neutral-950 text-[10px] font-black cursor-pointer disabled:cursor-not-allowed"
+                                            >
+                                              {inlineStockEdit?.saving ? '...' : 'Salvar (Enter)'}
+                                            </button>
+                                          </div>
+                                        </div>
+                                      );
+                                    })()
                                   ) : (
                                     <>
                                       {hasStockCase && (
@@ -4092,18 +4414,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                             });
                                             setInlineStockEdit({
                                               productId: p.id,
-                                              value: String(p.stock),
-                                              reason: 'ajuste',
+                                              value: '',
+                                              reason: 'entrada',
+                                              unit: 'unit',
                                               saving: false,
                                             });
                                           }}
                                           className="px-2 h-6 bg-neutral-900 hover:bg-neutral-800 text-white rounded font-bold text-[10px] cursor-pointer ml-0.5"
-                                          title="Digitar novo estoque na própria linha (Enter salva, Esc cancela)"
+                                          title="Digitar entrada, perda ou contagem de estoque (Enter salva, Esc cancela)"
                                         >
                                           Digitar
                                         </button>
                                       </div>
                                     </>
+                                  )}
+
+                                  {stockInlineSuccessByProduct[p.id] && (
+                                    <div className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-[10px] font-bold">
+                                      <CheckCircle2 className="w-3 h-3 text-emerald-600 shrink-0" />
+                                      <span>{stockInlineSuccessByProduct[p.id]}</span>
+                                    </div>
                                   )}
 
                                   {rowStockError && (

@@ -26,11 +26,29 @@ import {
 } from '../../utils/geo';
 import { AddressPinMap } from '../AddressPinMap';
 
+export interface InitialRegisterData {
+  name?: string;
+  email?: string;
+  phone?: string;
+  cep?: string;
+  address?: string;
+  number?: string;
+  neighborhood?: string;
+  city?: string;
+  state?: string;
+  complement?: string;
+  reference?: string;
+  latitude?: number;
+  longitude?: number;
+}
+
 interface CustomerAuthModalProps {
   isOpen: boolean;
   deliveryAreas: DeliveryArea[];
   currentCustomer: CustomerProfile | null;
   settings?: StoreSettings;
+  initialRegisterData?: InitialRegisterData;
+  initialTab?: 'login' | 'cadastro';
   onSuccess: (cust: CustomerProfile) => void;
   onClose: () => void;
   onLogout?: () => void;
@@ -41,6 +59,8 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   deliveryAreas,
   currentCustomer,
   settings,
+  initialRegisterData,
+  initialTab,
   onSuccess,
   onClose,
   onLogout,
@@ -199,24 +219,31 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setDistanceKm(currentCustomer.distanceKm ?? null);
       setIsWithinRadius(currentCustomer.isWithinDeliveryRadius ?? null);
     } else {
-      setTab('login');
-      setName('');
-      setEmail('');
-      setPhone('');
+      const hasPrefilledData = Boolean(
+        initialRegisterData &&
+          (initialRegisterData.name?.trim() ||
+            initialRegisterData.phone?.trim() ||
+            initialRegisterData.address?.trim() ||
+            initialRegisterData.cep?.trim())
+      );
+      setTab(initialTab || (hasPrefilledData ? 'cadastro' : 'login'));
+      setName(initialRegisterData?.name || '');
+      setEmail(initialRegisterData?.email || '');
+      setPhone(initialRegisterData?.phone || '');
       setPassword('');
       setConfirmPassword('');
-      setCep('');
-      setAddress('');
-      setNumber('');
-      setNeighborhood(deliveryAreas[0]?.name || '');
-      setCity('');
-      setState('');
-      setComplement('');
-      setReference('');
-      setLat(undefined);
-      setLng(undefined);
-      setGeoLat(undefined);
-      setGeoLng(undefined);
+      setCep(initialRegisterData?.cep || '');
+      setAddress(initialRegisterData?.address || '');
+      setNumber(initialRegisterData?.number || '');
+      setNeighborhood(initialRegisterData?.neighborhood || deliveryAreas[0]?.name || '');
+      setCity(initialRegisterData?.city || '');
+      setState(initialRegisterData?.state || '');
+      setComplement(initialRegisterData?.complement || '');
+      setReference(initialRegisterData?.reference || '');
+      setLat(initialRegisterData?.latitude);
+      setLng(initialRegisterData?.longitude);
+      setGeoLat(initialRegisterData?.latitude);
+      setGeoLng(initialRegisterData?.longitude);
       setGeoPrecisao(null);
       setIsPinManuallyAdjusted(false);
       setDistanceKm(null);
@@ -232,7 +259,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!loginEmail.trim() || !loginPassword.trim()) {
-      setLoginError('Preencha seu e-mail e senha.');
+      setLoginError('Preencha seu e-mail/WhatsApp e senha.');
       return;
     }
 
@@ -757,14 +784,14 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
           <form onSubmit={handleLogin} className="p-6 space-y-4">
             <div>
               <label className="text-xs font-bold text-neutral-700 block mb-1">
-                E-mail
+                E-mail ou WhatsApp
               </label>
               <div className="relative">
                 <Mail className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
                 <input
-                  type="email"
+                  type="text"
                   required
-                  placeholder="seu@email.com"
+                  placeholder="seu@email.com ou (11) 99999-9999"
                   value={loginEmail}
                   onChange={(e) => {
                     setLoginEmail(e.target.value);

@@ -64,6 +64,10 @@ import {
   Loader2,
   Ticket,
   Navigation,
+  Lock,
+  Eye,
+  EyeOff,
+  Home,
 } from 'lucide-react';
 import {
   calculateDistanceKm,
@@ -148,6 +152,25 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [showCheckoutMap, setShowCheckoutMap] = useState<boolean>(false);
   const [checkoutTriggerGpsCount, setCheckoutTriggerGpsCount] = useState<number>(0);
 
+  // Checkout mode & logged-in address selection state
+  const [checkoutEntryStep, setCheckoutEntryStep] = useState<'choice' | 'guest'>('choice');
+  const [authModalInitialTab, setAuthModalInitialTab] = useState<'login' | 'cadastro'>('login');
+  const [loggedAddressMode, setLoggedAddressMode] = useState<'saved' | 'custom'>('saved');
+  const [saveCustomAddressToAccount, setSaveCustomAddressToAccount] = useState<boolean>(false);
+
+  // Guest order tracking & post-order account conversion state
+  const [trackedGuestToken, setTrackedGuestToken] = useState<string>('');
+  const [guestTrackingError, setGuestTrackingError] = useState<string>('');
+  const [savedGuestOrdersCount, setSavedGuestOrdersCount] = useState<number>(
+    () => api.getSavedGuestOrders().length
+  );
+  const [guestConvertPhone, setGuestConvertPhone] = useState<string>('');
+  const [guestConvertPassword, setGuestConvertPassword] = useState<string>('');
+  const [showGuestConvertPassword, setShowGuestConvertPassword] = useState<boolean>(false);
+  const [isConvertingGuest, setIsConvertingGuest] = useState<boolean>(false);
+  const [guestConvertError, setGuestConvertError] = useState<string>('');
+  const [guestConvertSuccess, setGuestConvertSuccess] = useState<boolean>(false);
+
   // Coupon state
   const [couponInput, setCouponInput] = useState<string>('');
   const [appliedCoupon, setAppliedCoupon] = useState<CouponValidationResult | null>(null);
@@ -161,13 +184,83 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [myOrdersError, setMyOrdersError] = useState<string>('');
   const [outOfStockNotices, setOutOfStockNotices] = useState<string[]>([]);
 
+  const refreshSavedGuestOrdersCount = () => {
+    setSavedGuestOrdersCount(api.getSavedGuestOrders().length);
+  };
+
+  // Detect /pedido/:id?t=<token> on initial load or browser navigation
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const checkTrackingUrl = async () => {
+      const pathMatch = window.location.pathname.match(/^\/pedido\/([^/?#]+)/i);
+      const params = new URLSearchParams(window.location.search);
+      const tok = (params.get('t') || '').trim();
+      if (!pathMatch || !pathMatch[1] || !tok) return;
+
+      const orderId = decodeURIComponent(pathMatch[1]);
+      setGuestTrackingError('');
+      try {
+        const res = await api.trackGuestOrder(orderId, tok);
+        if (res?.order) {
+          setTrackedGuestToken(tok);
+          setPlacedOrder({ ...res.order, guestToken: tok });
+          setGuestConvertPhone(res.order.customer?.phone || '');
+          refreshSavedGuestOrdersCount();
+        }
+      } catch (err: any) {
+        setGuestTrackingError(err?.message || 'Pedido não encontrado ou link de acompanhamento inválido.');
+      }
+    };
+
+    checkTrackingUrl();
+    window.addEventListener('popstate', checkTrackingUrl);
+    return () => window.removeEventListener('popstate', checkTrackingUrl);
+  }, []);
+
   const handleOpenMyOrders = async () => {
     setIsMyOrdersOpen(true);
     setIsLoadingMyOrders(true);
     setMyOrdersError('');
     try {
-      const list = await api.getCustomerOrders();
-      setMyOrders(list);
+      const mergedById = new Map<string, Order>();
+
+      if (api.isCustomerAuthenticated()) {
+        try {
+          const accountList = await api.getCustomerOrders();
+          for (const ord of accountList) {
+            mergedById.set(ord.id, ord);
+          }
+        } catch (err: any) {
+          if (api.getSavedGuestOrders().length === 0) {
+            throw err;
+          }
+        }
+      }
+
+      const guestSaved = api.getSavedGuestOrders();
+      if (guestSaved.length > 0) {
+        const trackedResults = await Promise.allSettled(
+          guestSaved.map((g) => api.trackGuestOrder(g.id, g.token))
+        );
+        for (let i = 0; i < guestSaved.length; i++) {
+          const res = trackedResults[i];
+          const g = guestSaved[i];
+          if (res.status === 'fulfilled' && res.value?.order) {
+            mergedById.set(res.value.order.id, {
+              ...res.value.order,
+              guestToken: g.token,
+              trackingUrl: g.trackingUrl,
+            });
+          }
+        }
+      }
+
+      const combined = Array.from(mergedById.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+      setMyOrders(combined);
+      refreshSavedGuestOrdersCount();
     } catch (err: any) {
       setMyOrdersError(err.message || 'Não foi possível carregar seus pedidos.');
     } finally {
@@ -175,17 +268,30 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     }
   };
 
-  // Poll placedOrder status every 15 seconds ONLY while the tab is visible
+  // Poll placedOrder status every 15 seconds ONLY while the tab is visible (supports both logged-in and guest orders)
   useEffect(() => {
-    if (!placedOrder || !api.isCustomerAuthenticated()) return;
+    if (!placedOrder) return;
     const orderId = placedOrder.id;
+    const guestTok =
+      placedOrder.guestToken || trackedGuestToken || api.getGuestTokenForOrder(orderId) || '';
+    const canPollCustomer = api.isCustomerAuthenticated() && Boolean(placedOrder.customerId);
+    const canPollGuest = Boolean(guestTok);
+
+    if (!canPollCustomer && !canPollGuest) return;
 
     const fetchCurrentOrder = async () => {
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
       try {
-        const updated = await api.getCustomerOrder(orderId);
-        if (updated && updated.id === orderId) {
-          setPlacedOrder(updated);
+        if (canPollCustomer) {
+          const updated = await api.getCustomerOrder(orderId);
+          if (updated && updated.id === orderId) {
+            setPlacedOrder(updated);
+          }
+        } else if (canPollGuest) {
+          const res = await api.trackGuestOrder(orderId, guestTok);
+          if (res?.order && res.order.id === orderId) {
+            setPlacedOrder({ ...res.order, guestToken: guestTok });
+          }
         }
       } catch {
         // Ignore transient network errors during background refresh
@@ -209,36 +315,44 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         document.removeEventListener('visibilitychange', handleVisibility);
       }
     };
-  }, [placedOrder?.id]);
+  }, [placedOrder?.id, placedOrder?.customerId, placedOrder?.guestToken, trackedGuestToken]);
+
+  const applySavedCustomerAddressToState = (cust: CustomerProfile) => {
+    setCustomerName(cust.name);
+    setCustomerPhone(cust.phone);
+    setCep(cust.cep || '');
+    setAddress(cust.address || '');
+    setAddressNumber(cust.number || '');
+    setNeighborhood(cust.neighborhood || deliveryAreas[0]?.name || '');
+    setCheckoutCity(cust.city || '');
+    setCheckoutState(cust.state || '');
+    setComplement(cust.complement || '');
+    setReference(cust.reference || '');
+    setCheckoutLat(cust.latitude);
+    setCheckoutLng(cust.longitude);
+    setCheckoutGeoLat(cust.geoLatitude ?? cust.latitude);
+    setCheckoutGeoLng(cust.geoLongitude ?? cust.longitude);
+    setCheckoutPrecisao(cust.geoPrecision || null);
+    setIsPinConfirmed(Boolean(cust.locationVerified || api.isCustomerPinConfirmed(cust.id)));
+    if (cust.distanceKm !== undefined && cust.isWithinDeliveryRadius !== undefined) {
+      setCustomerDistance({
+        km: cust.distanceKm,
+        inside: cust.isWithinDeliveryRadius,
+      });
+    } else {
+      setCustomerDistance(null);
+    }
+  };
 
   // Keep fields synced when currentCustomer changes
   useEffect(() => {
     if (currentCustomer) {
-      setCustomerName(currentCustomer.name);
-      setCustomerPhone(currentCustomer.phone);
-      if (currentCustomer.cep) setCep(currentCustomer.cep);
-      setAddress(currentCustomer.address);
-      setAddressNumber(currentCustomer.number);
-      if (currentCustomer.neighborhood) setNeighborhood(currentCustomer.neighborhood);
-      if (currentCustomer.city) setCheckoutCity(currentCustomer.city);
-      if (currentCustomer.state) setCheckoutState(currentCustomer.state);
-      if (currentCustomer.complement) setComplement(currentCustomer.complement);
-      if (currentCustomer.reference) setReference(currentCustomer.reference);
-      setCheckoutLat(currentCustomer.latitude);
-      setCheckoutLng(currentCustomer.longitude);
-      setCheckoutGeoLat(currentCustomer.geoLatitude ?? currentCustomer.latitude);
-      setCheckoutGeoLng(currentCustomer.geoLongitude ?? currentCustomer.longitude);
-      setCheckoutPrecisao(currentCustomer.geoPrecision || null);
-      setIsPinConfirmed(
-        Boolean(currentCustomer.locationVerified || api.isCustomerPinConfirmed(currentCustomer.id))
-      );
-      if (currentCustomer.distanceKm !== undefined && currentCustomer.isWithinDeliveryRadius !== undefined) {
-        setCustomerDistance({
-          km: currentCustomer.distanceKm,
-          inside: currentCustomer.isWithinDeliveryRadius,
-        });
-      }
+      setLoggedAddressMode('saved');
+      setSaveCustomAddressToAccount(false);
+      applySavedCustomerAddressToState(currentCustomer);
     } else {
+      setLoggedAddressMode('saved');
+      setSaveCustomAddressToAccount(false);
       setDeliveryQuote(null);
       setCheckoutLat(undefined);
       setCheckoutLng(undefined);
@@ -250,7 +364,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   }, [currentCustomer]);
 
   const refreshServerDeliveryQuote = async (subtotalVal: number, nhVal: string) => {
-    if (!api.isCustomerAuthenticated()) return null;
+    if (!api.isCustomerAuthenticated() || loggedAddressMode === 'custom') return null;
     const quote = await api.getCustomerDeliveryQuote(subtotalVal, nhVal);
     if (quote) {
       setDeliveryQuote(quote);
@@ -286,11 +400,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     setCheckoutLat(newLat);
     setCheckoutLng(newLng);
 
-    if (!api.isCustomerAuthenticated() || !currentCustomer) {
+    if (!api.isCustomerAuthenticated() || !currentCustomer || loggedAddressMode === 'custom') {
       if (settings.storeLatitude !== undefined && settings.storeLongitude !== undefined) {
         const d = calculateDistanceKm(settings.storeLatitude, settings.storeLongitude, newLat, newLng);
         const maxRadius = settings.deliveryRadiusKm || 5;
         setCustomerDistance({ km: d, inside: d <= maxRadius });
+      }
+      if (markConfirmed) {
+        setIsPinConfirmed(true);
       }
       return;
     }
@@ -704,14 +821,22 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     }, 0);
   }, [cart, products]);
 
-  // Fetch delivery quote from server whenever customer is logged in and cart/neighborhood changes
+  // Fetch delivery quote from server whenever customer is logged in and using saved address
   useEffect(() => {
-    if (!currentCustomer || !api.isCustomerAuthenticated()) {
+    if (!currentCustomer || !api.isCustomerAuthenticated() || loggedAddressMode === 'custom') {
       setDeliveryQuote(null);
       return;
     }
     refreshServerDeliveryQuote(cartSubtotal, neighborhood);
-  }, [currentCustomer?.id, currentCustomer?.latitude, currentCustomer?.longitude, cartSubtotal, neighborhood, isCartOpen]);
+  }, [
+    currentCustomer?.id,
+    currentCustomer?.latitude,
+    currentCustomer?.longitude,
+    cartSubtotal,
+    neighborhood,
+    isCartOpen,
+    loggedAddressMode,
+  ]);
 
   // If existing customer has old/unconfirmed coordinates and opens checkout with delivery, resolve full address if needed so the map is ready
   useEffect(() => {
@@ -719,6 +844,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       isCartOpen &&
       deliveryType === 'delivery' &&
       currentCustomer &&
+      loggedAddressMode === 'saved' &&
       !isPinConfirmed &&
       checkoutLat === undefined &&
       (address.trim() || cep.replace(/\D/g, '').length === 8)
@@ -740,11 +866,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         }
       });
     }
-  }, [isCartOpen, deliveryType, currentCustomer?.id, isPinConfirmed]);
+  }, [isCartOpen, deliveryType, currentCustomer?.id, isPinConfirmed, loggedAddressMode]);
 
   const deliveryFee = useMemo(() => {
     if (deliveryType === 'retirada') return 0;
-    if (deliveryQuote) {
+    if (deliveryQuote && loggedAddressMode === 'saved') {
       return deliveryQuote.deliveryFee;
     }
     if (settings.freeDeliveryThreshold > 0 && cartSubtotal >= settings.freeDeliveryThreshold) {
@@ -759,7 +885,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       fee += extraKm * settings.pricePerKm;
     }
     return Math.round(fee * 100) / 100;
-  }, [deliveryType, deliveryQuote, cartSubtotal, settings, matchedArea, customerDistance]);
+  }, [deliveryType, deliveryQuote, loggedAddressMode, cartSubtotal, settings, matchedArea, customerDistance]);
 
   const cartDiscount = useMemo(() => {
     if (!appliedCoupon) return 0;
@@ -1553,6 +1679,171 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
               )}
             </div>
 
+            {/* Post-Order Account Creation Offer for Guest Orders (Requirement 3e) */}
+            {!currentCustomer && !placedOrder.customerId && (
+              <div className="p-5 rounded-2xl bg-gradient-to-br from-amber-50 via-white to-amber-50/70 border-2 border-amber-300 shadow-xs space-y-3">
+                {guestConvertSuccess ? (
+                  <div className="flex items-center gap-3 text-emerald-800">
+                    <CheckCircle2 className="w-6 h-6 text-emerald-600 shrink-0" />
+                    <div>
+                      <p className="font-black text-sm">Conta criada com sucesso!</p>
+                      <p className="text-xs text-emerald-700">
+                        Seus dados e seu endereço já ficaram salvos para o próximo pedido.
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      if (isConvertingGuest) return;
+                      setGuestConvertError('');
+                      let digits = guestConvertPhone.replace(/\D/g, '');
+                      if ((digits.length === 12 || digits.length === 13) && digits.startsWith('55')) {
+                        digits = digits.slice(2);
+                      }
+                      if (digits.length < 10 || digits.length > 11) {
+                        setGuestConvertError('Confirme um WhatsApp válido com DDD (10 ou 11 dígitos).');
+                        return;
+                      }
+                      if (guestConvertPassword.length < 8) {
+                        setGuestConvertError('A senha precisa ter no mínimo 8 caracteres.');
+                        return;
+                      }
+                      setIsConvertingGuest(true);
+                      try {
+                        const tok =
+                          placedOrder.guestToken ||
+                          trackedGuestToken ||
+                          api.getGuestTokenForOrder(placedOrder.id) ||
+                          undefined;
+                        const createdCust = await api.registerCustomer({
+                          name: placedOrder.customer.name,
+                          phone: guestConvertPhone.trim(),
+                          password: guestConvertPassword,
+                          cep: placedOrder.customer.cep,
+                          address:
+                            placedOrder.deliveryType === 'delivery' ? placedOrder.customer.address : '',
+                          number:
+                            placedOrder.deliveryType === 'delivery' ? placedOrder.customer.number : '',
+                          neighborhood:
+                            placedOrder.deliveryType === 'delivery' ? placedOrder.customer.neighborhood : '',
+                          complement: placedOrder.customer.complement,
+                          reference: placedOrder.customer.reference,
+                          city: placedOrder.customer.city,
+                          state: placedOrder.customer.state,
+                          latitude: placedOrder.customer.latitude,
+                          longitude: placedOrder.customer.longitude,
+                          guestOrderId: placedOrder.id,
+                          guestToken: tok,
+                        });
+                        setCurrentCustomer(createdCust);
+                        setGuestConvertSuccess(true);
+                        setPlacedOrder((prev) =>
+                          prev ? { ...prev, customerId: createdCust.id } : prev
+                        );
+                      } catch (err: any) {
+                        setGuestConvertError(err?.message || 'Não foi possível criar a conta.');
+                      } finally {
+                        setIsConvertingGuest(false);
+                      }
+                    }}
+                    className="space-y-3"
+                  >
+                    <div>
+                      <h4 className="font-black text-sm text-neutral-900 flex items-center gap-1.5">
+                        <User className="w-4 h-4 text-amber-600" />
+                        <span>Quer salvar seus dados para a próxima? Crie uma senha</span>
+                      </h4>
+                      <p className="text-xs text-neutral-600 mt-0.5">
+                        Aproveitamos o nome e endereço deste pedido (<strong>{placedOrder.customer.name}</strong>
+                        {placedOrder.deliveryType === 'delivery' && placedOrder.customer.address
+                          ? ` • ${placedOrder.customer.address}, ${placedOrder.customer.number}`
+                          : ''}
+                        ).
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="text-[11px] font-bold text-neutral-700 block mb-1">
+                          Confirme seu WhatsApp
+                        </label>
+                        <input
+                          type="tel"
+                          required
+                          value={guestConvertPhone}
+                          onChange={(e) => {
+                            setGuestConvertPhone(e.target.value);
+                            if (guestConvertError) setGuestConvertError('');
+                          }}
+                          placeholder="(11) 99999-9999"
+                          className="w-full px-3 py-2 bg-white border border-neutral-300 rounded-xl text-xs font-semibold outline-amber-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-[11px] font-bold text-neutral-700 block mb-1">
+                          Crie uma senha (mín. 8 caracteres)
+                        </label>
+                        <div className="relative">
+                          <Lock className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
+                          <input
+                            type={showGuestConvertPassword ? 'text' : 'password'}
+                            required
+                            minLength={8}
+                            value={guestConvertPassword}
+                            onChange={(e) => {
+                              setGuestConvertPassword(e.target.value);
+                              if (guestConvertError) setGuestConvertError('');
+                            }}
+                            placeholder="Mínimo 8 caracteres"
+                            className="w-full pl-8 pr-9 py-2 bg-white border border-neutral-300 rounded-xl text-xs font-semibold outline-amber-500"
+                          />
+                          <button
+                            type="button"
+                            tabIndex={-1}
+                            onClick={() => setShowGuestConvertPassword((v) => !v)}
+                            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-neutral-500 hover:text-neutral-800 cursor-pointer"
+                          >
+                            {showGuestConvertPassword ? (
+                              <EyeOff className="w-3.5 h-3.5" />
+                            ) : (
+                              <Eye className="w-3.5 h-3.5" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {guestConvertError && (
+                      <p className="text-xs font-bold text-red-700 bg-red-50 border border-red-200 p-2 rounded-xl">
+                        {guestConvertError}
+                      </p>
+                    )}
+
+                    <button
+                      type="submit"
+                      disabled={isConvertingGuest}
+                      className="w-full sm:w-auto px-5 py-2.5 bg-neutral-900 hover:bg-neutral-800 disabled:opacity-50 text-white font-black text-xs rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      {isConvertingGuest ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>Salvando seus dados...</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>Salvar meus dados</span>
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </>
+                      )}
+                    </button>
+                  </form>
+                )}
+              </div>
+            )}
+
             <div className="flex flex-col sm:flex-row gap-3 pt-2">
               <a
                 href={buildOrderWhatsAppUrl(placedOrder)}
@@ -1564,9 +1855,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 <span>Falar sobre o Pedido no WhatsApp</span>
               </a>
 
-              {currentCustomer && (
+              {(currentCustomer || savedGuestOrdersCount > 0) && (
                 <button
                   onClick={() => {
+                    if (typeof window !== 'undefined' && window.location.pathname.startsWith('/pedido/')) {
+                      try {
+                        window.history.replaceState({}, '', '/');
+                      } catch {}
+                    }
                     setPlacedOrder(null);
                     handleOpenMyOrders();
                   }}
@@ -1577,7 +1873,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
               )}
 
               <button
-                onClick={() => setPlacedOrder(null)}
+                onClick={() => {
+                  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/pedido/')) {
+                    try {
+                      window.history.replaceState({}, '', '/');
+                    } catch {}
+                  }
+                  setPlacedOrder(null);
+                }}
                 className="py-3 px-5 border border-neutral-300 hover:bg-neutral-100 text-neutral-700 font-bold rounded-xl text-sm transition-colors cursor-pointer"
               >
                 Voltar à Loja
@@ -1613,6 +1916,29 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         </div>
       )}
 
+      {guestTrackingError && (
+        <div className="mb-6 p-4 bg-red-50 border border-red-200 text-red-800 rounded-2xl flex items-center justify-between gap-3 text-xs font-bold">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+            <span>{guestTrackingError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setGuestTrackingError('');
+              if (typeof window !== 'undefined' && window.location.pathname.startsWith('/pedido/')) {
+                try {
+                  window.history.replaceState({}, '', '/');
+                } catch {}
+              }
+            }}
+            className="p-1 hover:bg-red-100 rounded-lg text-red-700 cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* Customer Account Recognition Bar */}
       <div className="mb-6 bg-white p-3.5 rounded-2xl border border-neutral-200 flex flex-wrap items-center justify-between gap-3 shadow-xs">
         <div className="flex items-center gap-2.5">
@@ -1626,20 +1952,22 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   Olá, <span className="text-amber-600">{currentCustomer.name}</span>! 👋
                 </p>
                 <p className="text-[11px] text-neutral-500">
-                  Entregando em: {currentCustomer.address}, {currentCustomer.number} ({currentCustomer.neighborhood})
+                  {currentCustomer.address
+                    ? `Entregando em: ${currentCustomer.address}, ${currentCustomer.number} (${currentCustomer.neighborhood})`
+                    : 'Conta ativa para pedidos rápidos'}
                 </p>
               </div>
             ) : (
               <div>
                 <p className="text-xs font-bold text-neutral-900">Já tem cadastro?</p>
-                <p className="text-[11px] text-neutral-500">Acesse com seu e-mail e senha para carregar seu endereço salvo.</p>
+                <p className="text-[11px] text-neutral-500">Acesse sua conta ou faça pedido rápido sem cadastro no carrinho.</p>
               </div>
             )}
           </div>
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
-          {currentCustomer && (
+          {(currentCustomer || savedGuestOrdersCount > 0) && (
             <button
               onClick={handleOpenMyOrders}
               className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 rounded-xl text-xs font-black transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
@@ -1649,7 +1977,10 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             </button>
           )}
           <button
-            onClick={() => setIsAuthModalOpen(true)}
+            onClick={() => {
+              setAuthModalInitialTab('login');
+              setIsAuthModalOpen(true);
+            }}
             className="px-3.5 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer"
           >
             {currentCustomer ? 'Minha Conta / Endereço' : 'Entrar / Cadastrar'}
@@ -1659,6 +1990,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
               onClick={() => {
                 api.logoutCustomer();
                 setCurrentCustomer(null);
+                setCheckoutEntryStep('choice');
                 setAppliedCoupon(null);
                 setMyOrders([]);
               }}
@@ -2478,7 +2810,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       {totalCartCount > 0 && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 w-full max-w-md px-4">
           <button
-            onClick={() => setIsCartOpen(true)}
+            onClick={() => {
+              if (!currentCustomer) {
+                setCheckoutEntryStep('choice');
+              }
+              setIsCartOpen(true);
+            }}
             className="w-full flex items-center justify-between bg-neutral-950 text-white p-4 rounded-2xl shadow-2xl hover:bg-neutral-900 transition-all border border-neutral-700 active:scale-98"
           >
             <div className="flex items-center gap-3">
@@ -2674,587 +3011,835 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                 })}
               </div>
 
-              {/* Delivery or Pickup */}
-              <div>
-                <h4 className="text-xs font-bold uppercase tracking-wider text-neutral-400 mb-2">
-                  Forma de Recebimento
-                </h4>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setDeliveryType('delivery')}
-                    className={`p-3 rounded-2xl border text-center transition-all ${
-                      deliveryType === 'delivery'
-                        ? 'border-amber-500 bg-amber-50/50 text-amber-900 font-bold'
-                        : 'border-neutral-200 text-neutral-600'
-                    }`}
-                  >
-                    <Truck className="w-5 h-5 mx-auto mb-1 text-amber-600" />
-                    <span className="text-xs block">Entrega Delivery</span>
-                    <span className="text-[10px] text-neutral-500">
-                      {deliveryFee === 0 ? 'Frete Grátis' : formatCurrency(deliveryFee)}
-                    </span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setDeliveryType('retirada')}
-                    className={`p-3 rounded-2xl border text-center transition-all ${
-                      deliveryType === 'retirada'
-                        ? 'border-amber-500 bg-amber-50/50 text-amber-900 font-bold'
-                        : 'border-neutral-200 text-neutral-600'
-                    }`}
-                  >
-                    <MapPin className="w-5 h-5 mx-auto mb-1 text-amber-600" />
-                    <span className="text-xs block">Retirar no Depósito</span>
-                    <span className="text-[10px] text-emerald-600 font-bold">Sem taxa</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Customer data & Address */}
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <h4 className="text-xs font-bold uppercase tracking-wider text-neutral-400">
-                    Seus Dados para o Pedido
-                  </h4>
-                  {currentCustomer && (
-                    <span className="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md font-semibold">
-                      ✓ Endereço Salvo
-                    </span>
-                  )}
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <div>
-                    <label className="text-[11px] font-semibold text-neutral-600 block mb-1">Seu Nome *</label>
-                    <input
-                      type="text"
-                      required
-                      placeholder="Ex: Carlos Eduardo"
-                      value={customerName}
-                      onChange={(e) => setCustomerName(e.target.value)}
-                      className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
-                    />
+              {/* PRIMEIRA TELA DO CHECKOUT (Requirement 1): shown when customer is not logged in and hasn't chosen guest checkout yet */}
+              {!currentCustomer && checkoutEntryStep === 'choice' ? (
+                <div className="space-y-4 pt-2">
+                  <div className="p-4 rounded-2xl bg-amber-50/70 border border-amber-200">
+                    <h4 className="font-black text-sm text-neutral-900">
+                      Como você prefere finalizar seu pedido?
+                    </h4>
+                    <p className="text-xs text-neutral-600 mt-0.5">
+                      Escolha uma opção abaixo antes de informar seus dados de entrega e pagamento.
+                    </p>
                   </div>
-                  <div>
-                    <label className="text-[11px] font-semibold text-neutral-600 block mb-1">WhatsApp / Celular *</label>
-                    <input
-                      type="tel"
-                      required
-                      placeholder="(11) 98888-7777"
-                      value={customerPhone}
-                      onChange={(e) => setCustomerPhone(e.target.value)}
-                      className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
-                    />
-                  </div>
-                </div>
 
-                {deliveryType === 'delivery' && (
-                  <div className="space-y-3 pt-1">
-                    {/* CEP Search Card */}
-                    <div className="p-3.5 bg-amber-50/80 border border-amber-300 rounded-2xl space-y-2">
-                      <div className="flex items-center justify-between">
-                        <label className="text-xs font-bold text-amber-950 flex items-center gap-1.5">
-                          <Building2 className="w-3.5 h-3.5 text-amber-600" />
-                          <span>Preencher Endereço por CEP</span>
-                        </label>
-                        <span className="text-[10px] text-amber-800 font-bold bg-amber-200/60 px-2 py-0.5 rounded">
-                          Raio Máx: {settings.deliveryRadiusKm || 5} km
-                        </span>
-                      </div>
-
-                      <div className="flex gap-2">
-                        <input
-                          type="text"
-                          maxLength={9}
-                          placeholder="Digite seu CEP (ex: 01310-100)"
-                          value={cep}
-                          onChange={(e) => {
-                            let val = e.target.value.replace(/\D/g, '');
-                            if (val.length > 8) val = val.slice(0, 8);
-                            let f = val;
-                            if (val.length > 5) f = `${val.slice(0, 5)}-${val.slice(5)}`;
-                            setCep(f);
-                            if (val.length === 8) handleSearchCheckoutCep(val);
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              e.preventDefault();
-                              handleSearchCheckoutCep();
-                            }
-                          }}
-                          className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl font-mono font-bold text-xs outline-none"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => handleSearchCheckoutCep()}
-                          disabled={isSearchingCep}
-                          className="px-3.5 py-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black rounded-xl text-xs flex items-center gap-1 shrink-0 cursor-pointer"
-                        >
-                          {isSearchingCep ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
-                          <span>Buscar</span>
-                        </button>
-                      </div>
-
-                      {cepNotice && (
-                        <p className="text-[11px] font-bold text-amber-950 bg-amber-100/90 p-2 rounded-xl">
-                          {cepNotice}
-                        </p>
-                      )}
-                    </div>
-
-                    {/* Delivery Radius / Coverage Info Banner */}
-                    {settings.deliveryRadiusKm && !cepNotice && (
-                      <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex flex-wrap items-center justify-between gap-2 text-xs text-amber-950">
-                        <div className="flex items-center gap-2">
-                          <Compass className="w-4 h-4 text-amber-600 shrink-0" />
-                          <span>
-                            Entregamos em até <strong>{settings.deliveryRadiusKm} km</strong> de distância do depósito!
+                  <div className="space-y-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthModalInitialTab('login');
+                        setIsAuthModalOpen(true);
+                      }}
+                      className="w-full p-5 rounded-2xl border-2 border-amber-500 bg-amber-50/60 hover:bg-amber-100/70 text-left transition-all flex items-center justify-between gap-4 cursor-pointer shadow-xs group"
+                    >
+                      <div className="flex items-start gap-3.5">
+                        <div className="w-11 h-11 rounded-2xl bg-amber-500 text-neutral-950 flex items-center justify-center shrink-0 font-black shadow-xs">
+                          <User className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <span className="font-black text-base text-neutral-900 block">
+                            Entrar ou criar conta
+                          </span>
+                          <span className="text-xs text-neutral-600 font-medium block mt-0.5">
+                            Seus endereços ficam salvos para a próxima.
                           </span>
                         </div>
-                        {address && (
-                          <button
-                            type="button"
-                            onClick={handleCheckDistance}
-                            disabled={checkingDistance}
-                            className="text-[11px] font-bold text-amber-700 hover:text-amber-900 bg-white px-2.5 py-1 rounded-lg border border-amber-300 shadow-2xs transition-colors shrink-0"
-                          >
-                            {checkingDistance ? 'Calculando...' : 'Checar Distância'}
-                          </button>
-                        )}
                       </div>
-                    )}
+                      <ArrowRight className="w-5 h-5 text-amber-700 shrink-0 group-hover:translate-x-0.5 transition-transform" />
+                    </button>
 
-                    {customerDistance && (
-                      <div className={`p-2.5 rounded-xl text-xs flex items-center gap-2 ${
-                        customerDistance.inside
-                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                          : 'bg-red-50 text-red-800 border border-red-200'
-                      }`}>
-                        {customerDistance.inside ? (
-                          <>
-                            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                            <span>
-                              Distância: <strong>{customerDistance.km} km</strong> — Dentro da área de entrega!
-                            </span>
-                          </>
-                        ) : (
-                          <>
-                            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
-                            <span>
-                              Distância: <strong>{customerDistance.km} km</strong> — Fora do raio máximo de {settings.deliveryRadiusKm} km. Escolha Retirada no Depósito.
-                            </span>
-                          </>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Bairro Selector with delivery area enforcement */}
-                    <div>
-                      <label className="text-[11px] font-semibold text-neutral-700 block mb-1">
-                        Selecione seu Bairro * (Áreas Atendidas pelo Depósito)
-                      </label>
-                      {activeAreas.length === 0 ? (
-                        <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-xs">
-                          <p className="font-bold">Nenhum bairro de entrega fixo cadastrado</p>
-                          <p className="mt-0.5 text-[11px] text-amber-700">
-                            Informe seu bairro no campo abaixo ou selecione a opção Retirada no Depósito.
-                          </p>
-                          <input
-                            type="text"
-                            required
-                            placeholder="Digite seu bairro..."
-                            value={neighborhood}
-                            onChange={(e) => setNeighborhood(e.target.value)}
-                            className="mt-2 w-full px-3 py-2 bg-white border border-amber-300 rounded-xl text-xs font-bold text-neutral-900"
-                          />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCheckoutError('');
+                        setCheckoutEntryStep('guest');
+                      }}
+                      className="w-full p-5 rounded-2xl border-2 border-neutral-300 hover:border-neutral-900 bg-white hover:bg-neutral-50 text-left transition-all flex items-center justify-between gap-4 cursor-pointer shadow-xs group"
+                    >
+                      <div className="flex items-start gap-3.5">
+                        <div className="w-11 h-11 rounded-2xl bg-neutral-900 text-white flex items-center justify-center shrink-0 font-black shadow-xs">
+                          <ShoppingBag className="w-5 h-5" />
                         </div>
-                      ) : (
-                        <>
-                          <select
-                            value={neighborhood}
-                            onChange={(e) => setNeighborhood(e.target.value)}
-                            className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs font-bold text-neutral-900"
-                            required
-                          >
-                            {activeAreas.map(area => (
-                              <option key={area.id} value={area.name}>
-                                {area.name} — Taxa: {formatCurrency(area.fee)} ({area.estimatedTime})
-                              </option>
-                            ))}
-                          </select>
+                        <div>
+                          <span className="font-black text-base text-neutral-900 block">
+                            Pedido rápido sem cadastro
+                          </span>
+                          <span className="text-xs text-neutral-600 font-medium block mt-0.5">
+                            Só nome, WhatsApp, endereço e pagamento.
+                          </span>
+                        </div>
+                      </div>
+                      <ArrowRight className="w-5 h-5 text-neutral-700 shrink-0 group-hover:translate-x-0.5 transition-transform" />
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* When in Guest Checkout mode, allow switching to Login / Create Account keeping typed fields */}
+                  {!currentCustomer && (
+                    <div className="p-3 rounded-2xl bg-neutral-100 border border-neutral-200 flex items-center justify-between gap-2 text-xs">
+                      <span className="text-neutral-700 font-semibold">
+                        Modo: <strong>Pedido rápido sem cadastro</strong>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthModalInitialTab('cadastro');
+                          setIsAuthModalOpen(true);
+                        }}
+                        className="text-amber-700 hover:text-amber-900 font-black underline cursor-pointer shrink-0"
+                      >
+                        Entrar ou criar conta
+                      </button>
+                    </div>
+                  )}
 
-                          {!isAreaCovered && (
-                            <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs flex items-start gap-2">
-                              <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
-                              <div>
-                                <strong>Bairro fora da área de entrega!</strong>
-                                <p className="mt-0.5 text-[11px]">
-                                  Nosso depósito entrega nos seguintes bairros: {activeAreas.map(a => a.name).join(', ')}.
-                                  Você também pode escolher <strong>Retirar no Depósito</strong>.
-                                </p>
-                              </div>
-                            </div>
-                          )}
-                        </>
+                  {/* Delivery or Pickup */}
+                  <div>
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-neutral-400 mb-2">
+                      Forma de Recebimento
+                    </h4>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setDeliveryType('delivery')}
+                        className={`p-3 rounded-2xl border text-center transition-all ${
+                          deliveryType === 'delivery'
+                            ? 'border-amber-500 bg-amber-50/50 text-amber-900 font-bold'
+                            : 'border-neutral-200 text-neutral-600'
+                        }`}
+                      >
+                        <Truck className="w-5 h-5 mx-auto mb-1 text-amber-600" />
+                        <span className="text-xs block">Entrega Delivery</span>
+                        <span className="text-[10px] text-neutral-500">
+                          {deliveryFee === 0 ? 'Frete Grátis' : formatCurrency(deliveryFee)}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setDeliveryType('retirada')}
+                        className={`p-3 rounded-2xl border text-center transition-all ${
+                          deliveryType === 'retirada'
+                            ? 'border-amber-500 bg-amber-50/50 text-amber-900 font-bold'
+                            : 'border-neutral-200 text-neutral-600'
+                        }`}
+                      >
+                        <MapPin className="w-5 h-5 mx-auto mb-1 text-amber-600" />
+                        <span className="text-xs block">Retirar no Depósito</span>
+                        <span className="text-[10px] text-emerald-600 font-bold">Sem taxa</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Customer data & Address */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-xs font-bold uppercase tracking-wider text-neutral-400">
+                        Seus Dados para o Pedido
+                      </h4>
+                      {currentCustomer && (
+                        <span className="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md font-semibold">
+                          ✓ Conta Conectada
+                        </span>
                       )}
                     </div>
 
-                    <div className="grid grid-cols-3 gap-2">
-                      <div className="col-span-2">
-                        <label className="text-[11px] font-semibold text-neutral-600 block mb-1">Rua / Avenida *</label>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[11px] font-semibold text-neutral-600 block mb-1">Seu Nome *</label>
                         <input
                           type="text"
                           required
-                          placeholder="Ex: Rua das Palmeiras"
-                          value={address}
-                          onChange={(e) => setAddress(e.target.value)}
+                          placeholder="Ex: Carlos Eduardo"
+                          value={customerName}
+                          onChange={(e) => setCustomerName(e.target.value)}
                           className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
                         />
                       </div>
                       <div>
-                        <label className="text-[11px] font-semibold text-neutral-600 block mb-1">Número *</label>
+                        <label className="text-[11px] font-semibold text-neutral-600 block mb-1">WhatsApp / Celular *</label>
                         <input
-                          type="text"
+                          type="tel"
                           required
-                          placeholder="123"
-                          value={addressNumber}
-                          onChange={(e) => setAddressNumber(e.target.value)}
-                          onBlur={handleCheckoutNumberBlur}
+                          placeholder="(11) 98888-7777"
+                          value={customerPhone}
+                          onChange={(e) => setCustomerPhone(e.target.value)}
                           className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
                         />
                       </div>
                     </div>
 
-                    {/* Optional Map Pin in Checkout */}
-                    {!showCheckoutMap ? (
-                      <div className="flex flex-wrap items-center gap-2 pt-1">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const fallbackLat = checkoutGeoLat ?? checkoutLat ?? settings.storeLatitude ?? -23.55052;
-                            const fallbackLng = checkoutGeoLng ?? checkoutLng ?? settings.storeLongitude ?? -46.633308;
-                            if (checkoutLat === undefined || checkoutLng === undefined) {
-                              setCheckoutLat(fallbackLat);
-                              setCheckoutLng(fallbackLng);
-                            }
-                            setShowCheckoutMap(true);
-                          }}
-                          className="px-3 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 border border-neutral-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
-                        >
-                          <MapPin className="w-3.5 h-3.5 text-red-600" />
-                          <span>Ajustar no mapa (opcional)</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const fallbackLat = checkoutGeoLat ?? checkoutLat ?? settings.storeLatitude ?? -23.55052;
-                            const fallbackLng = checkoutGeoLng ?? checkoutLng ?? settings.storeLongitude ?? -46.633308;
-                            if (checkoutLat === undefined || checkoutLng === undefined) {
-                              setCheckoutLat(fallbackLat);
-                              setCheckoutLng(fallbackLng);
-                            }
-                            setShowCheckoutMap(true);
-                            setCheckoutTriggerGpsCount((c) => c + 1);
-                          }}
-                          className="px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
-                        >
-                          <Navigation className="w-3.5 h-3.5 text-amber-700" />
-                          <span>Usar minha localização atual</span>
-                        </button>
+                    {/* Logged-in customer: "Entregar em:" selector (Requirement 2b) */}
+                    {currentCustomer && deliveryType === 'delivery' && (
+                      <div className="space-y-2.5 pt-1">
+                        <label className="text-xs font-black text-neutral-800 block">
+                          Entregar em:
+                        </label>
+
+                        {currentCustomer.address ? (
+                          <div className="space-y-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setLoggedAddressMode('saved');
+                                setSaveCustomAddressToAccount(false);
+                                setShowCheckoutMap(false);
+                                applySavedCustomerAddressToState(currentCustomer);
+                              }}
+                              className={`w-full p-3.5 rounded-2xl border-2 text-left transition-all flex items-start gap-3 cursor-pointer ${
+                                loggedAddressMode === 'saved'
+                                  ? 'border-amber-500 bg-amber-50/60'
+                                  : 'border-neutral-200 bg-white hover:border-neutral-300'
+                              }`}
+                            >
+                              <div
+                                className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 mt-0.5 ${
+                                  loggedAddressMode === 'saved'
+                                    ? 'bg-amber-500 text-neutral-950'
+                                    : 'bg-neutral-100 text-neutral-600'
+                                }`}
+                              >
+                                <Home className="w-4 h-4" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="font-black text-xs text-neutral-900">Casa</span>
+                                  {loggedAddressMode === 'saved' && (
+                                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-200/80 text-amber-950">
+                                      Selecionado
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-xs text-neutral-700 font-medium mt-0.5 break-words">
+                                  {currentCustomer.address}, {currentCustomer.number} — {currentCustomer.neighborhood}
+                                </p>
+                                {(currentCustomer.complement || currentCustomer.reference) && (
+                                  <p className="text-[11px] text-neutral-500 mt-0.5">
+                                    {[currentCustomer.complement, currentCustomer.reference]
+                                      .filter(Boolean)
+                                      .join(' • ')}
+                                  </p>
+                                )}
+                              </div>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setLoggedAddressMode('custom');
+                                setSaveCustomAddressToAccount(false);
+                                setDeliveryQuote(null);
+                                setCustomerDistance(null);
+                                setCepNotice('');
+                                setCep('');
+                                setAddress('');
+                                setAddressNumber('');
+                                setNeighborhood(activeAreas[0]?.name || currentCustomer.neighborhood || '');
+                                setComplement('');
+                                setReference('');
+                                setCheckoutLat(undefined);
+                                setCheckoutLng(undefined);
+                                setCheckoutGeoLat(undefined);
+                                setCheckoutGeoLng(undefined);
+                                setShowCheckoutMap(false);
+                              }}
+                              className={`w-full p-3.5 rounded-2xl border-2 text-left transition-all flex items-center gap-3 cursor-pointer ${
+                                loggedAddressMode === 'custom'
+                                  ? 'border-amber-500 bg-amber-50/60'
+                                  : 'border-neutral-200 bg-white hover:border-neutral-300'
+                              }`}
+                            >
+                              <div
+                                className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${
+                                  loggedAddressMode === 'custom'
+                                    ? 'bg-amber-500 text-neutral-950'
+                                    : 'bg-neutral-100 text-neutral-600'
+                                }`}
+                              >
+                                <MapPin className="w-4 h-4" />
+                              </div>
+                              <div className="flex-1">
+                                <span className="font-black text-xs text-neutral-900 block">
+                                  Outro endereço (só neste pedido)
+                                </span>
+                                <span className="text-[11px] text-neutral-500 block">
+                                  Informe outro endereço de entrega para este pedido
+                                </span>
+                              </div>
+                            </button>
+                          </div>
+                        ) : null}
                       </div>
-                    ) : (
-                      checkoutLat !== undefined &&
-                      checkoutLng !== undefined && (
-                        <div className="space-y-2">
-                          <AddressPinMap
-                            latitude={checkoutLat}
-                            longitude={checkoutLng}
-                            geoLatitude={checkoutGeoLat ?? checkoutLat}
-                            geoLongitude={checkoutGeoLng ?? checkoutLng}
-                            precisao={checkoutPrecisao}
-                            triggerGpsCount={checkoutTriggerGpsCount}
-                            showConfirmButton={Boolean(currentCustomer && !isPinConfirmed)}
-                            isConfirmingPin={isConfirmingPin}
-                            pinConfirmed={isPinConfirmed}
-                            onConfirmPin={(confirmedLat, confirmedLng) => {
-                              setCheckoutLat(confirmedLat);
-                              setCheckoutLng(confirmedLng);
-                              setCheckoutError('');
-                              persistCheckoutCoordinates(confirmedLat, confirmedLng, true);
-                            }}
-                            onChange={(newLat, newLng) => {
-                              setCheckoutLat(newLat);
-                              setCheckoutLng(newLng);
-                              setCheckoutError('');
-                              persistCheckoutCoordinates(newLat, newLng, true);
-                            }}
-                            onResetToAddress={() => {
-                              if (checkoutGeoLat !== undefined && checkoutGeoLng !== undefined) {
-                                setCheckoutLat(checkoutGeoLat);
-                                setCheckoutLng(checkoutGeoLng);
-                                persistCheckoutCoordinates(checkoutGeoLat, checkoutGeoLng, true);
-                              }
-                            }}
-                          />
+                    )}
+
+                    {/* Address Form Fields: shown for Guest Delivery OR Logged-in with "Outro endereço" (or if logged-in customer has no saved address yet) */}
+                    {deliveryType === 'delivery' &&
+                      (!currentCustomer ||
+                        loggedAddressMode === 'custom' ||
+                        !currentCustomer.address) && (
+                        <div className="space-y-3 pt-1">
+                          {/* CEP Search Card */}
+                          <div className="p-3.5 bg-amber-50/80 border border-amber-300 rounded-2xl space-y-2">
+                            <div className="flex items-center justify-between">
+                              <label className="text-xs font-bold text-amber-950 flex items-center gap-1.5">
+                                <Building2 className="w-3.5 h-3.5 text-amber-600" />
+                                <span>Preencher Endereço por CEP</span>
+                              </label>
+                              <span className="text-[10px] text-amber-800 font-bold bg-amber-200/60 px-2 py-0.5 rounded">
+                                Raio Máx: {settings.deliveryRadiusKm || 5} km
+                              </span>
+                            </div>
+
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                maxLength={9}
+                                placeholder="Digite seu CEP (ex: 01310-100)"
+                                value={cep}
+                                onChange={(e) => {
+                                  let val = e.target.value.replace(/\D/g, '');
+                                  if (val.length > 8) val = val.slice(0, 8);
+                                  let f = val;
+                                  if (val.length > 5) f = `${val.slice(0, 5)}-${val.slice(5)}`;
+                                  setCep(f);
+                                  if (val.length === 8) handleSearchCheckoutCep(val);
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    handleSearchCheckoutCep();
+                                  }
+                                }}
+                                className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl font-mono font-bold text-xs outline-none"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => handleSearchCheckoutCep()}
+                                disabled={isSearchingCep}
+                                className="px-3.5 py-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black rounded-xl text-xs flex items-center gap-1 shrink-0 cursor-pointer"
+                              >
+                                {isSearchingCep ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <Search className="w-3.5 h-3.5" />
+                                )}
+                                <span>Buscar</span>
+                              </button>
+                            </div>
+
+                            {cepNotice && (
+                              <p className="text-[11px] font-bold text-amber-950 bg-amber-100/90 p-2 rounded-xl">
+                                {cepNotice}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Delivery Radius / Coverage Info Banner */}
+                          {settings.deliveryRadiusKm && !cepNotice && (
+                            <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex flex-wrap items-center justify-between gap-2 text-xs text-amber-950">
+                              <div className="flex items-center gap-2">
+                                <Compass className="w-4 h-4 text-amber-600 shrink-0" />
+                                <span>
+                                  Entregamos em até <strong>{settings.deliveryRadiusKm} km</strong> de distância do depósito!
+                                </span>
+                              </div>
+                              {address && (
+                                <button
+                                  type="button"
+                                  onClick={handleCheckDistance}
+                                  disabled={checkingDistance}
+                                  className="text-[11px] font-bold text-amber-700 hover:text-amber-900 bg-white px-2.5 py-1 rounded-lg border border-amber-300 shadow-2xs transition-colors shrink-0"
+                                >
+                                  {checkingDistance ? 'Calculando...' : 'Checar Distância'}
+                                </button>
+                              )}
+                            </div>
+                          )}
+
+                          {customerDistance && (
+                            <div
+                              className={`p-2.5 rounded-xl text-xs flex items-center gap-2 ${
+                                customerDistance.inside
+                                  ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                                  : 'bg-red-50 text-red-800 border border-red-200'
+                              }`}
+                            >
+                              {customerDistance.inside ? (
+                                <>
+                                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                                  <span>
+                                    Distância: <strong>{customerDistance.km} km</strong> — Dentro da área de entrega!
+                                  </span>
+                                </>
+                              ) : (
+                                <>
+                                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                                  <span>
+                                    Distância: <strong>{customerDistance.km} km</strong> — Fora do raio máximo de{' '}
+                                    {settings.deliveryRadiusKm} km. Escolha Retirada no Depósito.
+                                  </span>
+                                </>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Bairro Selector with delivery area enforcement */}
+                          <div>
+                            <label className="text-[11px] font-semibold text-neutral-700 block mb-1">
+                              Selecione seu Bairro * (Áreas Atendidas pelo Depósito)
+                            </label>
+                            {activeAreas.length === 0 ? (
+                              <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-xs">
+                                <p className="font-bold">Nenhum bairro de entrega fixo cadastrado</p>
+                                <p className="mt-0.5 text-[11px] text-amber-700">
+                                  Informe seu bairro no campo abaixo ou selecione a opção Retirada no Depósito.
+                                </p>
+                                <input
+                                  type="text"
+                                  required
+                                  placeholder="Digite seu bairro..."
+                                  value={neighborhood}
+                                  onChange={(e) => setNeighborhood(e.target.value)}
+                                  className="mt-2 w-full px-3 py-2 bg-white border border-amber-300 rounded-xl text-xs font-bold text-neutral-900"
+                                />
+                              </div>
+                            ) : (
+                              <>
+                                <select
+                                  value={neighborhood}
+                                  onChange={(e) => setNeighborhood(e.target.value)}
+                                  className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs font-bold text-neutral-900"
+                                  required
+                                >
+                                  {activeAreas.map((area) => (
+                                    <option key={area.id} value={area.name}>
+                                      {area.name} — Taxa: {formatCurrency(area.fee)} ({area.estimatedTime})
+                                    </option>
+                                  ))}
+                                </select>
+
+                                {!isAreaCovered && (
+                                  <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs flex items-start gap-2">
+                                    <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+                                    <div>
+                                      <strong>Bairro fora da área de entrega!</strong>
+                                      <p className="mt-0.5 text-[11px]">
+                                        Nosso depósito entrega nos seguintes bairros:{' '}
+                                        {activeAreas.map((a) => a.name).join(', ')}. Você também pode escolher{' '}
+                                        <strong>Retirar no Depósito</strong>.
+                                      </p>
+                                    </div>
+                                  </div>
+                                )}
+                              </>
+                            )}
+                          </div>
+
+                          <div className="grid grid-cols-3 gap-2">
+                            <div className="col-span-2">
+                              <label className="text-[11px] font-semibold text-neutral-600 block mb-1">
+                                Rua / Avenida *
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                placeholder="Ex: Rua das Palmeiras"
+                                value={address}
+                                onChange={(e) => setAddress(e.target.value)}
+                                className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
+                              />
+                            </div>
+                            <div>
+                              <label className="text-[11px] font-semibold text-neutral-600 block mb-1">Número *</label>
+                              <input
+                                type="text"
+                                required
+                                placeholder="123"
+                                value={addressNumber}
+                                onChange={(e) => setAddressNumber(e.target.value)}
+                                onBlur={handleCheckoutNumberBlur}
+                                className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
+                              />
+                            </div>
+                          </div>
+
+                          {/* Optional Map Pin in Checkout */}
+                          {!showCheckoutMap ? (
+                            <div className="flex flex-wrap items-center gap-2 pt-1">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const fallbackLat =
+                                    checkoutGeoLat ?? checkoutLat ?? settings.storeLatitude ?? -23.55052;
+                                  const fallbackLng =
+                                    checkoutGeoLng ?? checkoutLng ?? settings.storeLongitude ?? -46.633308;
+                                  if (checkoutLat === undefined || checkoutLng === undefined) {
+                                    setCheckoutLat(fallbackLat);
+                                    setCheckoutLng(fallbackLng);
+                                  }
+                                  setShowCheckoutMap(true);
+                                }}
+                                className="px-3 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 border border-neutral-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                              >
+                                <MapPin className="w-3.5 h-3.5 text-red-600" />
+                                <span>Ajustar no mapa (opcional)</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const fallbackLat =
+                                    checkoutGeoLat ?? checkoutLat ?? settings.storeLatitude ?? -23.55052;
+                                  const fallbackLng =
+                                    checkoutGeoLng ?? checkoutLng ?? settings.storeLongitude ?? -46.633308;
+                                  if (checkoutLat === undefined || checkoutLng === undefined) {
+                                    setCheckoutLat(fallbackLat);
+                                    setCheckoutLng(fallbackLng);
+                                  }
+                                  setShowCheckoutMap(true);
+                                  setCheckoutTriggerGpsCount((c) => c + 1);
+                                }}
+                                className="px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                              >
+                                <Navigation className="w-3.5 h-3.5 text-amber-700" />
+                                <span>Usar minha localização atual</span>
+                              </button>
+                            </div>
+                          ) : (
+                            checkoutLat !== undefined &&
+                            checkoutLng !== undefined && (
+                              <div className="space-y-2">
+                                <AddressPinMap
+                                  latitude={checkoutLat}
+                                  longitude={checkoutLng}
+                                  geoLatitude={checkoutGeoLat ?? checkoutLat}
+                                  geoLongitude={checkoutGeoLng ?? checkoutLng}
+                                  precisao={checkoutPrecisao}
+                                  triggerGpsCount={checkoutTriggerGpsCount}
+                                  showConfirmButton={Boolean(currentCustomer && !isPinConfirmed)}
+                                  isConfirmingPin={isConfirmingPin}
+                                  pinConfirmed={isPinConfirmed}
+                                  onConfirmPin={(confirmedLat, confirmedLng) => {
+                                    setCheckoutLat(confirmedLat);
+                                    setCheckoutLng(confirmedLng);
+                                    setCheckoutError('');
+                                    persistCheckoutCoordinates(confirmedLat, confirmedLng, true);
+                                  }}
+                                  onChange={(newLat, newLng) => {
+                                    setCheckoutLat(newLat);
+                                    setCheckoutLng(newLng);
+                                    setCheckoutError('');
+                                    persistCheckoutCoordinates(newLat, newLng, true);
+                                  }}
+                                  onResetToAddress={() => {
+                                    if (checkoutGeoLat !== undefined && checkoutGeoLng !== undefined) {
+                                      setCheckoutLat(checkoutGeoLat);
+                                      setCheckoutLng(checkoutGeoLng);
+                                      persistCheckoutCoordinates(checkoutGeoLat, checkoutGeoLng, true);
+                                    }
+                                  }}
+                                />
+                              </div>
+                            )
+                          )}
+
+                          <div className="grid grid-cols-2 gap-2">
+                            <div>
+                              <label className="text-[11px] font-semibold text-neutral-600 block mb-1">
+                                Complemento / Apto
+                              </label>
+                              <input
+                                type="text"
+                                placeholder="Apto 42B"
+                                value={complement}
+                                onChange={(e) => setComplement(e.target.value)}
+                                className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
+                              />
+                            </div>
+                            <div>
+                              <label className="text-[11px] font-semibold text-neutral-600 block mb-1">
+                                Ponto de Referência
+                              </label>
+                              <input
+                                type="text"
+                                placeholder="Ex: Portão cinza"
+                                value={reference}
+                                onChange={(e) => setReference(e.target.value)}
+                                className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
+                              />
+                            </div>
+                          </div>
+
+                          {/* Checkbox "Salvar este endereço na minha conta" (unchecked by default) when logged-in customer chooses "Outro endereço" */}
+                          {currentCustomer &&
+                            (loggedAddressMode === 'custom' || !currentCustomer.address) && (
+                              <label className="flex items-center gap-2.5 p-3 rounded-xl bg-amber-50/70 border border-amber-200 cursor-pointer select-none">
+                                <input
+                                  type="checkbox"
+                                  checked={saveCustomAddressToAccount}
+                                  onChange={(e) => setSaveCustomAddressToAccount(e.target.checked)}
+                                  className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
+                                />
+                                <span className="text-xs font-bold text-neutral-800">
+                                  Salvar este endereço na minha conta
+                                </span>
+                              </label>
+                            )}
                         </div>
-                      )
-                    )}
+                      )}
+                  </div>
 
+                  {/* Payment Method */}
+                  <div className="space-y-2">
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-neutral-400">
+                      Forma de Pagamento
+                    </h4>
                     <div className="grid grid-cols-2 gap-2">
-                      <div>
-                        <label className="text-[11px] font-semibold text-neutral-600 block mb-1">Complemento / Apto</label>
-                        <input
-                          type="text"
-                          placeholder="Apto 42B"
-                          value={complement}
-                          onChange={(e) => setComplement(e.target.value)}
-                          className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-[11px] font-semibold text-neutral-600 block mb-1">Ponto de Referência</label>
-                        <input
-                          type="text"
-                          placeholder="Ex: Portão cinza"
-                          value={reference}
-                          onChange={(e) => setReference(e.target.value)}
-                          className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Payment Method */}
-              <div className="space-y-2">
-                <h4 className="text-xs font-bold uppercase tracking-wider text-neutral-400">
-                  Forma de Pagamento
-                </h4>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setPaymentMethod('pix')}
-                    className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
-                      paymentMethod === 'pix' ? 'border-amber-500 bg-amber-50 text-amber-900' : 'border-neutral-200 text-neutral-700'
-                    }`}
-                  >
-                    PIX (pagar agora)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setPaymentMethod('cartao_credito')}
-                    className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
-                      paymentMethod === 'cartao_credito' ? 'border-amber-500 bg-amber-50 text-amber-900' : 'border-neutral-200 text-neutral-700'
-                    }`}
-                  >
-                    {deliveryType === 'retirada' ? 'Cartão de crédito (na retirada)' : 'Cartão de crédito (na entrega)'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setPaymentMethod('cartao_debito')}
-                    className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
-                      paymentMethod === 'cartao_debito' ? 'border-amber-500 bg-amber-50 text-amber-900' : 'border-neutral-200 text-neutral-700'
-                    }`}
-                  >
-                    {deliveryType === 'retirada' ? 'Cartão de débito (na retirada)' : 'Cartão de débito (na entrega)'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setPaymentMethod('dinheiro')}
-                    className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
-                      paymentMethod === 'dinheiro' ? 'border-amber-500 bg-amber-50 text-amber-900' : 'border-neutral-200 text-neutral-700'
-                    }`}
-                  >
-                    {deliveryType === 'retirada' ? 'Dinheiro (na retirada)' : 'Dinheiro (na entrega)'}
-                  </button>
-                </div>
-
-                {paymentMethod === 'dinheiro' && (
-                  <div className="mt-2 bg-neutral-50 p-3 rounded-xl border border-neutral-200 space-y-1">
-                    <label className="text-[11px] font-semibold text-neutral-700 block">
-                      Precisa de troco para quanto?
-                    </label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      min="0"
-                      placeholder="Ex: 50 ou 100"
-                      value={cashChangeFor}
-                      onChange={(e) => setCashChangeFor(e.target.value)}
-                      className={`w-full px-3 py-2 bg-white border rounded-lg text-xs ${
-                        isCheckoutCashInvalid ? 'border-red-400' : 'border-neutral-300'
-                      }`}
-                    />
-                    {isCheckoutCashInvalid && (
-                      <p className="text-[11px] font-bold text-red-600">
-                        O valor do troco precisa ser maior que o total do pedido
-                      </p>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              <div>
-                <label className="text-[11px] font-semibold text-neutral-600 block mb-1">
-                  Observações para o depósito (opcional)
-                </label>
-                <textarea
-                  rows={2}
-                  placeholder="Ex: Mandar as latinhas bem geladas!"
-                  value={orderNotes}
-                  onChange={(e) => setOrderNotes(e.target.value)}
-                  className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
-                />
-              </div>
-
-              {/* Cupom de Desconto */}
-              <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200 space-y-2 text-xs">
-                <div className="flex items-center justify-between">
-                  <label className="font-bold text-neutral-800 flex items-center gap-1.5">
-                    <Ticket className="w-4 h-4 text-amber-600" />
-                    <span>Cupom de Desconto</span>
-                  </label>
-                  {appliedCoupon && (
-                    <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full">
-                      ✓ Ativo
-                    </span>
-                  )}
-                </div>
-
-                {appliedCoupon ? (
-                  <div className="flex items-center justify-between bg-emerald-50 border border-emerald-200 p-2.5 rounded-xl">
-                    <div>
-                      <span className="font-black text-emerald-950 font-mono tracking-wider">{appliedCoupon.code}</span>
-                      <span className="text-emerald-700 ml-2 font-semibold">
-                        (-{formatCurrency(cartDiscount)}
-                        {appliedCoupon.type === 'percent' && appliedCoupon.maxDiscount
-                          ? ` • ${appliedCoupon.value}% até ${formatCurrency(appliedCoupon.maxDiscount)}`
-                          : appliedCoupon.type === 'percent'
-                          ? ` • ${appliedCoupon.value}% OFF`
-                          : ''}
-                        )
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={handleRemoveCoupon}
-                      className="text-[11px] text-red-600 hover:text-red-800 font-bold underline cursor-pointer"
-                    >
-                      Remover
-                    </button>
-                  </div>
-                ) : (
-                  <div className="space-y-1.5">
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        placeholder="Ex: PROMO10"
-                        value={couponInput}
-                        onChange={(e) => {
-                          setCouponInput(e.target.value.toUpperCase());
-                          if (couponError) setCouponError('');
-                        }}
-                        className="flex-1 px-3 py-2 bg-white border border-neutral-300 rounded-xl font-mono font-bold uppercase text-xs outline-amber-500"
-                      />
                       <button
                         type="button"
-                        onClick={handleApplyCoupon}
-                        disabled={isValidatingCoupon || !couponInput.trim()}
-                        className="px-3.5 py-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-neutral-950 font-black rounded-xl text-xs transition-colors cursor-pointer"
+                        onClick={() => setPaymentMethod('pix')}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
+                          paymentMethod === 'pix'
+                            ? 'border-amber-500 bg-amber-50 text-amber-900'
+                            : 'border-neutral-200 text-neutral-700'
+                        }`}
                       >
-                        {isValidatingCoupon ? 'Validando...' : 'Aplicar'}
+                        PIX (pagar agora)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPaymentMethod('cartao_credito')}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
+                          paymentMethod === 'cartao_credito'
+                            ? 'border-amber-500 bg-amber-50 text-amber-900'
+                            : 'border-neutral-200 text-neutral-700'
+                        }`}
+                      >
+                        {deliveryType === 'retirada'
+                          ? 'Cartão de crédito (na retirada)'
+                          : 'Cartão de crédito (na entrega)'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPaymentMethod('cartao_debito')}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
+                          paymentMethod === 'cartao_debito'
+                            ? 'border-amber-500 bg-amber-50 text-amber-900'
+                            : 'border-neutral-200 text-neutral-700'
+                        }`}
+                      >
+                        {deliveryType === 'retirada'
+                          ? 'Cartão de débito (na retirada)'
+                          : 'Cartão de débito (na entrega)'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPaymentMethod('dinheiro')}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
+                          paymentMethod === 'dinheiro'
+                            ? 'border-amber-500 bg-amber-50 text-amber-900'
+                            : 'border-neutral-200 text-neutral-700'
+                        }`}
+                      >
+                        {deliveryType === 'retirada' ? 'Dinheiro (na retirada)' : 'Dinheiro (na entrega)'}
                       </button>
                     </div>
-                    {couponError && (
-                      <p className="text-[11px] font-bold text-red-600 bg-red-50 p-2 rounded-xl border border-red-200">
-                        {couponError}
-                      </p>
+
+                    {paymentMethod === 'dinheiro' && (
+                      <div className="mt-2 bg-neutral-50 p-3 rounded-xl border border-neutral-200 space-y-1">
+                        <label className="text-[11px] font-semibold text-neutral-700 block">
+                          Precisa de troco para quanto?
+                        </label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          placeholder="Ex: 50 ou 100"
+                          value={cashChangeFor}
+                          onChange={(e) => setCashChangeFor(e.target.value)}
+                          className={`w-full px-3 py-2 bg-white border rounded-lg text-xs ${
+                            isCheckoutCashInvalid ? 'border-red-400' : 'border-neutral-300'
+                          }`}
+                        />
+                        {isCheckoutCashInvalid && (
+                          <p className="text-[11px] font-bold text-red-600">
+                            O valor do troco precisa ser maior que o total do pedido
+                          </p>
+                        )}
+                      </div>
                     )}
                   </div>
-                )}
-              </div>
 
-              {/* Total summary */}
-              <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200 space-y-2 text-xs">
-                <div className="flex justify-between text-neutral-600">
-                  <span>Subtotal:</span>
-                  <span>{formatCurrency(cartSubtotal)}</span>
-                </div>
-                {cartPromoSavings > 0 && (
-                  <div className="flex justify-between text-emerald-600 font-bold">
-                    <span>Economia nas Promoções:</span>
-                    <span>-{formatCurrency(cartPromoSavings)}</span>
+                  <div>
+                    <label className="text-[11px] font-semibold text-neutral-600 block mb-1">
+                      Observações para o depósito (opcional)
+                    </label>
+                    <textarea
+                      rows={2}
+                      placeholder="Ex: Mandar as latinhas bem geladas!"
+                      value={orderNotes}
+                      onChange={(e) => setOrderNotes(e.target.value)}
+                      className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
+                    />
                   </div>
-                )}
-                {cartDiscount > 0 && (
-                  <div className="flex justify-between text-emerald-600 font-bold">
-                    <span>Desconto do Cupom ({appliedCoupon?.code}):</span>
-                    <span>-{formatCurrency(cartDiscount)}</span>
-                  </div>
-                )}
-                <div className="flex justify-between text-neutral-600">
-                  <span>Taxa de Entrega:</span>
-                  <span>{deliveryFee === 0 ? 'Grátis' : formatCurrency(deliveryFee)}</span>
-                </div>
-                <div className="flex justify-between text-base font-black text-neutral-900 pt-2 border-t border-neutral-200">
-                  <span>Total Final:</span>
-                  <span className="text-amber-600">{formatCurrency(cartTotal)}</span>
-                </div>
-                {totalSavings > 0 && (
-                  <div className="mt-2 p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 font-black text-xs text-center">
-                    🎉 Você economizou {formatCurrency(totalSavings)}
-                  </div>
-                )}
-              </div>
 
-              {isSubmitting && submittingStatusText && (
-                <div className="p-3.5 bg-amber-50 border border-amber-300 rounded-2xl text-amber-900 text-xs font-bold flex items-center gap-2">
-                  <Loader2 className="w-4 h-4 shrink-0 text-amber-600 animate-spin" />
-                  <span>{submittingStatusText}</span>
-                </div>
-              )}
+                  {/* Cupom de Desconto — EXCLUSIVO para clientes com conta (escondido no pedido rápido sem cadastro) */}
+                  {currentCustomer && (
+                    <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200 space-y-2 text-xs">
+                      <div className="flex items-center justify-between">
+                        <label className="font-bold text-neutral-800 flex items-center gap-1.5">
+                          <Ticket className="w-4 h-4 text-amber-600" />
+                          <span>Cupom de Desconto</span>
+                        </label>
+                        {appliedCoupon && (
+                          <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full">
+                            ✓ Ativo
+                          </span>
+                        )}
+                      </div>
 
-              {checkoutError && (
-                <div className="p-3.5 bg-red-50 border border-red-200 rounded-2xl text-red-700 text-xs font-bold space-y-2.5">
-                  <div className="flex items-start gap-2">
-                    <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
-                    <span>{checkoutError}</span>
-                  </div>
-                  {canRetryOrderSubmit && (
-                    <button
-                      type="button"
-                      disabled={isSubmitting}
-                      onClick={() => submitCustomerOrder()}
-                      className="w-full py-2.5 px-4 bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white font-black text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
-                    >
-                      <span>Tentar de novo</span>
-                    </button>
+                      {appliedCoupon ? (
+                        <div className="flex items-center justify-between bg-emerald-50 border border-emerald-200 p-2.5 rounded-xl">
+                          <div>
+                            <span className="font-black text-emerald-950 font-mono tracking-wider">
+                              {appliedCoupon.code}
+                            </span>
+                            <span className="text-emerald-700 ml-2 font-semibold">
+                              (-{formatCurrency(cartDiscount)}
+                              {appliedCoupon.type === 'percent' && appliedCoupon.maxDiscount
+                                ? ` • ${appliedCoupon.value}% até ${formatCurrency(appliedCoupon.maxDiscount)}`
+                                : appliedCoupon.type === 'percent'
+                                ? ` • ${appliedCoupon.value}% OFF`
+                                : ''}
+                              )
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={handleRemoveCoupon}
+                            className="text-[11px] text-red-600 hover:text-red-800 font-bold underline cursor-pointer"
+                          >
+                            Remover
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="space-y-1.5">
+                          <div className="flex gap-2">
+                            <input
+                              type="text"
+                              placeholder="Ex: PROMO10"
+                              value={couponInput}
+                              onChange={(e) => {
+                                setCouponInput(e.target.value.toUpperCase());
+                                if (couponError) setCouponError('');
+                              }}
+                              className="flex-1 px-3 py-2 bg-white border border-neutral-300 rounded-xl font-mono font-bold uppercase text-xs outline-amber-500"
+                            />
+                            <button
+                              type="button"
+                              onClick={handleApplyCoupon}
+                              disabled={isValidatingCoupon || !couponInput.trim()}
+                              className="px-3.5 py-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-neutral-950 font-black rounded-xl text-xs transition-colors cursor-pointer"
+                            >
+                              {isValidatingCoupon ? 'Validando...' : 'Aplicar'}
+                            </button>
+                          </div>
+                          {couponError && (
+                            <p className="text-[11px] font-bold text-red-600 bg-red-50 p-2 rounded-xl border border-red-200">
+                              {couponError}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   )}
-                </div>
-              )}
 
-              <button
-                type="submit"
-                disabled={isSubmitting || cart.length === 0 || !isAreaCovered || !settings.isOpen || isCheckoutCashInvalid}
-                className="w-full py-4 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 disabled:cursor-not-allowed text-white font-black text-base rounded-2xl shadow-xl shadow-amber-500/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
-              >
-                {!settings.isOpen ? (
-                  <span>🔴 Depósito Fechado no Momento</span>
-                ) : isSubmitting ? (
-                  <>
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                    <span>{submittingStatusText || 'Enviando pedido...'}</span>
-                  </>
-                ) : (
-                  <>
-                    <span>Confirmar e Enviar Pedido</span>
-                    <ArrowRight className="w-5 h-5" />
-                  </>
-                )}
-              </button>
+                  {/* Total summary */}
+                  <div className="bg-neutral-50 p-4 rounded-2xl border border-neutral-200 space-y-2 text-xs">
+                    <div className="flex justify-between text-neutral-600">
+                      <span>Subtotal:</span>
+                      <span>{formatCurrency(cartSubtotal)}</span>
+                    </div>
+                    {cartPromoSavings > 0 && (
+                      <div className="flex justify-between text-emerald-600 font-bold">
+                        <span>Economia nas Promoções:</span>
+                        <span>-{formatCurrency(cartPromoSavings)}</span>
+                      </div>
+                    )}
+                    {cartDiscount > 0 && (
+                      <div className="flex justify-between text-emerald-600 font-bold">
+                        <span>Desconto do Cupom ({appliedCoupon?.code}):</span>
+                        <span>-{formatCurrency(cartDiscount)}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between text-neutral-600">
+                      <span>Taxa de Entrega:</span>
+                      <span>{deliveryFee === 0 ? 'Grátis' : formatCurrency(deliveryFee)}</span>
+                    </div>
+                    <div className="flex justify-between text-base font-black text-neutral-900 pt-2 border-t border-neutral-200">
+                      <span>Total Final:</span>
+                      <span className="text-amber-600">{formatCurrency(cartTotal)}</span>
+                    </div>
+                    {totalSavings > 0 && (
+                      <div className="mt-2 p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 font-black text-xs text-center">
+                        🎉 Você economizou {formatCurrency(totalSavings)}
+                      </div>
+                    )}
+                  </div>
+
+                  {isSubmitting && submittingStatusText && (
+                    <div className="p-3.5 bg-amber-50 border border-amber-300 rounded-2xl text-amber-900 text-xs font-bold flex items-center gap-2">
+                      <Loader2 className="w-4 h-4 shrink-0 text-amber-600 animate-spin" />
+                      <span>{submittingStatusText}</span>
+                    </div>
+                  )}
+
+                  {checkoutError && (
+                    <div className="p-3.5 bg-red-50 border border-red-200 rounded-2xl text-red-700 text-xs font-bold space-y-2.5">
+                      <div className="flex items-start gap-2">
+                        <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+                        <span>{checkoutError}</span>
+                      </div>
+                      {canRetryOrderSubmit && (
+                        <button
+                          type="button"
+                          disabled={isSubmitting}
+                          onClick={() => submitCustomerOrder()}
+                          className="w-full py-2.5 px-4 bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white font-black text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <span>Tentar de novo</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={
+                      isSubmitting ||
+                      cart.length === 0 ||
+                      !isAreaCovered ||
+                      !settings.isOpen ||
+                      isCheckoutCashInvalid
+                    }
+                    className="w-full py-4 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 disabled:cursor-not-allowed text-white font-black text-base rounded-2xl shadow-xl shadow-amber-500/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    {!settings.isOpen ? (
+                      <span>🔴 Depósito Fechado no Momento</span>
+                    ) : isSubmitting ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        <span>{submittingStatusText || 'Enviando pedido...'}</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>Confirmar e Enviar Pedido</span>
+                        <ArrowRight className="w-5 h-5" />
+                      </>
+                    )}
+                  </button>
+                </>
+              )}
             </form>
           </div>
         </div>
@@ -3381,6 +3966,21 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         deliveryAreas={deliveryAreas}
         currentCustomer={currentCustomer}
         settings={settings}
+        initialTab={authModalInitialTab}
+        initialRegisterData={{
+          name: customerName,
+          phone: customerPhone,
+          cep,
+          address,
+          number: addressNumber,
+          neighborhood,
+          city: checkoutCity,
+          state: checkoutState,
+          complement,
+          reference,
+          latitude: checkoutLat,
+          longitude: checkoutLng,
+        }}
         onSuccess={(cust) => {
           setCurrentCustomer(cust);
           setIsAuthModalOpen(false);
@@ -3388,6 +3988,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         onClose={() => setIsAuthModalOpen(false)}
         onLogout={() => {
           setCurrentCustomer(null);
+          setCheckoutEntryStep('choice');
           setAppliedCoupon(null);
           setMyOrders([]);
         }}

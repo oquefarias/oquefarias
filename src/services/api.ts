@@ -18,6 +18,8 @@ import {
   StockAdjustReason,
   StockMovementsResponse,
   AdminChangesResponse,
+  GuestTrackedOrderResponse,
+  SavedGuestOrderLink,
   isComboProduct,
   calculateComboMetrics,
 } from '../types';
@@ -27,6 +29,7 @@ import { soundService } from '../utils/sound';
 const STORAGE_KEY_ADMIN_TOKEN = 'deposito_admin_token_v5';
 const STORAGE_KEY_CUSTOMER_TOKEN = 'deposito_customer_token_v5';
 const STORAGE_KEY_CURRENT_CUSTOMER = 'deposito_current_customer_v5';
+const STORAGE_KEY_GUEST_ORDERS = 'deposito_guest_orders_v1';
 
 export interface VerifyPinResult {
   success: boolean;
@@ -500,6 +503,81 @@ class ApiService {
     }
 
     return await res.json();
+  }
+
+  public getSavedGuestOrders(): SavedGuestOrderLink[] {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_GUEST_ORDERS);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (item: any) =>
+          item &&
+          typeof item.id === 'string' &&
+          typeof item.token === 'string' &&
+          /^[a-f0-9]{32}$/i.test(item.token)
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  public getGuestTokenForOrder(orderId: string): string | null {
+    const saved = this.getSavedGuestOrders().find((o) => o.id === orderId);
+    return saved ? saved.token : null;
+  }
+
+  public saveGuestOrderToStorage(order: Order, token: string, trackingUrl?: string): void {
+    if (typeof window === 'undefined' || !order?.id || !token) return;
+    try {
+      const cleanToken = token.trim();
+      if (!/^[a-f0-9]{32}$/i.test(cleanToken)) return;
+      const existing = this.getSavedGuestOrders().filter((o) => o.id !== order.id);
+      const itemsSummary = (order.items || [])
+        .map((i) => `${i.quantity}x ${i.name}`)
+        .join(', ');
+      const entry: SavedGuestOrderLink = {
+        id: order.id,
+        token: cleanToken,
+        trackingUrl: trackingUrl || `/pedido/${order.id}?t=${cleanToken}`,
+        createdAt: order.createdAt || new Date().toISOString(),
+        total: Number(order.total) || 0,
+        status: order.status || 'pendente',
+        deliveryType: order.deliveryType || 'delivery',
+        itemsSummary,
+      };
+      const next = [entry, ...existing].slice(0, 25);
+      localStorage.setItem(STORAGE_KEY_GUEST_ORDERS, JSON.stringify(next));
+    } catch {
+      // Ignore storage quota or private mode errors
+    }
+  }
+
+  public async trackGuestOrder(orderId: string, token: string): Promise<GuestTrackedOrderResponse> {
+    const cleanId = encodeURIComponent(orderId.trim());
+    const cleanTok = encodeURIComponent(token.trim());
+    const res = await fetch(`/api/orders/track/${cleanId}?t=${cleanTok}`, {
+      cache: 'no-store',
+    });
+
+    if (!res.ok) {
+      let message = 'Pedido não encontrado.';
+      try {
+        const json = await res.json();
+        if (json?.error) message = json.error;
+      } catch {}
+      const err: any = new Error(message);
+      err.status = res.status;
+      throw err;
+    }
+
+    const data: GuestTrackedOrderResponse = await res.json();
+    if (data?.order && token) {
+      this.saveGuestOrderToStorage(data.order, token, data.order.trackingUrl);
+    }
+    return data;
   }
 
   public async getCustomerDeliveryQuote(
@@ -1382,7 +1460,16 @@ class ApiService {
           throw serverErr;
         }
 
-        createdOrder = await res.json();
+        const rawJson = await res.json();
+        if (rawJson && typeof rawJson === 'object' && rawJson.order && typeof rawJson.order === 'object') {
+          createdOrder = {
+            ...rawJson.order,
+            trackingUrl: rawJson.trackingUrl || rawJson.order.trackingUrl,
+            guestToken: rawJson.guestToken || rawJson.order.guestToken,
+          };
+        } else {
+          createdOrder = rawJson;
+        }
         break;
       } catch (err: any) {
         if (!isNetworkOrTimeoutError(err)) {
@@ -1407,6 +1494,16 @@ class ApiService {
       exhaustedErr.isNetworkError = true;
       exhaustedErr.isNetworkRetryExhausted = true;
       throw exhaustedErr;
+    }
+
+    if (createdOrder.guestToken) {
+      this.saveGuestOrderToStorage(createdOrder, createdOrder.guestToken, createdOrder.trackingUrl);
+    } else if (createdOrder.trackingUrl) {
+      const matchTok = createdOrder.trackingUrl.match(/[?&]t=([a-f0-9]{32})/i);
+      if (matchTok && matchTok[1]) {
+        createdOrder.guestToken = matchTok[1];
+        this.saveGuestOrderToStorage(createdOrder, matchTok[1], createdOrder.trackingUrl);
+      }
     }
 
     if (this.isAdminAuthenticated()) {

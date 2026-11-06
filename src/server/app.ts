@@ -1210,6 +1210,7 @@ function orderToDB(o: Order) {
     status: o.status || 'pendente',
     customer: o.customer, // jsonb
     customer_id: o.customerId || null,
+    guest_token: o.guestToken || null,
     coupon_code: o.couponCode ? o.couponCode.toUpperCase().trim() : null,
     discount: Number(o.discount) || 0,
     delivery_type: o.deliveryType || 'delivery',
@@ -1315,11 +1316,56 @@ function sanitizePublicCustomer<T extends Record<string, any>>(c: T): T {
 }
 
 function sanitizeCustomerOrder(o: Order): Order {
+  const { guestToken: _guestToken, ...restOrder } = o;
   return {
-    ...o,
+    ...restOrder,
     customer: o.customer ? sanitizePublicCustomer(o.customer) : o.customer,
     items: (o.items || []).map(({ costPrice: _costPrice, ...itemRest }) => itemRest),
   };
+}
+
+const GUEST_ORDER_RATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const GUEST_ORDER_MAX_PER_HOUR = 3;
+const guestOrdersByIp = new Map<string, number[]>();
+const guestOrdersByPhone = new Map<string, number[]>();
+
+function normalizeBrazilianPhoneDigits(rawPhone: unknown): string {
+  let digits = String(rawPhone || '').replace(/\D/g, '');
+  if ((digits.length === 12 || digits.length === 13) && digits.startsWith('55')) {
+    digits = digits.slice(2);
+  }
+  return digits;
+}
+
+function pruneGuestTimestamps(list: number[] | undefined, now: number): number[] {
+  if (!list || list.length === 0) return [];
+  return list.filter((ts) => now - ts < GUEST_ORDER_RATE_WINDOW_MS);
+}
+
+function isGuestOrderRateLimited(ip: string, phoneDigits: string): boolean {
+  const now = Date.now();
+  const ipKey = ip || 'unknown';
+  const ipList = pruneGuestTimestamps(guestOrdersByIp.get(ipKey), now);
+  guestOrdersByIp.set(ipKey, ipList);
+
+  const phoneKey = phoneDigits || 'unknown';
+  const phoneList = pruneGuestTimestamps(guestOrdersByPhone.get(phoneKey), now);
+  guestOrdersByPhone.set(phoneKey, phoneList);
+
+  return ipList.length >= GUEST_ORDER_MAX_PER_HOUR || phoneList.length >= GUEST_ORDER_MAX_PER_HOUR;
+}
+
+function recordGuestOrderRateLimit(ip: string, phoneDigits: string): void {
+  const now = Date.now();
+  const ipKey = ip || 'unknown';
+  const ipList = pruneGuestTimestamps(guestOrdersByIp.get(ipKey), now);
+  ipList.push(now);
+  guestOrdersByIp.set(ipKey, ipList);
+
+  const phoneKey = phoneDigits || 'unknown';
+  const phoneList = pruneGuestTimestamps(guestOrdersByPhone.get(phoneKey), now);
+  phoneList.push(now);
+  guestOrdersByPhone.set(phoneKey, phoneList);
 }
 
 const DEFAULT_SERVER_SHORTCUTS: Record<string, string> = {
@@ -2496,18 +2542,22 @@ export function createApp(): express.Express {
       state,
       latitude,
       longitude,
+      guestOrderId,
+      guestToken,
     } = req.body || {};
 
-    if (!name || typeof name !== 'string' || !name.trim()) {
-      return res.status(400).json({ error: 'Nome completo é obrigatório.' });
+    if (!name || typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 80) {
+      return res.status(400).json({ error: 'Nome completo é obrigatório (2 a 80 caracteres).' });
     }
 
-    if (!email || typeof email !== 'string' || !email.includes('@')) {
+    const cleanPhoneDigits = normalizeBrazilianPhoneDigits(phone);
+    if (cleanPhoneDigits.length < 10 || cleanPhoneDigits.length > 11) {
+      return res.status(400).json({ error: 'Número de WhatsApp válido (10 ou 11 dígitos) é obrigatório.' });
+    }
+
+    const hasExplicitEmail = typeof email === 'string' && email.trim() !== '';
+    if (hasExplicitEmail && !email.includes('@')) {
       return res.status(400).json({ error: 'E-mail válido é obrigatório.' });
-    }
-
-    if (!phone || typeof phone !== 'string' || phone.replace(/\D/g, '').length < 8) {
-      return res.status(400).json({ error: 'Número de WhatsApp é obrigatório.' });
     }
 
     if (!password || typeof password !== 'string' || password.length < 8) {
@@ -2517,34 +2567,35 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
-    const cleanEmail = email.toLowerCase().trim();
-    const cleanPhoneDigits = phone.replace(/\D/g, '');
+    const cleanEmail = hasExplicitEmail ? email.toLowerCase().trim() : undefined;
 
-    // Check email uniqueness
-    const { data: existingUser, error: checkErr } = await supabase
-      .from('customers')
-      .select('id')
-      .eq('email', cleanEmail)
-      .maybeSingle();
+    // Check email uniqueness when email is provided
+    if (cleanEmail) {
+      const { data: existingUser, error: checkErr } = await supabase
+        .from('customers')
+        .select('id')
+        .eq('email', cleanEmail)
+        .maybeSingle();
 
-    if (checkErr) {
-      console.error('[Supabase Error] check customer email:', checkErr.message);
-      return res.status(500).json({ error: checkErr.message });
-    }
+      if (checkErr) {
+        console.error('[Supabase Error] check customer email:', checkErr.message);
+        return res.status(500).json({ error: checkErr.message });
+      }
 
-    if (existingUser) {
-      return res.status(409).json({
-        error: 'Este e-mail já está cadastrado. Faça login com seu e-mail e senha.',
-        field: 'email',
-      });
+      if (existingUser) {
+        return res.status(409).json({
+          error: 'Este e-mail já está cadastrado. Faça login com seu e-mail e senha.',
+          field: 'email',
+        });
+      }
     }
 
     // Check phone uniqueness when customer has password_hash
     if (cleanPhoneDigits.length >= 10) {
       const { data: phoneRows, error: phoneCheckErr } = await supabase
         .from('customers')
-        .select('id, phone, email')
-        .not('email', 'is', null);
+        .select('id, phone, email, password_hash')
+        .not('password_hash', 'is', null);
 
       if (phoneCheckErr) {
         console.error('[Supabase Error] check customer phone:', phoneCheckErr.message);
@@ -2552,7 +2603,7 @@ export function createApp(): express.Express {
       }
 
       const duplicatePhone = (phoneRows || []).find(
-        (r: any) => String(r.phone || '').replace(/\D/g, '') === cleanPhoneDigits
+        (r: any) => normalizeBrazilianPhoneDigits(r.phone) === cleanPhoneDigits
       );
       if (duplicatePhone) {
         return res.status(409).json({
@@ -2575,29 +2626,72 @@ export function createApp(): express.Express {
           ? Number(longitude)
           : undefined;
 
-      const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
-        address,
-        number,
-        neighborhood,
-        city,
-        state,
-        cep,
-        pinLatitude: parsedLat,
-        pinLongitude: parsedLng,
-      });
+      const trimmedAddress = String(address || '').trim();
+      const trimmedNumber = String(number || '').trim();
+      const trimmedNeighborhood = String(neighborhood || '').trim();
+      const isPickupPlaceholder =
+        !trimmedAddress || trimmedAddress.toLowerCase() === 'retirada no depósito';
 
-      if (geoValidation.error) {
-        return res.status(400).json({ error: geoValidation.error });
+      let geoValidation: Awaited<ReturnType<typeof resolveAndValidateCustomerAddress>> = {
+        locationVerified: false,
+      };
+
+      if (!isPickupPlaceholder) {
+        geoValidation = await resolveAndValidateCustomerAddress(supabase, {
+          address: trimmedAddress,
+          number: trimmedNumber,
+          neighborhood: trimmedNeighborhood,
+          city,
+          state,
+          cep,
+          pinLatitude: parsedLat,
+          pinLongitude: parsedLng,
+        });
+
+        if (geoValidation.error) {
+          return res.status(400).json({ error: geoValidation.error });
+        }
+      }
+
+      let initialOrdersCount = 0;
+      let initialTotalSpent = 0;
+      let initialLastOrderAt: string | undefined = undefined;
+      let validGuestOrderToLink: string | null = null;
+
+      if (
+        typeof guestOrderId === 'string' &&
+        guestOrderId.trim() &&
+        typeof guestToken === 'string' &&
+        /^[a-f0-9]{32}$/i.test(guestToken.trim())
+      ) {
+        const { data: guestOrderRow, error: guestOrderErr } = await supabase
+          .from('orders')
+          .select('id, total, created_at, guest_token, customer_id')
+          .eq('id', guestOrderId.trim())
+          .maybeSingle();
+
+        if (
+          !guestOrderErr &&
+          guestOrderRow &&
+          !guestOrderRow.customer_id &&
+          typeof guestOrderRow.guest_token === 'string' &&
+          guestOrderRow.guest_token === guestToken.trim()
+        ) {
+          validGuestOrderToLink = String(guestOrderRow.id);
+          initialOrdersCount = 1;
+          initialTotalSpent = Number(guestOrderRow.total) || 0;
+          initialLastOrderAt = guestOrderRow.created_at || new Date().toISOString();
+        }
       }
 
       const newCustProfile: CustomerProfile = {
         id: customerId,
         name: name.trim(),
         email: cleanEmail,
-        phone: phone.trim(),
-        address: (address || '').trim(),
-        number: (number || '').trim(),
-        neighborhood: (neighborhood || '').trim(),
+        phone: String(phone).trim(),
+        address: isPickupPlaceholder ? '' : trimmedAddress,
+        number: isPickupPlaceholder ? '' : trimmedNumber,
+        neighborhood: isPickupPlaceholder ? '' : trimmedNeighborhood,
         complement: complement ? complement.trim() : undefined,
         reference: reference ? reference.trim() : undefined,
         cep: cep ? cep.trim() : undefined,
@@ -2613,19 +2707,44 @@ export function createApp(): express.Express {
         distanceKm: geoValidation.distanceKm,
         isWithinDeliveryRadius: geoValidation.isWithinDeliveryRadius,
         createdAt: new Date().toISOString(),
-        totalOrdersCount: 0,
-        totalSpent: 0,
+        totalOrdersCount: initialOrdersCount,
+        totalSpent: initialTotalSpent,
+        lastOrderAt: initialLastOrderAt,
       };
 
-      const { data: insertedRow, error: insertErr } = await supabase
+      let dbPayload = customerToDB(newCustProfile, passwordHash);
+      let { data: insertedRow, error: insertErr } = await supabase
         .from('customers')
-        .insert(customerToDB(newCustProfile, passwordHash))
+        .insert(dbPayload)
         .select('*')
         .single();
+
+      // If customers.email has a NOT NULL constraint in the database and email was omitted, fallback to a phone-based internal email
+      if (insertErr && !cleanEmail) {
+        newCustProfile.email = `${cleanPhoneDigits}@whatsapp.cliente`;
+        dbPayload = customerToDB(newCustProfile, passwordHash);
+        const retryInsert = await supabase
+          .from('customers')
+          .insert(dbPayload)
+          .select('*')
+          .single();
+        insertedRow = retryInsert.data;
+        insertErr = retryInsert.error;
+      }
 
       if (insertErr) {
         console.error('[Supabase Error] customer register insert:', insertErr.message);
         return res.status(500).json({ error: insertErr.message });
+      }
+
+      if (validGuestOrderToLink) {
+        const { error: linkErr } = await supabase
+          .from('orders')
+          .update({ customer_id: customerId })
+          .eq('id', validGuestOrderToLink);
+        if (linkErr) {
+          console.warn('[Supabase Warning] link guest order to new customer:', linkErr.message);
+        }
       }
 
       const { token, expiresAt } = createCustomerSignedToken(customerId);
@@ -2645,7 +2764,7 @@ export function createApp(): express.Express {
   router.post('/customer/login', async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password) {
-      return res.status(400).json({ error: 'E-mail e senha são obrigatórios.' });
+      return res.status(400).json({ error: 'E-mail/WhatsApp e senha são obrigatórios.' });
     }
 
     const supabase = getSupabase();
@@ -2671,16 +2790,39 @@ export function createApp(): express.Express {
       console.warn('[Auth Warning] customer login attempt check:', err);
     }
 
-    const cleanEmail = String(email).toLowerCase().trim();
-    const { data: customerRow, error: fetchErr } = await supabase
-      .from('customers')
-      .select('*')
-      .eq('email', cleanEmail)
-      .maybeSingle();
+    const rawIdentifier = String(email).trim();
+    let customerRow: any = null;
 
-    if (fetchErr) {
-      console.error('[Supabase Error] customer login query:', fetchErr.message);
-      return res.status(500).json({ error: fetchErr.message });
+    if (rawIdentifier.includes('@')) {
+      const cleanEmail = rawIdentifier.toLowerCase();
+      const { data, error: fetchErr } = await supabase
+        .from('customers')
+        .select('*')
+        .eq('email', cleanEmail)
+        .maybeSingle();
+
+      if (fetchErr) {
+        console.error('[Supabase Error] customer login query:', fetchErr.message);
+        return res.status(500).json({ error: fetchErr.message });
+      }
+      customerRow = data;
+    } else {
+      const cleanDigits = normalizeBrazilianPhoneDigits(rawIdentifier);
+      if (cleanDigits.length >= 10) {
+        const { data: phoneCandidates, error: phoneFetchErr } = await supabase
+          .from('customers')
+          .select('*')
+          .not('password_hash', 'is', null);
+
+        if (phoneFetchErr) {
+          console.error('[Supabase Error] customer login phone query:', phoneFetchErr.message);
+          return res.status(500).json({ error: phoneFetchErr.message });
+        }
+
+        customerRow = (phoneCandidates || []).find(
+          (r: any) => normalizeBrazilianPhoneDigits(r.phone) === cleanDigits
+        );
+      }
     }
 
     if (!customerRow || !customerRow.password_hash) {
@@ -2690,7 +2832,7 @@ export function createApp(): express.Express {
         success: false,
         created_at: new Date().toISOString(),
       });
-      return res.status(401).json({ error: 'E-mail ou senha incorretos.' });
+      return res.status(401).json({ error: 'E-mail/WhatsApp ou senha incorretos.' });
     }
 
     const isMatch = await verifyPassword(String(password), customerRow.password_hash);
@@ -2702,7 +2844,7 @@ export function createApp(): express.Express {
     });
 
     if (!isMatch) {
-      return res.status(401).json({ error: 'E-mail ou senha incorretos.' });
+      return res.status(401).json({ error: 'E-mail/WhatsApp ou senha incorretos.' });
     }
 
     const { token, expiresAt } = createCustomerSignedToken(customerRow.id);
@@ -4921,7 +5063,31 @@ export function createApp(): express.Express {
         if (isCustomer && existingIdempRow.customer_id === signed?.customerId) {
           return res.status(200).json(sanitizeCustomerOrder(orderFromDB(existingIdempRow)));
         }
+        if (!isCustomer && !existingIdempRow.customer_id && existingIdempRow.guest_token) {
+          const sanitized = sanitizeCustomerOrder(orderFromDB(existingIdempRow));
+          const guestTok = String(existingIdempRow.guest_token);
+          const trackingUrl = `/pedido/${existingIdempRow.id}?t=${guestTok}`;
+          return res.status(200).json({
+            ...sanitized,
+            order: sanitized,
+            trackingUrl,
+            guestToken: guestTok,
+          });
+        }
       }
+    }
+
+    // Reject coupons for non-registered customers
+    if (
+      effectiveSource === 'online' &&
+      rawOrder.couponCode &&
+      typeof rawOrder.couponCode === 'string' &&
+      rawOrder.couponCode.trim() !== '' &&
+      !isCustomer
+    ) {
+      return res.status(400).json({
+        error: 'Cupons de desconto são exclusivos para clientes cadastrados.',
+      });
     }
 
     // 1. Fetch current products, delivery areas, settings directly from Supabase (without base64 images)
@@ -4944,6 +5110,9 @@ export function createApp(): express.Express {
     let customerData: any = null;
     let serverDistanceKm: number | undefined = undefined;
     let serverIsWithinRadius: boolean | undefined = undefined;
+    let guestToken: string | undefined = undefined;
+    let guestPhoneDigitsForRateLimit = '';
+    const clientIpForRateLimit = getClientIp(req);
 
     if (effectiveSource === 'balcao') {
       // Admin POS sale
@@ -4957,14 +5126,8 @@ export function createApp(): express.Express {
         reference: rawOrder.customer?.reference || undefined,
       };
       customerId = rawOrder.customerId || undefined;
-    } else {
-      // Store checkout - requires customer token
-      if (!isCustomer || !signed?.customerId) {
-        return res.status(401).json({
-          error: 'Faça login ou crie sua conta para finalizar o pedido.',
-        });
-      }
-
+    } else if (isCustomer && signed?.customerId) {
+      // Logged-in customer checkout
       customerId = signed.customerId;
       const { data: custRow, error: custErr } = await supabase
         .from('customers')
@@ -4977,64 +5140,305 @@ export function createApp(): express.Express {
       }
 
       let dbCustomer = customerFromDB(custRow);
-      if (rawOrder.deliveryType !== 'retirada' && (custRow.geo_latitude === null || custRow.geo_latitude === undefined)) {
-        const legacyResult = await ensureLegacyCustomerGeocoded(supabase, custRow);
-        dbCustomer = legacyResult.customer;
-      }
-
-      // Calculate distance strictly from the customer's geocoded typed address (or fallback saved coordinates), never from req.body
-      const orderRefLat = dbCustomer.geoLatitude ?? dbCustomer.latitude;
-      const orderRefLng = dbCustomer.geoLongitude ?? dbCustomer.longitude;
-      if (
-        orderRefLat !== undefined &&
-        orderRefLat !== null &&
-        orderRefLng !== undefined &&
-        orderRefLng !== null &&
-        dbSettings.storeLatitude !== undefined &&
-        dbSettings.storeLatitude !== null &&
-        dbSettings.storeLongitude !== undefined &&
-        dbSettings.storeLongitude !== null
-      ) {
-        serverDistanceKm = haversineKm(
-          Number(dbSettings.storeLatitude),
-          Number(dbSettings.storeLongitude),
-          Number(orderRefLat),
-          Number(orderRefLng)
-        );
-        serverIsWithinRadius = serverDistanceKm <= maxRadiusKm;
-      }
-
       const isDeliveryOrder = rawOrder.deliveryType !== 'retirada';
-      const verifiedFlag = isDeliveryOrder ? Boolean(dbCustomer.locationVerified) : true;
+      const customAddr =
+        isDeliveryOrder && rawOrder.deliveryAddress && typeof rawOrder.deliveryAddress === 'object'
+          ? rawOrder.deliveryAddress
+          : null;
 
-      // Use customer data directly from the database by the token's id
-      customerData = {
-        name: dbCustomer.name,
-        phone: dbCustomer.phone,
-        email: dbCustomer.email || undefined,
-        address: isDeliveryOrder ? (dbCustomer.address || rawOrder.customer?.address || '') : 'Retirada no Depósito',
-        number: isDeliveryOrder ? (dbCustomer.number || rawOrder.customer?.number || '') : 'S/N',
-        neighborhood: isDeliveryOrder ? (dbCustomer.neighborhood || rawOrder.customer?.neighborhood || '') : 'Depósito',
-        complement: dbCustomer.complement || rawOrder.customer?.complement || undefined,
-        reference: dbCustomer.reference || rawOrder.customer?.reference || undefined,
-        cep: dbCustomer.cep || rawOrder.customer?.cep || undefined,
-        city: dbCustomer.city || rawOrder.customer?.city || undefined,
-        state: dbCustomer.state || rawOrder.customer?.state || undefined,
-        latitude: dbCustomer.latitude,
-        longitude: dbCustomer.longitude,
-        geoLatitude: dbCustomer.geoLatitude,
-        geoLongitude: dbCustomer.geoLongitude,
-        geoPrecision: dbCustomer.geoPrecision,
-        pinOffsetM: dbCustomer.pinOffsetM,
-        locationVerified: verifiedFlag,
-        geo_latitude: dbCustomer.geoLatitude ?? null,
-        geo_longitude: dbCustomer.geoLongitude ?? null,
-        geo_precision: dbCustomer.geoPrecision ?? null,
-        pin_offset_m: dbCustomer.pinOffsetM ?? null,
-        location_verified: verifiedFlag,
-        distanceKm: serverDistanceKm,
-        isWithinDeliveryRadius: serverIsWithinRadius,
-      };
+      if (customAddr) {
+        const cAddress = String(customAddr.address || '').trim();
+        const cNumber = String(customAddr.number || '').trim();
+        const cNeighborhood = String(customAddr.neighborhood || '').trim();
+        const cCep = customAddr.cep ? String(customAddr.cep).trim() : undefined;
+        const cCity = customAddr.city ? String(customAddr.city).trim() : undefined;
+        const cState = customAddr.state ? String(customAddr.state).trim() : undefined;
+        const cComplement = customAddr.complement ? String(customAddr.complement).trim() : undefined;
+        const cReference = customAddr.reference ? String(customAddr.reference).trim() : undefined;
+
+        if (!cAddress || !cNumber || !cNeighborhood) {
+          return res.status(400).json({
+            error: 'Preencha rua, número e bairro do endereço de entrega.',
+          });
+        }
+
+        const parsedPinLat =
+          customAddr.latitude !== undefined &&
+          customAddr.latitude !== null &&
+          !Number.isNaN(Number(customAddr.latitude))
+            ? Number(customAddr.latitude)
+            : undefined;
+        const parsedPinLng =
+          customAddr.longitude !== undefined &&
+          customAddr.longitude !== null &&
+          !Number.isNaN(Number(customAddr.longitude))
+            ? Number(customAddr.longitude)
+            : undefined;
+
+        const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
+          address: cAddress,
+          number: cNumber,
+          neighborhood: cNeighborhood,
+          city: cCity,
+          state: cState,
+          cep: cCep,
+          pinLatitude: parsedPinLat,
+          pinLongitude: parsedPinLng,
+        });
+
+        if (geoValidation.error) {
+          return res.status(400).json({ error: geoValidation.error });
+        }
+
+        serverDistanceKm = geoValidation.distanceKm;
+        serverIsWithinRadius = geoValidation.isWithinDeliveryRadius;
+
+        if (dbAreas.length > 0 && dbSettings.deliveryModel !== 'radius') {
+          const matchedNh = dbAreas.find(
+            (a) => a.active && a.name.toLowerCase().trim() === cNeighborhood.toLowerCase()
+          );
+          if (!matchedNh) {
+            return res.status(400).json({
+              error: `Desculpe! O bairro "${cNeighborhood}" não está na nossa área de entrega atendida.`,
+            });
+          }
+        }
+
+        const verifiedFlag = Boolean(geoValidation.locationVerified);
+        customerData = {
+          name: dbCustomer.name,
+          phone: dbCustomer.phone,
+          email: dbCustomer.email || undefined,
+          address: cAddress,
+          number: cNumber,
+          neighborhood: cNeighborhood,
+          complement: cComplement,
+          reference: cReference,
+          cep: cCep,
+          city: cCity,
+          state: cState,
+          latitude: geoValidation.latitude,
+          longitude: geoValidation.longitude,
+          geoLatitude: geoValidation.geoLatitude,
+          geoLongitude: geoValidation.geoLongitude,
+          geoPrecision: geoValidation.geoPrecision,
+          pinOffsetM: geoValidation.pinOffsetM,
+          locationVerified: verifiedFlag,
+          geo_latitude: geoValidation.geoLatitude ?? null,
+          geo_longitude: geoValidation.geoLongitude ?? null,
+          geo_precision: geoValidation.geoPrecision ?? null,
+          pin_offset_m: geoValidation.pinOffsetM ?? null,
+          location_verified: verifiedFlag,
+          distanceKm: serverDistanceKm,
+          isWithinDeliveryRadius: serverIsWithinRadius,
+        };
+      } else {
+        if (isDeliveryOrder && (custRow.geo_latitude === null || custRow.geo_latitude === undefined)) {
+          const legacyResult = await ensureLegacyCustomerGeocoded(supabase, custRow);
+          dbCustomer = legacyResult.customer;
+        }
+
+        const orderRefLat = dbCustomer.geoLatitude ?? dbCustomer.latitude;
+        const orderRefLng = dbCustomer.geoLongitude ?? dbCustomer.longitude;
+        if (
+          orderRefLat !== undefined &&
+          orderRefLat !== null &&
+          orderRefLng !== undefined &&
+          orderRefLng !== null &&
+          dbSettings.storeLatitude !== undefined &&
+          dbSettings.storeLatitude !== null &&
+          dbSettings.storeLongitude !== undefined &&
+          dbSettings.storeLongitude !== null
+        ) {
+          serverDistanceKm = haversineKm(
+            Number(dbSettings.storeLatitude),
+            Number(dbSettings.storeLongitude),
+            Number(orderRefLat),
+            Number(orderRefLng)
+          );
+          serverIsWithinRadius = serverDistanceKm <= maxRadiusKm;
+        }
+
+        const verifiedFlag = isDeliveryOrder ? Boolean(dbCustomer.locationVerified) : true;
+
+        customerData = {
+          name: dbCustomer.name,
+          phone: dbCustomer.phone,
+          email: dbCustomer.email || undefined,
+          address: isDeliveryOrder ? (dbCustomer.address || rawOrder.customer?.address || '') : 'Retirada no Depósito',
+          number: isDeliveryOrder ? (dbCustomer.number || rawOrder.customer?.number || '') : 'S/N',
+          neighborhood: isDeliveryOrder ? (dbCustomer.neighborhood || rawOrder.customer?.neighborhood || '') : 'Depósito',
+          complement: dbCustomer.complement || rawOrder.customer?.complement || undefined,
+          reference: dbCustomer.reference || rawOrder.customer?.reference || undefined,
+          cep: dbCustomer.cep || rawOrder.customer?.cep || undefined,
+          city: dbCustomer.city || rawOrder.customer?.city || undefined,
+          state: dbCustomer.state || rawOrder.customer?.state || undefined,
+          latitude: dbCustomer.latitude,
+          longitude: dbCustomer.longitude,
+          geoLatitude: dbCustomer.geoLatitude,
+          geoLongitude: dbCustomer.geoLongitude,
+          geoPrecision: dbCustomer.geoPrecision,
+          pinOffsetM: dbCustomer.pinOffsetM,
+          locationVerified: verifiedFlag,
+          geo_latitude: dbCustomer.geoLatitude ?? null,
+          geo_longitude: dbCustomer.geoLongitude ?? null,
+          geo_precision: dbCustomer.geoPrecision ?? null,
+          pin_offset_m: dbCustomer.pinOffsetM ?? null,
+          location_verified: verifiedFlag,
+          distanceKm: serverDistanceKm,
+          isWithinDeliveryRadius: serverIsWithinRadius,
+        };
+      }
+    } else if (rawOrder.guest && typeof rawOrder.guest === 'object') {
+      // Guest quick checkout (without account)
+      const guestObj = rawOrder.guest;
+      const gName = String(guestObj.name || '').trim();
+      const gPhoneRaw = String(guestObj.phone || '').trim();
+      const gPhoneDigits = normalizeBrazilianPhoneDigits(gPhoneRaw);
+
+      if (gName.length < 2 || gName.length > 80) {
+        return res.status(400).json({ error: 'Informe seu nome (entre 2 e 80 caracteres).' });
+      }
+
+      if (gPhoneDigits.length < 10 || gPhoneDigits.length > 11) {
+        return res.status(400).json({
+          error: 'Informe um WhatsApp válido com DDD (10 ou 11 dígitos).',
+        });
+      }
+
+      if (isGuestOrderRateLimited(clientIpForRateLimit, gPhoneDigits)) {
+        return res.status(429).json({
+          error: 'Muitos pedidos seguidos, aguarde um pouco ou fale com a gente no WhatsApp',
+        });
+      }
+
+      const oneHourAgoIso = new Date(Date.now() - GUEST_ORDER_RATE_WINDOW_MS).toISOString();
+      const { data: recentGuestOrders, error: guestRateErr } = await supabase
+        .from('orders')
+        .select('id, customer', { count: 'exact' })
+        .not('guest_token', 'is', null)
+        .gte('created_at', oneHourAgoIso)
+        .limit(200);
+
+      if (guestRateErr) {
+        console.error('[Supabase Error] guest rate limit check:', guestRateErr.message);
+        return res.status(500).json({ error: guestRateErr.message });
+      }
+
+      const matchingPhoneCount = (recentGuestOrders || []).filter(
+        (row: any) => normalizeBrazilianPhoneDigits(row?.customer?.phone) === gPhoneDigits
+      ).length;
+
+      if (matchingPhoneCount >= GUEST_ORDER_MAX_PER_HOUR) {
+        return res.status(429).json({
+          error: 'Muitos pedidos seguidos, aguarde um pouco ou fale com a gente no WhatsApp',
+        });
+      }
+
+      guestPhoneDigitsForRateLimit = gPhoneDigits;
+      guestToken = crypto.randomBytes(16).toString('hex');
+      const isDeliveryOrder = rawOrder.deliveryType !== 'retirada';
+
+      if (isDeliveryOrder) {
+        const gAddress = String(guestObj.address || '').trim();
+        const gNumber = String(guestObj.number || '').trim();
+        const gNeighborhood = String(guestObj.neighborhood || '').trim();
+        const gCep = guestObj.cep ? String(guestObj.cep).trim() : undefined;
+        const gCity = guestObj.city ? String(guestObj.city).trim() : undefined;
+        const gState = guestObj.state ? String(guestObj.state).trim() : undefined;
+        const gComplement = guestObj.complement ? String(guestObj.complement).trim() : undefined;
+        const gReference = guestObj.reference ? String(guestObj.reference).trim() : undefined;
+
+        if (!gAddress || !gNumber || !gNeighborhood) {
+          return res.status(400).json({
+            error: 'Preencha rua, número e bairro do endereço de entrega.',
+          });
+        }
+
+        const parsedPinLat =
+          guestObj.latitude !== undefined &&
+          guestObj.latitude !== null &&
+          !Number.isNaN(Number(guestObj.latitude))
+            ? Number(guestObj.latitude)
+            : undefined;
+        const parsedPinLng =
+          guestObj.longitude !== undefined &&
+          guestObj.longitude !== null &&
+          !Number.isNaN(Number(guestObj.longitude))
+            ? Number(guestObj.longitude)
+            : undefined;
+
+        const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
+          address: gAddress,
+          number: gNumber,
+          neighborhood: gNeighborhood,
+          city: gCity,
+          state: gState,
+          cep: gCep,
+          pinLatitude: parsedPinLat,
+          pinLongitude: parsedPinLng,
+        });
+
+        if (geoValidation.error) {
+          return res.status(400).json({ error: geoValidation.error });
+        }
+
+        serverDistanceKm = geoValidation.distanceKm;
+        serverIsWithinRadius = geoValidation.isWithinDeliveryRadius;
+
+        if (dbAreas.length > 0 && dbSettings.deliveryModel !== 'radius') {
+          const matchedNh = dbAreas.find(
+            (a) => a.active && a.name.toLowerCase().trim() === gNeighborhood.toLowerCase()
+          );
+          if (!matchedNh) {
+            return res.status(400).json({
+              error: `Desculpe! O bairro "${gNeighborhood}" não está na nossa área de entrega atendida.`,
+            });
+          }
+        }
+
+        const verifiedFlag = Boolean(geoValidation.locationVerified);
+        customerData = {
+          name: gName,
+          phone: gPhoneRaw,
+          address: gAddress,
+          number: gNumber,
+          neighborhood: gNeighborhood,
+          complement: gComplement,
+          reference: gReference,
+          cep: gCep,
+          city: gCity,
+          state: gState,
+          latitude: geoValidation.latitude,
+          longitude: geoValidation.longitude,
+          geoLatitude: geoValidation.geoLatitude,
+          geoLongitude: geoValidation.geoLongitude,
+          geoPrecision: geoValidation.geoPrecision,
+          pinOffsetM: geoValidation.pinOffsetM,
+          locationVerified: verifiedFlag,
+          geo_latitude: geoValidation.geoLatitude ?? null,
+          geo_longitude: geoValidation.geoLongitude ?? null,
+          geo_precision: geoValidation.geoPrecision ?? null,
+          pin_offset_m: geoValidation.pinOffsetM ?? null,
+          location_verified: verifiedFlag,
+          distanceKm: serverDistanceKm,
+          isWithinDeliveryRadius: serverIsWithinRadius,
+        };
+      } else {
+        customerData = {
+          name: gName,
+          phone: gPhoneRaw,
+          address: 'Retirada no Depósito',
+          number: 'S/N',
+          neighborhood: 'Depósito',
+          locationVerified: true,
+          location_verified: true,
+        };
+      }
+    } else {
+      return res.status(401).json({
+        error: 'Faça login, crie sua conta ou escolha Pedido rápido sem cadastro para finalizar.',
+      });
     }
 
     // 2. Validate items and recalculate subtotal
@@ -5229,7 +5633,19 @@ export function createApp(): express.Express {
       refId: orderId,
     }));
 
-    // 3. Recalculate Delivery Fee & Enforce Delivery Radius on Server
+    // 3. Recalculate Delivery Fee, Minimum Order & Enforce Delivery Radius on Server
+    const minOrderVal = Number(dbSettings.minOrderValue) || 0;
+    if (
+      effectiveSource === 'online' &&
+      minOrderVal > 0 &&
+      Math.round(recalculatedSubtotal * 100) < Math.round(minOrderVal * 100)
+    ) {
+      const formattedMin = minOrderVal.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+      return res.status(400).json({
+        error: `O pedido mínimo é de ${formattedMin}.`,
+      });
+    }
+
     const deliveryType = rawOrder.deliveryType === 'retirada' ? 'retirada' : 'delivery';
     let deliveryFee = 0;
 
@@ -5247,6 +5663,12 @@ export function createApp(): express.Express {
 
       const customerNh = (customerData.neighborhood || '').toLowerCase().trim();
       const matchedArea = dbAreas.find((a) => a.active && a.name.toLowerCase().trim() === customerNh);
+
+      if (effectiveSource !== 'balcao' && dbAreas.length > 0 && dbSettings.deliveryModel !== 'radius' && !matchedArea) {
+        return res.status(400).json({
+          error: `Desculpe! O bairro "${customerData.neighborhood || ''}" não está na nossa área de entrega atendida.`,
+        });
+      }
 
       if (matchedArea) {
         deliveryFee = matchedArea.fee;
@@ -5269,7 +5691,10 @@ export function createApp(): express.Express {
     let discount = 0;
     let validCouponCode: string | undefined = undefined;
 
-    if (rawOrder.couponCode && typeof rawOrder.couponCode === 'string') {
+    if (rawOrder.couponCode && typeof rawOrder.couponCode === 'string' && rawOrder.couponCode.trim() !== '') {
+      if (!isCustomer) {
+        return res.status(400).json({ error: 'Cupons de desconto são exclusivos para clientes cadastrados.' });
+      }
       const requestedCode = rawOrder.couponCode.toUpperCase().trim();
       const { data: couponRow, error: couponFetchErr } = await supabase
         .from('coupons')
@@ -5370,6 +5795,7 @@ export function createApp(): express.Express {
       status: 'pendente', // Force pending
       customer: customerData,
       customerId,
+      guestToken,
       couponCode: validCouponCode,
       discount: Math.round(discount * 100) / 100,
       deliveryType,
@@ -5404,6 +5830,17 @@ export function createApp(): express.Express {
           if (isCustomer && dupRow.customer_id === signed?.customerId) {
             return res.status(200).json(sanitizeCustomerOrder(dupOrder));
           }
+          if (!isCustomer && !dupRow.customer_id && dupRow.guest_token) {
+            const sanitizedDup = sanitizeCustomerOrder(dupOrder);
+            const dupTok = String(dupRow.guest_token);
+            const trackingUrl = `/pedido/${dupRow.id}?t=${dupTok}`;
+            return res.status(200).json({
+              ...sanitizedDup,
+              order: sanitizedDup,
+              trackingUrl,
+              guestToken: dupTok,
+            });
+          }
         }
       }
 
@@ -5427,7 +5864,116 @@ export function createApp(): express.Express {
       }
     }
 
+    if (guestToken) {
+      recordGuestOrderRateLimit(clientIpForRateLimit, guestPhoneDigitsForRateLimit);
+      const sanitizedGuestOrder = sanitizeCustomerOrder(newOrder);
+      const trackingUrl = `/pedido/${newOrder.id}?t=${guestToken}`;
+      return res.status(201).json({
+        ...sanitizedGuestOrder,
+        order: sanitizedGuestOrder,
+        trackingUrl,
+        guestToken,
+      });
+    }
+
     return res.status(201).json(isAdmin ? newOrder : sanitizeCustomerOrder(newOrder));
+  });
+
+  // Guest order tracking without login: GET /api/orders/track/:id?t=<token>
+  router.get('/orders/track/:id', async (req, res) => {
+    const { id } = req.params;
+    const rawToken = typeof req.query.t === 'string' ? req.query.t.trim() : '';
+
+    if (!id || !rawToken || !/^[a-f0-9]{32}$/i.test(rawToken)) {
+      return res.status(404).json({ error: 'Pedido não encontrado.' });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+
+    const { data: orderRow, error: orderErr } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderErr) {
+      console.error('[Supabase Error] track guest order:', orderErr.message);
+      return res.status(500).json({ error: orderErr.message });
+    }
+
+    if (!orderRow || typeof orderRow.guest_token !== 'string' || orderRow.guest_token.length !== 32) {
+      return res.status(404).json({ error: 'Pedido não encontrado.' });
+    }
+
+    const storedBuf = Buffer.from(orderRow.guest_token.toLowerCase(), 'utf8');
+    const queryBuf = Buffer.from(rawToken.toLowerCase(), 'utf8');
+    if (storedBuf.length !== queryBuf.length || !crypto.timingSafeEqual(storedBuf, queryBuf)) {
+      return res.status(404).json({ error: 'Pedido não encontrado.' });
+    }
+
+    const { data: settingsRow, error: settingsErr } = await supabase
+      .from('store_settings')
+      .select('data')
+      .eq('id', 'default')
+      .maybeSingle();
+
+    if (settingsErr) {
+      console.error('[Supabase Error] track order settings:', settingsErr.message);
+      return res.status(500).json({ error: settingsErr.message });
+    }
+
+    const cleanSettings = settingsRow?.data
+      ? sanitizePublicSettings(settingsRow.data)
+      : sanitizePublicSettings(initialSettings);
+
+    const parsedOrder = sanitizeCustomerOrder(orderFromDB(orderRow));
+    const safeCustomer = {
+      name: parsedOrder.customer?.name || '',
+      phone: parsedOrder.customer?.phone || '',
+      address: parsedOrder.customer?.address || '',
+      number: parsedOrder.customer?.number || '',
+      neighborhood: parsedOrder.customer?.neighborhood || '',
+      complement: parsedOrder.customer?.complement || undefined,
+      reference: parsedOrder.customer?.reference || undefined,
+      cep: parsedOrder.customer?.cep || undefined,
+      city: parsedOrder.customer?.city || undefined,
+      state: parsedOrder.customer?.state || undefined,
+    };
+
+    const safeOrder: Order = {
+      id: parsedOrder.id,
+      createdAt: parsedOrder.createdAt,
+      updatedAt: parsedOrder.updatedAt,
+      source: parsedOrder.source,
+      status: parsedOrder.status,
+      deliveryType: parsedOrder.deliveryType,
+      items: parsedOrder.items,
+      subtotal: parsedOrder.subtotal,
+      discount: parsedOrder.discount,
+      deliveryFee: parsedOrder.deliveryFee,
+      total: parsedOrder.total,
+      paymentMethod: parsedOrder.paymentMethod,
+      cashChangeFor: parsedOrder.cashChangeFor,
+      notes: parsedOrder.notes,
+      customerId: parsedOrder.customerId,
+      customer: safeCustomer,
+      trackingUrl: `/pedido/${parsedOrder.id}?t=${rawToken}`,
+    };
+
+    return res.json({
+      order: safeOrder,
+      store: {
+        storeName: cleanSettings.storeName,
+        phone: cleanSettings.phone,
+        whatsapp: cleanSettings.whatsapp,
+        address: cleanSettings.address,
+        openingHours: cleanSettings.openingHours,
+        estimatedDeliveryTime: cleanSettings.estimatedDeliveryTime,
+        pixKey: cleanSettings.pixKey,
+        pixReceiver: cleanSettings.pixReceiver,
+      },
+    });
   });
 
   router.get('/orders/:id', async (req, res) => {

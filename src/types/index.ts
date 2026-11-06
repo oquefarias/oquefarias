@@ -224,6 +224,24 @@ export interface Coupon {
   usedCount: number;
 }
 
+export interface OrderDeliveryAddressPayload {
+  cep?: string;
+  address: string;
+  number: string;
+  neighborhood: string;
+  complement?: string;
+  reference?: string;
+  city?: string;
+  state?: string;
+  latitude?: number;
+  longitude?: number;
+}
+
+export interface GuestOrderPayload extends OrderDeliveryAddressPayload {
+  name: string;
+  phone: string;
+}
+
 export interface Order {
   id: string;
   createdAt: string;
@@ -243,6 +261,37 @@ export interface Order {
   status: OrderStatus;
   notes?: string;
   updatedAt: string;
+  guestToken?: string;
+  trackingUrl?: string;
+  deliveryAddress?: OrderDeliveryAddressPayload;
+  guest?: GuestOrderPayload;
+}
+
+export interface GuestTrackedStoreInfo {
+  storeName: string;
+  phone: string;
+  whatsapp: string;
+  address: string;
+  openingHours: string;
+  estimatedDeliveryTime: string;
+  pixKey: string;
+  pixReceiver: string;
+}
+
+export interface GuestTrackedOrderResponse {
+  order: Order;
+  store: GuestTrackedStoreInfo;
+}
+
+export interface SavedGuestOrderLink {
+  id: string;
+  token: string;
+  trackingUrl: string;
+  createdAt: string;
+  total: number;
+  status: OrderStatus;
+  deliveryType: 'delivery' | 'retirada' | 'local';
+  itemsSummary: string;
 }
 
 export interface DiningTable {
