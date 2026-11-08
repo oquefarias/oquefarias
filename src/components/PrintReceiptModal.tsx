@@ -10,7 +10,7 @@ import {
 } from '../types';
 import { Printer, X } from 'lucide-react';
 import QRCode from 'qrcode';
-import { buildSingleDeliveryRouteUrl, isCustomerLocationVerified } from '../utils/geo';
+import { buildSingleDeliveryRouteUrl } from '../utils/geo';
 
 interface PrintReceiptModalProps {
   order: Order | null;
@@ -28,8 +28,10 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
     order.source !== 'mesa'
   );
 
-  const locationVerified = order ? isCustomerLocationVerified(order.customer) : false;
-  const routeUrl = order && isDeliveryRouteOrder ? buildSingleDeliveryRouteUrl(order.customer) : '';
+  const routeUrl =
+    order && isDeliveryRouteOrder
+      ? buildSingleDeliveryRouteUrl(order.customer, settings.address)
+      : '';
 
   useEffect(() => {
     let active = true;
@@ -161,11 +163,6 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
                     <p className="text-[11px] font-bold text-neutral-900 mt-1">
                       Escaneie para abrir a rota
                     </p>
-                    {!locationVerified && (
-                      <p className="text-[11px] font-bold text-amber-900 bg-amber-100 px-2 py-0.5 rounded mt-1">
-                        ⚠ Confira o endereço escrito
-                      </p>
-                    )}
                   </div>
                 )}
               </>

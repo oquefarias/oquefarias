@@ -337,8 +337,45 @@ export interface RouteCustomerLike {
 
 /**
  * Formats the customer's full written address (street, number, neighborhood, city, state, CEP).
+/**
+ * Extracts the city/UF portion from the store's full address string if available.
+ * Example: "Av. das Palmeiras, 450 - Centro, São Paulo - SP" -> "São Paulo - SP"
  */
-export function formatCustomerWrittenAddress(customer?: RouteCustomerLike | null): string {
+export function extractStoreCityFromAddress(storeAddress?: string | null): string {
+  if (!storeAddress) return '';
+  const raw = String(storeAddress).trim();
+  if (!raw) return '';
+  const commaParts = raw
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (commaParts.length >= 3) {
+    return commaParts[commaParts.length - 1];
+  }
+  const dashParts = raw
+    .split(' - ')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (dashParts.length >= 3) {
+    return dashParts.slice(-2).join(' - ');
+  }
+  if (commaParts.length === 2) {
+    const second = commaParts[1];
+    if (!/^\d+$/.test(second)) {
+      return second;
+    }
+  }
+  return '';
+}
+
+/**
+ * Formats a customer's written address for Google Maps destination search:
+ * "Rua, Número, Bairro, Cidade da loja"
+ */
+export function formatCustomerWrittenAddress(
+  customer?: RouteCustomerLike | null,
+  storeAddress?: string | null
+): string {
   if (!customer) return '';
   const streetPart = [
     customer.address?.trim() || '',
@@ -347,17 +384,21 @@ export function formatCustomerWrittenAddress(customer?: RouteCustomerLike | null
     .filter(Boolean)
     .join(', ');
 
-  const cityStatePart = [
+  const customerCityState = [
     customer.city?.trim() || '',
     customer.state?.trim() || '',
   ]
     .filter(Boolean)
     .join(' - ');
 
+  const storeCity = extractStoreCityFromAddress(storeAddress);
+  const cityStatePart = customerCityState || storeCity;
+
   const cepDigits = (customer.cep || '').replace(/\D/g, '');
-  const formattedCep = cepDigits.length === 8
-    ? `${cepDigits.slice(0, 5)}-${cepDigits.slice(5)}`
-    : customer.cep?.trim() || '';
+  const formattedCep =
+    cepDigits.length === 8
+      ? `${cepDigits.slice(0, 5)}-${cepDigits.slice(5)}`
+      : customer.cep?.trim() || '';
 
   return [
     streetPart,
@@ -370,104 +411,31 @@ export function formatCustomerWrittenAddress(customer?: RouteCustomerLike | null
 }
 
 /**
- * Checks whether the customer's location is verified (`location_verified === true`).
- * When false, the receipt prints "⚠ Confira o endereço escrito".
+ * Checks whether the customer's written address is present.
  */
 export function isCustomerLocationVerified(customer?: RouteCustomerLike | null): boolean {
   if (!customer) return false;
-  const rawVerified =
-    customer.location_verified !== undefined && customer.location_verified !== null
-      ? customer.location_verified
-      : customer.locationVerified;
-  return rawVerified === true;
+  return Boolean(customer.address?.trim() && customer.neighborhood?.trim());
 }
 
 /**
- * Determines whether the route QR / link should use (LAT,LNG) coordinates.
- * Coordinates are used ONLY when:
- * 1. location_verified is true, AND
- * 2. The customer positioned the pin (pin_offset_m / pinOffsetM >= 15m, meaning
- *    final coordinates differ from geocoded address coordinates geo_latitude/geo_longitude).
- * If pinOffsetM is missing or < 15m, or location_verified is false, returns false (uses written address).
+ * Coordinates are no longer used for delivery routes; always returns false so routes use written address.
  */
-export function shouldUseCustomerCoordinatesForRoute(customer?: RouteCustomerLike | null): boolean {
-  if (!customer) return false;
-  if (!isCustomerLocationVerified(customer)) return false;
-
-  const lat = Number(customer.latitude);
-  const lng = Number(customer.longitude);
-  if (
-    customer.latitude === undefined ||
-    customer.latitude === null ||
-    customer.longitude === undefined ||
-    customer.longitude === null ||
-    !Number.isFinite(lat) ||
-    !Number.isFinite(lng) ||
-    (lat === 0 && lng === 0)
-  ) {
-    return false;
-  }
-
-  const rawPinOffset =
-    customer.pinOffsetM !== undefined && customer.pinOffsetM !== null
-      ? customer.pinOffsetM
-      : customer.pin_offset_m;
-
-  if (
-    rawPinOffset === undefined ||
-    rawPinOffset === null ||
-    typeof rawPinOffset === 'boolean' ||
-    String(rawPinOffset).trim() === ''
-  ) {
-    return false;
-  }
-
-  const pinOffsetM = Number(rawPinOffset);
-  if (!Number.isFinite(pinOffsetM) || pinOffsetM < 15) {
-    return false;
-  }
-
-  const rawGeoLat =
-    customer.geoLatitude !== undefined && customer.geoLatitude !== null
-      ? customer.geoLatitude
-      : customer.geo_latitude;
-  const rawGeoLng =
-    customer.geoLongitude !== undefined && customer.geoLongitude !== null
-      ? customer.geoLongitude
-      : customer.geo_longitude;
-
-  if (
-    rawGeoLat !== undefined &&
-    rawGeoLat !== null &&
-    rawGeoLng !== undefined &&
-    rawGeoLng !== null &&
-    Number.isFinite(Number(rawGeoLat)) &&
-    Number.isFinite(Number(rawGeoLng))
-  ) {
-    const actualDiffM = calculateDistanceMeters(Number(rawGeoLat), Number(rawGeoLng), lat, lng);
-    if (actualDiffM < 15) {
-      return false;
-    }
-  }
-
-  return true;
+export function shouldUseCustomerCoordinatesForRoute(_customer?: RouteCustomerLike | null): boolean {
+  return false;
 }
 
 /**
- * Returns the Google Maps destination parameter for a delivery customer:
- * - DEFAULT: full written address (street, number, neighborhood, city, UF, CEP) encoded with encodeURIComponent.
- * - Coordinates (LAT,LNG) ONLY when location_verified is true AND pinOffsetM >= 15m.
+ * Returns the Google Maps destination parameter for a delivery customer using the written address
+ * (street, number, neighborhood, store city) without coordinates.
  */
-export function getDeliveryDestinationParam(customer?: RouteCustomerLike | null): string {
+export function getDeliveryDestinationParam(
+  customer?: RouteCustomerLike | null,
+  storeAddress?: string | null
+): string {
   if (!customer) return '';
 
-  if (shouldUseCustomerCoordinatesForRoute(customer)) {
-    const lat = Number(customer.latitude);
-    const lng = Number(customer.longitude);
-    return `${lat},${lng}`;
-  }
-
-  const written = formatCustomerWrittenAddress(customer);
+  const written = formatCustomerWrittenAddress(customer, storeAddress);
   if (written) {
     return encodeURIComponent(written);
   }
@@ -480,11 +448,14 @@ export function getDeliveryDestinationParam(customer?: RouteCustomerLike | null)
 }
 
 /**
- * Builds the public Google Maps route URL for a single delivery order:
+ * Builds the public Google Maps route URL for a single delivery order using the written address:
  * https://www.google.com/maps/dir/?api=1&destination=...&travelmode=driving
  */
-export function buildSingleDeliveryRouteUrl(customer?: RouteCustomerLike | null): string {
-  const dest = getDeliveryDestinationParam(customer);
+export function buildSingleDeliveryRouteUrl(
+  customer?: RouteCustomerLike | null,
+  storeAddress?: string | null
+): string {
+  const dest = getDeliveryDestinationParam(customer, storeAddress);
   if (!dest) return 'https://www.google.com/maps';
   return `https://www.google.com/maps/dir/?api=1&destination=${dest}&travelmode=driving`;
 }
@@ -499,9 +470,8 @@ export interface MultiRouteOrderStop<T = any> {
 }
 
 /**
- * Sorts up to 9 delivery orders by nearest-neighbor starting from the store coordinates
- * (using calculateDistanceKm with whatever coordinates exist) and builds a single
- * multi-stop Google Maps directions URL where each stop link follows getDeliveryDestinationParam.
+ * Builds a multi-stop Google Maps directions URL (up to 9 stops) using only written addresses
+ * (street, number, neighborhood, store city) without coordinates.
  */
 export function buildMultiStopDeliveryRoute<T extends { id: string; customer: RouteCustomerLike }>(
   orders: T[],
@@ -515,85 +485,28 @@ export function buildMultiStopDeliveryRoute<T extends { id: string; customer: Ro
     return { url: 'https://www.google.com/maps', orderedStops: [] };
   }
 
-  const hasStoreCoords =
-    typeof storeSettings.storeLatitude === 'number' &&
-    Number.isFinite(storeSettings.storeLatitude) &&
-    typeof storeSettings.storeLongitude === 'number' &&
-    Number.isFinite(storeSettings.storeLongitude);
+  const storeAddress = storeSettings.address?.trim() || '';
 
-  let currentLat = hasStoreCoords ? Number(storeSettings.storeLatitude) : null;
-  let currentLng = hasStoreCoords ? Number(storeSettings.storeLongitude) : null;
+  const orderedStops: MultiRouteOrderStop<T>[] = limited.map((order, idx) => {
+    const c = order.customer;
+    return {
+      order,
+      stopNumber: idx + 1,
+      destinationParam: getDeliveryDestinationParam(c, storeAddress),
+      writtenAddress:
+        formatCustomerWrittenAddress(c, storeAddress) || c?.address || 'Endereço não informado',
+      isVerified: true,
+      distanceFromPrevKm: null,
+    };
+  });
 
-  const getStopSortingCoords = (c?: RouteCustomerLike | null): { lat: number; lng: number } | null => {
-    if (!c) return null;
-    const rawLat = c.latitude ?? c.geoLatitude ?? c.geo_latitude;
-    const rawLng = c.longitude ?? c.geoLongitude ?? c.geo_longitude;
-    const lat = Number(rawLat);
-    const lng = Number(rawLng);
-    if (
-      rawLat !== undefined &&
-      rawLat !== null &&
-      rawLng !== undefined &&
-      rawLng !== null &&
-      Number.isFinite(lat) &&
-      Number.isFinite(lng) &&
-      (lat !== 0 || lng !== 0)
-    ) {
-      return { lat, lng };
-    }
-    return null;
-  };
-
-  const remaining = [...limited];
-  const orderedStops: MultiRouteOrderStop<T>[] = [];
-
-  while (remaining.length > 0) {
-    let bestIdx = 0;
-    let bestDist: number | null = null;
-
-    if (currentLat !== null && currentLng !== null) {
-      for (let i = 0; i < remaining.length; i++) {
-        const coords = getStopSortingCoords(remaining[i].customer);
-        if (coords) {
-          const d = calculateDistanceKm(currentLat, currentLng, coords.lat, coords.lng);
-          if (bestDist === null || d < bestDist) {
-            bestDist = d;
-            bestIdx = i;
-          }
-        }
-      }
-    }
-
-    const [chosen] = remaining.splice(bestIdx, 1);
-    const c = chosen.customer;
-    const chosenCoords = getStopSortingCoords(c);
-
-    if (chosenCoords) {
-      currentLat = chosenCoords.lat;
-      currentLng = chosenCoords.lng;
-    }
-
-    orderedStops.push({
-      order: chosen,
-      stopNumber: orderedStops.length + 1,
-      destinationParam: getDeliveryDestinationParam(c),
-      writtenAddress: formatCustomerWrittenAddress(c) || c?.address || 'Endereço não informado',
-      isVerified: isCustomerLocationVerified(c),
-      distanceFromPrevKm: bestDist,
-    });
-  }
-
-  const originParam = hasStoreCoords
-    ? `${Number(storeSettings.storeLatitude)},${Number(storeSettings.storeLongitude)}`
-    : storeSettings.address
-      ? encodeURIComponent(storeSettings.address.trim())
-      : '';
+  const originParam = storeAddress ? encodeURIComponent(storeAddress) : '';
 
   const lastStop = orderedStops[orderedStops.length - 1];
   const intermediateStops = orderedStops.slice(0, -1);
 
   const waypointsParam = intermediateStops
-    .map(s => s.destinationParam)
+    .map((s) => s.destinationParam)
     .filter(Boolean)
     .join('|');
 
@@ -614,6 +527,3 @@ export function buildMultiStopDeliveryRoute<T extends { id: string; customer: Ro
     orderedStops,
   };
 }
-
-
-

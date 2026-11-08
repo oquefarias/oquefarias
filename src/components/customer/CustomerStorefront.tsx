@@ -26,6 +26,9 @@ import {
   calculateComboMetrics,
   formatOrderItemComboLine,
   isProductHiddenFromStore,
+  getActiveDeliveryAreasSorted,
+  findMatchingActiveDeliveryArea,
+  formatDeliveryAreaOptionLabel,
 } from '../../types';
 import {
   api,
@@ -35,7 +38,6 @@ import {
   ORDER_NETWORK_EXHAUSTED_MESSAGE,
 } from '../../services/api';
 import { CustomerAuthModal } from './CustomerAuthModal';
-import { AddressPinMap } from '../AddressPinMap';
 import { ProductAddonsModal } from '../ProductAddonsModal';
 import { 
   Beer, 
@@ -59,24 +61,15 @@ import {
   X,
   User,
   AlertTriangle,
-  Compass,
   Building2,
   Loader2,
   Ticket,
-  Navigation,
   Lock,
   Eye,
   EyeOff,
   Home,
 } from 'lucide-react';
-import {
-  calculateDistanceKm,
-  checkPinOffsetLimit,
-  resolveAddressOrCep,
-  fetchAddressByCep,
-  fetchCoordinatesByCepBrasilApi,
-  resolveFullAddressOnServer,
-} from '../../utils/geo';
+import { fetchAddressByCep } from '../../utils/geo';
 
 interface CustomerStorefrontProps {
   products: Product[];
@@ -111,6 +104,10 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
   
   // Checkout form state
+  const activeAreas = useMemo(
+    () => getActiveDeliveryAreasSorted(deliveryAreas),
+    [deliveryAreas]
+  );
   const [deliveryType, setDeliveryType] = useState<'delivery' | 'retirada'>('delivery');
   const [customerName, setCustomerName] = useState<string>(currentCustomer?.name || '');
   const [customerPhone, setCustomerPhone] = useState<string>(currentCustomer?.phone || '');
@@ -119,7 +116,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [cepNotice, setCepNotice] = useState<string>('');
   const [address, setAddress] = useState<string>(currentCustomer?.address || '');
   const [addressNumber, setAddressNumber] = useState<string>(currentCustomer?.number || '');
-  const [neighborhood, setNeighborhood] = useState<string>(currentCustomer?.neighborhood || (deliveryAreas[0]?.name || ''));
+  const [selectedDeliveryAreaId, setSelectedDeliveryAreaId] = useState<string>(() => {
+    const matched = findMatchingActiveDeliveryArea(activeAreas, currentCustomer?.neighborhood);
+    return matched ? matched.id : '';
+  });
+  const [neighborhood, setNeighborhood] = useState<string>(() => {
+    const matched = findMatchingActiveDeliveryArea(activeAreas, currentCustomer?.neighborhood);
+    return matched ? matched.name : '';
+  });
   const [complement, setComplement] = useState<string>(currentCustomer?.complement || '');
   const [reference, setReference] = useState<string>(currentCustomer?.reference || '');
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('pix');
@@ -129,28 +133,9 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [checkoutClientRequestId, setCheckoutClientRequestId] = useState<string>(() => crypto.randomUUID());
   const [placedOrder, setPlacedOrder] = useState<Order | null>(null);
   const [copiedPix, setCopiedPix] = useState<boolean>(false);
-  const [checkingDistance, setCheckingDistance] = useState<boolean>(false);
-  const [customerDistance, setCustomerDistance] = useState<{ km: number; inside: boolean } | null>(null);
   const [deliveryQuote, setDeliveryQuote] = useState<CustomerDeliveryQuoteResult | null>(null);
   const [checkoutCity, setCheckoutCity] = useState<string>(currentCustomer?.city || '');
   const [checkoutState, setCheckoutState] = useState<string>(currentCustomer?.state || '');
-  const [checkoutLat, setCheckoutLat] = useState<number | undefined>(currentCustomer?.latitude);
-  const [checkoutLng, setCheckoutLng] = useState<number | undefined>(currentCustomer?.longitude);
-  const [checkoutGeoLat, setCheckoutGeoLat] = useState<number | undefined>(
-    currentCustomer?.geoLatitude ?? currentCustomer?.latitude
-  );
-  const [checkoutGeoLng, setCheckoutGeoLng] = useState<number | undefined>(
-    currentCustomer?.geoLongitude ?? currentCustomer?.longitude
-  );
-  const [checkoutPrecisao, setCheckoutPrecisao] = useState<string | null>(
-    currentCustomer?.geoPrecision || null
-  );
-  const [isConfirmingPin, setIsConfirmingPin] = useState<boolean>(false);
-  const [isPinConfirmed, setIsPinConfirmed] = useState<boolean>(() =>
-    Boolean(currentCustomer?.locationVerified || api.isCustomerPinConfirmed(currentCustomer?.id))
-  );
-  const [showCheckoutMap, setShowCheckoutMap] = useState<boolean>(false);
-  const [checkoutTriggerGpsCount, setCheckoutTriggerGpsCount] = useState<number>(0);
 
   // Checkout mode & logged-in address selection state
   const [checkoutEntryStep, setCheckoutEntryStep] = useState<'choice' | 'guest'>('choice');
@@ -323,28 +308,16 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     setCep(cust.cep || '');
     setAddress(cust.address || '');
     setAddressNumber(cust.number || '');
-    setNeighborhood(cust.neighborhood || deliveryAreas[0]?.name || '');
+    const matched = findMatchingActiveDeliveryArea(activeAreas, cust.neighborhood);
+    setSelectedDeliveryAreaId(matched ? matched.id : '');
+    setNeighborhood(matched ? matched.name : '');
     setCheckoutCity(cust.city || '');
     setCheckoutState(cust.state || '');
     setComplement(cust.complement || '');
     setReference(cust.reference || '');
-    setCheckoutLat(cust.latitude);
-    setCheckoutLng(cust.longitude);
-    setCheckoutGeoLat(cust.geoLatitude ?? cust.latitude);
-    setCheckoutGeoLng(cust.geoLongitude ?? cust.longitude);
-    setCheckoutPrecisao(cust.geoPrecision || null);
-    setIsPinConfirmed(Boolean(cust.locationVerified || api.isCustomerPinConfirmed(cust.id)));
-    if (cust.distanceKm !== undefined && cust.isWithinDeliveryRadius !== undefined) {
-      setCustomerDistance({
-        km: cust.distanceKm,
-        inside: cust.isWithinDeliveryRadius,
-      });
-    } else {
-      setCustomerDistance(null);
-    }
   };
 
-  // Keep fields synced when currentCustomer changes
+  // Keep fields synced when currentCustomer or activeAreas changes
   useEffect(() => {
     if (currentCustomer) {
       setLoggedAddressMode('saved');
@@ -354,283 +327,87 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setLoggedAddressMode('saved');
       setSaveCustomAddressToAccount(false);
       setDeliveryQuote(null);
-      setCheckoutLat(undefined);
-      setCheckoutLng(undefined);
-      setCheckoutGeoLat(undefined);
-      setCheckoutGeoLng(undefined);
-      setCheckoutPrecisao(null);
-      setIsPinConfirmed(false);
     }
-  }, [currentCustomer]);
+  }, [currentCustomer, activeAreas]);
 
-  const refreshServerDeliveryQuote = async (subtotalVal: number, nhVal: string) => {
+  const refreshServerDeliveryQuote = async (
+    subtotalVal: number,
+    nhVal: string,
+    areaIdVal?: string
+  ) => {
     if (!api.isCustomerAuthenticated() || loggedAddressMode === 'custom') return null;
-    const quote = await api.getCustomerDeliveryQuote(subtotalVal, nhVal);
+    const quote = await api.getCustomerDeliveryQuote(subtotalVal, nhVal, areaIdVal);
     if (quote) {
       setDeliveryQuote(quote);
-      if (quote.distanceKm !== null && quote.distanceKm !== undefined) {
-        setCustomerDistance({
-          km: quote.distanceKm,
-          inside: quote.isWithinDeliveryRadius,
-        });
-      }
-      if (quote.latitude !== null && quote.longitude !== null && checkoutLat === undefined) {
-        setCheckoutLat(quote.latitude);
-        setCheckoutLng(quote.longitude);
-      }
     }
     return quote;
   };
 
-  // Persist customer pin/address update and refresh server quote
-  const persistCheckoutCoordinates = async (
-    newLat: number,
-    newLng: number,
-    markConfirmed: boolean,
-    extraFields?: {
-      cep?: string;
-      address?: string;
-      number?: string;
-      neighborhood?: string;
-      city?: string;
-      state?: string;
-    },
-    suppressErrorBanner: boolean = false
-  ) => {
-    setCheckoutLat(newLat);
-    setCheckoutLng(newLng);
-
-    if (!api.isCustomerAuthenticated() || !currentCustomer || loggedAddressMode === 'custom') {
-      if (settings.storeLatitude !== undefined && settings.storeLongitude !== undefined) {
-        const d = calculateDistanceKm(settings.storeLatitude, settings.storeLongitude, newLat, newLng);
-        const maxRadius = settings.deliveryRadiusKm || 5;
-        setCustomerDistance({ km: d, inside: d <= maxRadius });
-      }
-      if (markConfirmed) {
-        setIsPinConfirmed(true);
-      }
-      return;
-    }
-
-    setIsConfirmingPin(true);
-    try {
-      const updated = await api.updateCustomerMe({
-        cep: extraFields?.cep ?? cep,
-        address: extraFields?.address ?? address,
-        number: extraFields?.number ?? addressNumber,
-        neighborhood: extraFields?.neighborhood ?? neighborhood,
-        city: extraFields?.city ?? checkoutCity,
-        state: extraFields?.state ?? checkoutState,
-        complement,
-        reference,
-        latitude: newLat,
-        longitude: newLng,
-      });
-      setCurrentCustomer(updated);
-      if (updated.geoLatitude !== undefined && updated.geoLatitude !== null && updated.geoLongitude !== undefined && updated.geoLongitude !== null) {
-        setCheckoutGeoLat(updated.geoLatitude);
-        setCheckoutGeoLng(updated.geoLongitude);
-      }
-      if (updated.geoPrecision) {
-        setCheckoutPrecisao(updated.geoPrecision);
-      }
-      if (markConfirmed && updated.id) {
-        api.markCustomerPinConfirmed(updated.id);
-        setIsPinConfirmed(true);
-      }
-      await refreshServerDeliveryQuote(
-        cart.reduce((s, i) => {
-          const cp = products.find((p) => p.id === i.product.id) || i.product;
-          const unitPrice =
-            i.saleUnit === 'case' && hasProductCase(cp)
-              ? Number(cp.casePrice)
-              : getEffectiveProductPrice(cp);
-          return s + unitPrice * i.quantity;
-        }, 0),
-        extraFields?.neighborhood ?? neighborhood
-      );
-    } catch (err: any) {
-      console.warn('Falha ao atualizar coordenadas do cliente:', err);
-      if (!suppressErrorBanner && err?.message && !isNetworkOrTimeoutError(err)) {
-        setCheckoutError(err.message);
-      }
-    } finally {
-      setIsConfirmingPin(false);
-    }
-  };
-
-  // Handle CEP search in checkout using POST /api/geo/resolve
+  // Handle optional CEP search in checkout using ViaCEP (never blocks if it fails)
   const handleSearchCheckoutCep = async (cleanCepArg?: string) => {
     const rawDigits = (cleanCepArg || cep).replace(/\D/g, '');
     if (rawDigits.length !== 8) {
-      setCepNotice('Digite um CEP válido com 8 dígitos.');
       return;
     }
     setIsSearchingCep(true);
     setCepNotice('');
     try {
       const viaCep = await fetchAddressByCep(rawDigits);
-      const brasilApi = await fetchCoordinatesByCepBrasilApi(rawDigits);
-
-      if (!viaCep && !brasilApi) {
-        setCepNotice('CEP não encontrado. Digite a rua manualmente.');
+      if (!viaCep) {
+        setCepNotice('Não foi possível buscar pelo CEP. Preencha a rua e escolha seu bairro abaixo.');
         return;
       }
 
-      const street = viaCep?.logradouro || brasilApi?.street || address;
-      const nh = viaCep?.bairro || brasilApi?.neighborhood || neighborhood;
-      const cityVal = viaCep?.localidade || brasilApi?.city || checkoutCity;
-      const ufVal = viaCep?.uf || brasilApi?.state || checkoutState;
-
-      if (street) setAddress(street);
-      if (nh) setNeighborhood(nh);
-      if (cityVal) setCheckoutCity(cityVal);
-      if (ufVal) setCheckoutState(ufVal);
-
-      const resolved = await resolveFullAddressOnServer({
-        rua: street,
-        numero: addressNumber.trim(),
-        bairro: nh,
-        cidade: cityVal,
-        uf: ufVal,
-        cep: rawDigits,
-      });
-
-      if (resolved) {
-        setCheckoutLat(resolved.latitude);
-        setCheckoutLng(resolved.longitude);
-        setCheckoutGeoLat(resolved.latitude);
-        setCheckoutGeoLng(resolved.longitude);
-        setCheckoutPrecisao(resolved.precisao);
-
-        await persistCheckoutCoordinates(resolved.latitude, resolved.longitude, false, {
-          cep: `${rawDigits.slice(0, 5)}-${rawDigits.slice(5)}`,
-          address: street,
-          number: addressNumber.trim(),
-          neighborhood: nh,
-          city: cityVal,
-          state: ufVal,
-        });
-
-        setCepNotice(
-          resolved.precisao === 'aproximada'
-            ? '⚠️ CEP com localização aproximada. Confira e ajuste o alfinete no mapa abaixo.'
-            : '✓ Endereço localizado! Confira o alfinete no mapa abaixo.'
-        );
-      } else {
-        setCepNotice('Rua e bairro preenchidos pelo CEP!');
+      if (viaCep.logradouro) {
+        setAddress(viaCep.logradouro);
       }
+      if (viaCep.localidade) setCheckoutCity(viaCep.localidade);
+      if (viaCep.uf) setCheckoutState(viaCep.uf);
+
+      if (viaCep.bairro) {
+        const matched = findMatchingActiveDeliveryArea(activeAreas, viaCep.bairro);
+        if (matched) {
+          setSelectedDeliveryAreaId(matched.id);
+          setNeighborhood(matched.name);
+          setCepNotice(`Rua e bairro (${matched.name}) preenchidos pelo CEP!`);
+          return;
+        }
+      }
+
+      setCepNotice('Rua preenchida pelo CEP! Agora escolha seu bairro na lista abaixo.');
     } catch {
-      setCepNotice('Erro ao buscar o CEP.');
+      // Se falhar, segue normal sem travar (1b)
     } finally {
       setIsSearchingCep(false);
     }
   };
 
-  // Refine coordinates when number is filled/changed in checkout
-  const handleCheckoutNumberBlur = async () => {
-    const rawDigits = cep.replace(/\D/g, '');
-    if (!addressNumber.trim() || (!address.trim() && rawDigits.length !== 8)) return;
-
-    setCheckingDistance(true);
-    try {
-      const resolved = await resolveFullAddressOnServer({
-        rua: address.trim(),
-        numero: addressNumber.trim(),
-        bairro: neighborhood.trim(),
-        cidade: checkoutCity.trim(),
-        uf: checkoutState.trim(),
-        cep: rawDigits,
-      });
-      if (resolved) {
-        setCheckoutLat(resolved.latitude);
-        setCheckoutLng(resolved.longitude);
-        setCheckoutGeoLat(resolved.latitude);
-        setCheckoutGeoLng(resolved.longitude);
-        setCheckoutPrecisao(resolved.precisao);
-
-        await persistCheckoutCoordinates(resolved.latitude, resolved.longitude, false, {
-          address: address.trim(),
-          number: addressNumber.trim(),
-          neighborhood: neighborhood.trim(),
-        });
-      }
-    } finally {
-      setCheckingDistance(false);
-    }
-  };
-
-  // Active delivery areas
-  const activeAreas = useMemo(() => deliveryAreas.filter(a => a.active), [deliveryAreas]);
-
-  // Check if chosen neighborhood is covered by delivery
+  // Matched active delivery area for the currently selected neighborhood
   const matchedArea = useMemo(() => {
-    return activeAreas.find(a => a.name.toLowerCase().trim() === neighborhood.toLowerCase().trim());
-  }, [activeAreas, neighborhood]);
+    if (selectedDeliveryAreaId) {
+      const byId = activeAreas.find((a) => a.id === selectedDeliveryAreaId);
+      if (byId) return byId;
+    }
+    if (neighborhood) {
+      return findMatchingActiveDeliveryArea(activeAreas, neighborhood);
+    }
+    return undefined;
+  }, [activeAreas, selectedDeliveryAreaId, neighborhood]);
+
+  // Saved customer's neighborhood matched against active areas (1d)
+  const savedCustomerMatchedArea = useMemo(() => {
+    if (!currentCustomer?.neighborhood) return undefined;
+    return findMatchingActiveDeliveryArea(activeAreas, currentCustomer.neighborhood);
+  }, [activeAreas, currentCustomer?.neighborhood]);
 
   const [checkoutError, setCheckoutError] = useState<string>('');
   const [submittingStatusText, setSubmittingStatusText] = useState<string>('');
   const [canRetryOrderSubmit, setCanRetryOrderSubmit] = useState<boolean>(false);
 
-  const handleCheckDistance = async () => {
-    if (!address.trim()) {
-      setCepNotice('Por favor, digite a rua do seu endereço para verificar.');
-      return;
-    }
-    setCheckingDistance(true);
-    setCepNotice('');
-    try {
-      const resolved = await resolveFullAddressOnServer({
-        rua: address.trim(),
-        numero: addressNumber.trim(),
-        bairro: neighborhood.trim(),
-        cidade: checkoutCity.trim(),
-        uf: checkoutState.trim(),
-        cep: cep.replace(/\D/g, ''),
-      });
-      if (resolved) {
-        setCheckoutLat(resolved.latitude);
-        setCheckoutLng(resolved.longitude);
-        setCheckoutGeoLat(resolved.latitude);
-        setCheckoutGeoLng(resolved.longitude);
-        setCheckoutPrecisao(resolved.precisao);
-        await persistCheckoutCoordinates(resolved.latitude, resolved.longitude, false);
-      } else {
-        const fullQuery = `${address}${addressNumber ? `, ${addressNumber}` : ''}${neighborhood ? `, ${neighborhood}` : ''}, Brasil`;
-        const res = await resolveAddressOrCep(fullQuery);
-        if (res) {
-          setCheckoutLat(res.lat);
-          setCheckoutLng(res.lng);
-          setCheckoutGeoLat(res.lat);
-          setCheckoutGeoLng(res.lng);
-          setCheckoutPrecisao(res.precisao || 'rua');
-          await persistCheckoutCoordinates(res.lat, res.lng, false);
-        } else {
-          setCepNotice('Endereço não localizado com precisão. Verifique a rua, número ou CEP digitados.');
-        }
-      }
-    } catch {
-      setCepNotice('Não foi possível verificar a distância no momento.');
-    } finally {
-      setCheckingDistance(false);
-    }
-  };
-
   const isAreaCovered = useMemo(() => {
     if (deliveryType === 'retirada') return true;
-    if (deliveryQuote && deliveryQuote.distanceKm !== null && !deliveryQuote.isWithinDeliveryRadius) {
-      return false;
-    }
-    if (customerDistance && !customerDistance.inside) {
-      return false;
-    }
-    if (matchedArea) return true;
-    if (settings.deliveryModel === 'radius' || (settings.deliveryRadiusKm && activeAreas.length === 0)) {
-      return true;
-    }
-    if (activeAreas.length === 0) return true;
-    return !!matchedArea;
-  }, [deliveryType, activeAreas.length, matchedArea, deliveryQuote, customerDistance, settings.deliveryModel, settings.deliveryRadiusKm]);
+    return Boolean(matchedArea);
+  }, [deliveryType, matchedArea]);
 
   const showOutOfStock = Boolean(settings.showOutOfStock);
   const lastProductsFetchAtRef = React.useRef<number>(Date.now());
@@ -827,65 +604,29 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setDeliveryQuote(null);
       return;
     }
-    refreshServerDeliveryQuote(cartSubtotal, neighborhood);
+    refreshServerDeliveryQuote(cartSubtotal, neighborhood, selectedDeliveryAreaId);
   }, [
     currentCustomer?.id,
-    currentCustomer?.latitude,
-    currentCustomer?.longitude,
     cartSubtotal,
     neighborhood,
+    selectedDeliveryAreaId,
     isCartOpen,
     loggedAddressMode,
   ]);
 
-  // If existing customer has old/unconfirmed coordinates and opens checkout with delivery, resolve full address if needed so the map is ready
-  useEffect(() => {
-    if (
-      isCartOpen &&
-      deliveryType === 'delivery' &&
-      currentCustomer &&
-      loggedAddressMode === 'saved' &&
-      !isPinConfirmed &&
-      checkoutLat === undefined &&
-      (address.trim() || cep.replace(/\D/g, '').length === 8)
-    ) {
-      resolveFullAddressOnServer({
-        rua: address.trim(),
-        numero: addressNumber.trim(),
-        bairro: neighborhood.trim(),
-        cidade: checkoutCity.trim(),
-        uf: checkoutState.trim(),
-        cep: cep.replace(/\D/g, ''),
-      }).then((resolved) => {
-        if (resolved) {
-          setCheckoutLat(resolved.latitude);
-          setCheckoutLng(resolved.longitude);
-          setCheckoutGeoLat(resolved.latitude);
-          setCheckoutGeoLng(resolved.longitude);
-          setCheckoutPrecisao(resolved.precisao);
-        }
-      });
-    }
-  }, [isCartOpen, deliveryType, currentCustomer?.id, isPinConfirmed, loggedAddressMode]);
-
   const deliveryFee = useMemo(() => {
     if (deliveryType === 'retirada') return 0;
-    if (deliveryQuote && loggedAddressMode === 'saved') {
-      return deliveryQuote.deliveryFee;
-    }
     if (settings.freeDeliveryThreshold > 0 && cartSubtotal >= settings.freeDeliveryThreshold) {
       return 0;
     }
     if (matchedArea) {
-      return matchedArea.fee;
+      return Math.round(Number(matchedArea.fee) * 100) / 100;
     }
-    let fee = settings.deliveryFee || 5.0;
-    if (customerDistance && settings.pricePerKm && settings.pricePerKm > 0) {
-      const extraKm = Math.max(0, customerDistance.km - 1);
-      fee += extraKm * settings.pricePerKm;
+    if (deliveryQuote && deliveryQuote.isValidArea && loggedAddressMode === 'saved') {
+      return deliveryQuote.deliveryFee;
     }
-    return Math.round(fee * 100) / 100;
-  }, [deliveryType, deliveryQuote, loggedAddressMode, cartSubtotal, settings, matchedArea, customerDistance]);
+    return 0;
+  }, [deliveryType, deliveryQuote, loggedAddressMode, cartSubtotal, settings.freeDeliveryThreshold, matchedArea]);
 
   const cartDiscount = useMemo(() => {
     if (!appliedCoupon) return 0;
@@ -1056,7 +797,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     hasCheckoutCashTyped &&
     (Number.isNaN(checkoutCashNum) || Math.round(checkoutCashNum * 100) < Math.round(cartTotal * 100));
 
-  // Submit order to depot
+  // Submit order to depot (supports logged-in saved address, logged-in custom address, and guest quick checkout)
   const submitCustomerOrder = async () => {
     if (isSubmitting) return;
     setCheckoutError('');
@@ -1068,121 +809,203 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     }
     if (cart.length === 0 || isCheckoutCashInvalid) return;
 
-    // Requirement: Mandatory login/registration before completing order
-    if (!api.isCustomerAuthenticated() || !currentCustomer) {
-      setIsAuthModalOpen(true);
+    const isLogged = Boolean(api.isCustomerAuthenticated() && currentCustomer);
+    if (!isLogged && checkoutEntryStep === 'choice') {
       return;
     }
 
-    if (!customerName.trim() || !customerPhone.trim()) {
-      setCheckoutError('Por favor preencha seu nome e telefone.');
+    const cleanName = customerName.trim();
+    const cleanPhone = customerPhone.trim();
+    const cleanPhoneDigits = cleanPhone.replace(/\D/g, '');
+
+    if (cleanName.length < 2 || cleanName.length > 80) {
+      setCheckoutError('Por favor informe seu nome (entre 2 e 80 caracteres).');
       return;
     }
+    if (cleanPhoneDigits.length < 10 || cleanPhoneDigits.length > 13) {
+      setCheckoutError('Por favor informe um WhatsApp válido com DDD.');
+      return;
+    }
+
+    const isUsingCustomAddress =
+      !isLogged || loggedAddressMode === 'custom' || !currentCustomer?.address;
+    const effectiveAddress = isUsingCustomAddress
+      ? address.trim()
+      : (currentCustomer?.address || address).trim();
+    const effectiveNumber = isUsingCustomAddress
+      ? addressNumber.trim()
+      : (currentCustomer?.number || addressNumber).trim();
+    const effectiveComplement = isUsingCustomAddress
+      ? complement.trim()
+      : (currentCustomer?.complement || complement || '').trim();
+    const effectiveReference = isUsingCustomAddress
+      ? reference.trim()
+      : (currentCustomer?.reference || reference || '').trim();
+    const effectiveCep = isUsingCustomAddress
+      ? cep.trim()
+      : (currentCustomer?.cep || cep || '').trim();
 
     if (deliveryType === 'delivery') {
-      if (!address.trim() || !addressNumber.trim() || !neighborhood.trim()) {
-        setCheckoutError('Por favor preencha o endereço completo de entrega.');
+      if (effectiveAddress.length < 2 || effectiveAddress.length > 120) {
+        setCheckoutError('Informe a rua do endereço de entrega (entre 2 e 120 caracteres).');
         return;
       }
-      const radiusCheckFailed =
-        (deliveryQuote && deliveryQuote.distanceKm !== null && !deliveryQuote.isWithinDeliveryRadius) ||
-        (customerDistance && !customerDistance.inside);
-      if (radiusCheckFailed) {
-        const maxRad = deliveryQuote?.deliveryRadiusKm || settings.deliveryRadiusKm || 5;
-        setCheckoutError(`Endereço fora do raio de entrega de ${maxRad} km. Escolha Retirar no Depósito.`);
+      if (effectiveNumber.length < 1 || effectiveNumber.length > 20) {
+        setCheckoutError('Informe o número do imóvel (entre 1 e 20 caracteres).');
         return;
       }
-      if (!isAreaCovered) {
-        setCheckoutError(`Desculpe! O bairro "${neighborhood}" não está na nossa área de entrega atendida.`);
+      if (effectiveComplement.length > 80) {
+        setCheckoutError('O complemento deve ter no máximo 80 caracteres.');
+        return;
+      }
+      if (effectiveReference.length > 120) {
+        setCheckoutError('O ponto de referência deve ter no máximo 120 caracteres.');
+        return;
+      }
+      if (effectiveCep && effectiveCep.replace(/\D/g, '').length !== 8) {
+        setCheckoutError('CEP inválido. Digite os 8 números do CEP ou deixe em branco.');
+        return;
+      }
+      if (!matchedArea) {
+        setCheckoutError('Escolha um bairro da lista de entrega.');
         return;
       }
     }
 
     if (cartSubtotal < settings.minOrderValue) {
-      setCheckoutError(`O pedido mínimo para entrega é de ${formatCurrency(settings.minOrderValue)}`);
+      setCheckoutError(`O pedido mínimo é de ${formatCurrency(settings.minOrderValue)}.`);
       return;
     }
 
     setIsSubmitting(true);
     try {
-      // Refresh products right before finalizing the order (Requirement 4c)
+      // Refresh products right before finalizing the order
       lastProductsFetchAtRef.current = Date.now();
       await api.reloadProducts().catch(() => {});
 
-      // If customer has pin coordinates in checkout, ensure they are saved in their profile & marked confirmed
-      if (deliveryType === 'delivery' && checkoutLat !== undefined && checkoutLng !== undefined && currentCustomer) {
-        if (
-          !isPinConfirmed ||
-          currentCustomer.latitude !== checkoutLat ||
-          currentCustomer.longitude !== checkoutLng ||
-          currentCustomer.address !== address ||
-          currentCustomer.number !== addressNumber
-        ) {
-          await persistCheckoutCoordinates(checkoutLat, checkoutLng, true, undefined, true);
+      // If logged-in customer chose "Outro endereço" (or had no saved address) and checked "Salvar este endereço na minha conta"
+      if (
+        isLogged &&
+        currentCustomer &&
+        deliveryType === 'delivery' &&
+        isUsingCustomAddress &&
+        saveCustomAddressToAccount &&
+        matchedArea
+      ) {
+        try {
+          const updatedProfile = await api.updateCustomerMe({
+            name: cleanName,
+            phone: cleanPhone,
+            cep: effectiveCep || undefined,
+            address: effectiveAddress,
+            number: effectiveNumber,
+            neighborhood: matchedArea.name,
+            deliveryAreaId: matchedArea.id,
+            complement: effectiveComplement || undefined,
+            reference: effectiveReference || undefined,
+            city: checkoutCity.trim() || undefined,
+            state: checkoutState.trim() || undefined,
+          });
+          setCurrentCustomer(updatedProfile);
+        } catch (saveAddrErr: any) {
+          console.warn('Aviso ao salvar endereço na conta:', saveAddrErr);
         }
       }
 
-      const order = await api.createOrder(
-        {
-          source: 'online',
-          clientRequestId: checkoutClientRequestId,
-          couponCode: appliedCoupon?.code,
-          customer: {
-            name: customerName,
-            phone: customerPhone,
-            cep: deliveryType === 'delivery' ? cep : undefined,
-            address: deliveryType === 'delivery' ? address : 'Retirada no Depósito',
-            number: deliveryType === 'delivery' ? addressNumber : 'S/N',
-            neighborhood: deliveryType === 'delivery' ? neighborhood : 'Depósito',
-            complement,
-            reference,
-          },
-          deliveryType,
-          items: cart.map((i) => {
-            const currentProd = products.find((p) => p.id === i.product.id) || i.product;
-            const isCase = i.saleUnit === 'case' && canSellProductCase(currentProd, settings, 'store');
-            const effPrice = getCartItemUnitPrice(currentProd, i.saleUnit, i.addonsTotal);
-            const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
-            return {
-              productId: currentProd.id,
-              name: currentProd.name,
-              volume: currentProd.volume,
-              price: effPrice,
-              originalPrice: isCase ? Number(currentProd.casePrice) : currentProd.price,
-              costPrice: currentProd.costPrice,
-              quantity: i.quantity,
-              saleUnit: isCase ? 'case' : 'unit',
-              unitsPerSale,
-              isCold: currentProd.isCold,
-              addons:
-                i.addons && i.addons.length > 0
-                  ? i.addons.map((a) => ({
-                      groupId: a.groupId,
-                      optionId: a.optionId,
-                      groupName: a.groupName,
-                      optionName: a.optionName,
-                      price: a.price,
-                      quantity: a.quantity,
-                    }))
-                  : undefined,
-              addonsTotal: i.addonsTotal,
-              comboItems: i.comboItems && i.comboItems.length > 0 ? i.comboItems : undefined,
-            };
-          }),
-          subtotal: cartSubtotal,
-          deliveryFee,
-          total: cartTotal,
-          paymentMethod,
-          cashChangeFor:
-            paymentMethod === 'dinheiro' && hasCheckoutCashTyped && !Number.isNaN(checkoutCashNum)
-              ? Math.round(checkoutCashNum * 100) / 100
+      const orderItemsPayload = cart.map((i) => {
+        const currentProd = products.find((p) => p.id === i.product.id) || i.product;
+        const isCase = i.saleUnit === 'case' && canSellProductCase(currentProd, settings, 'store');
+        const effPrice = getCartItemUnitPrice(currentProd, i.saleUnit, i.addonsTotal);
+        const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
+        return {
+          productId: currentProd.id,
+          name: currentProd.name,
+          volume: currentProd.volume,
+          price: effPrice,
+          originalPrice: isCase ? Number(currentProd.casePrice) : currentProd.price,
+          costPrice: currentProd.costPrice,
+          quantity: i.quantity,
+          saleUnit: isCase ? ('case' as const) : ('unit' as const),
+          unitsPerSale,
+          isCold: currentProd.isCold,
+          addons:
+            i.addons && i.addons.length > 0
+              ? i.addons.map((a) => ({
+                  groupId: a.groupId,
+                  optionId: a.optionId,
+                  groupName: a.groupName,
+                  optionName: a.optionName,
+                  price: a.price,
+                  quantity: a.quantity,
+                }))
               : undefined,
-          notes: orderNotes,
+          addonsTotal: i.addonsTotal,
+          comboItems: i.comboItems && i.comboItems.length > 0 ? i.comboItems : undefined,
+        };
+      });
+
+      const orderPayload: any = {
+        source: 'online',
+        clientRequestId: checkoutClientRequestId,
+        couponCode: isLogged ? appliedCoupon?.code : undefined,
+        deliveryType,
+        deliveryAreaId: deliveryType === 'delivery' ? matchedArea?.id : undefined,
+        customer: {
+          name: cleanName,
+          phone: cleanPhone,
+          cep: deliveryType === 'delivery' ? effectiveCep || undefined : undefined,
+          address: deliveryType === 'delivery' ? effectiveAddress : 'Retirada no Depósito',
+          number: deliveryType === 'delivery' ? effectiveNumber : 'S/N',
+          neighborhood: deliveryType === 'delivery' ? (matchedArea?.name || '') : 'Depósito',
+          deliveryAreaId: deliveryType === 'delivery' ? matchedArea?.id : undefined,
+          complement: deliveryType === 'delivery' ? effectiveComplement || undefined : undefined,
+          reference: deliveryType === 'delivery' ? effectiveReference || undefined : undefined,
         },
-        {
-          onStatusMessage: (msg) => setSubmittingStatusText(msg),
+        items: orderItemsPayload,
+        subtotal: cartSubtotal,
+        deliveryFee,
+        total: cartTotal,
+        paymentMethod,
+        cashChangeFor:
+          paymentMethod === 'dinheiro' && hasCheckoutCashTyped && !Number.isNaN(checkoutCashNum)
+            ? Math.round(checkoutCashNum * 100) / 100
+            : undefined,
+        notes: orderNotes,
+      };
+
+      if (isLogged) {
+        if (deliveryType === 'delivery' && isUsingCustomAddress && matchedArea) {
+          orderPayload.deliveryAddress = {
+            cep: effectiveCep || undefined,
+            address: effectiveAddress,
+            number: effectiveNumber,
+            neighborhood: matchedArea.name,
+            deliveryAreaId: matchedArea.id,
+            complement: effectiveComplement || undefined,
+            reference: effectiveReference || undefined,
+            city: checkoutCity.trim() || undefined,
+            state: checkoutState.trim() || undefined,
+          };
         }
-      );
+      } else {
+        orderPayload.guest = {
+          name: cleanName,
+          phone: cleanPhone,
+          cep: deliveryType === 'delivery' ? effectiveCep || undefined : undefined,
+          address: deliveryType === 'delivery' ? effectiveAddress : 'Retirada no Depósito',
+          number: deliveryType === 'delivery' ? effectiveNumber : 'S/N',
+          neighborhood: deliveryType === 'delivery' ? (matchedArea?.name || '') : 'Depósito',
+          deliveryAreaId: deliveryType === 'delivery' ? matchedArea?.id : undefined,
+          complement: deliveryType === 'delivery' ? effectiveComplement || undefined : undefined,
+          reference: deliveryType === 'delivery' ? effectiveReference || undefined : undefined,
+          city: deliveryType === 'delivery' ? checkoutCity.trim() || undefined : undefined,
+          state: deliveryType === 'delivery' ? checkoutState.trim() || undefined : undefined,
+        };
+      }
+
+      const order = await api.createOrder(orderPayload, {
+        onStatusMessage: (msg) => setSubmittingStatusText(msg),
+      });
 
       confetti({
         particleCount: 100,
@@ -1191,6 +1014,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       });
 
       setPlacedOrder(order);
+      if (!isLogged && order.guestToken) {
+        setTrackedGuestToken(order.guestToken);
+        setGuestConvertPhone(cleanPhone);
+        setGuestConvertPassword('');
+        setGuestConvertError('');
+        setGuestConvertSuccess(false);
+        refreshSavedGuestOrdersCount();
+      }
       setCart([]);
       setCheckoutClientRequestId(crypto.randomUUID());
       setAppliedCoupon(null);
@@ -1728,12 +1559,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                             placedOrder.deliveryType === 'delivery' ? placedOrder.customer.number : '',
                           neighborhood:
                             placedOrder.deliveryType === 'delivery' ? placedOrder.customer.neighborhood : '',
+                          deliveryAreaId:
+                            placedOrder.deliveryType === 'delivery' ? placedOrder.customer.deliveryAreaId : undefined,
                           complement: placedOrder.customer.complement,
                           reference: placedOrder.customer.reference,
                           city: placedOrder.customer.city,
                           state: placedOrder.customer.state,
-                          latitude: placedOrder.customer.latitude,
-                          longitude: placedOrder.customer.longitude,
                           guestOrderId: placedOrder.id,
                           guestToken: tok,
                         });
@@ -3170,7 +3001,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       </div>
                     </div>
 
-                    {/* Logged-in customer: "Entregar em:" selector (Requirement 2b) */}
+                    {/* Logged-in customer: "Entregar em:" selector */}
                     {currentCustomer && deliveryType === 'delivery' && (
                       <div className="space-y-2.5 pt-1">
                         <label className="text-xs font-black text-neutral-800 block">
@@ -3184,7 +3015,6 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                               onClick={() => {
                                 setLoggedAddressMode('saved');
                                 setSaveCustomAddressToAccount(false);
-                                setShowCheckoutMap(false);
                                 applySavedCustomerAddressToState(currentCustomer);
                               }}
                               className={`w-full p-3.5 rounded-2xl border-2 text-left transition-all flex items-start gap-3 cursor-pointer ${
@@ -3212,7 +3042,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                                   )}
                                 </div>
                                 <p className="text-xs text-neutral-700 font-medium mt-0.5 break-words">
-                                  {currentCustomer.address}, {currentCustomer.number} — {currentCustomer.neighborhood}
+                                  {currentCustomer.address}, {currentCustomer.number}
+                                  {savedCustomerMatchedArea
+                                    ? ` — ${savedCustomerMatchedArea.name}`
+                                    : currentCustomer.neighborhood
+                                    ? ` — ${currentCustomer.neighborhood}`
+                                    : ''}
                                 </p>
                                 {(currentCustomer.complement || currentCustomer.reference) && (
                                   <p className="text-[11px] text-neutral-500 mt-0.5">
@@ -3224,25 +3059,78 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                               </div>
                             </button>
 
+                            {/* 1d) Se um cliente antigo tiver um bairro salvo que não bate com nenhum bairro ativo, no checkout mostre "Escolha seu bairro na lista" com o <select> em branco e não deixe finalizar entrega sem escolher */}
+                            {loggedAddressMode === 'saved' && !savedCustomerMatchedArea && (
+                              <div className="p-3.5 bg-amber-50 border-2 border-amber-400 rounded-2xl space-y-2">
+                                <label className="text-xs font-black text-amber-950 block">
+                                  Escolha seu bairro na lista *
+                                </label>
+                                <select
+                                  value={selectedDeliveryAreaId}
+                                  onChange={(e) => {
+                                    const nextId = e.target.value;
+                                    setSelectedDeliveryAreaId(nextId);
+                                    const found = activeAreas.find((a) => a.id === nextId);
+                                    setNeighborhood(found ? found.name : '');
+                                    setCheckoutError('');
+                                  }}
+                                  className="w-full px-3 py-2.5 bg-white border border-amber-400 rounded-xl text-xs font-bold text-neutral-900 outline-none"
+                                  required
+                                >
+                                  <option value="">Escolha seu bairro na lista</option>
+                                  {activeAreas.map((area) => (
+                                    <option key={area.id} value={area.id}>
+                                      {formatDeliveryAreaOptionLabel(area)}
+                                    </option>
+                                  ))}
+                                </select>
+                                <p className="text-[11px] text-neutral-600 leading-relaxed">
+                                  Seu bairro não está na lista? No momento não entregamos aí — você pode escolher{' '}
+                                  <button
+                                    type="button"
+                                    onClick={() => setDeliveryType('retirada')}
+                                    className="font-bold text-amber-900 underline cursor-pointer"
+                                  >
+                                    Retirada na loja
+                                  </button>{' '}
+                                  ou{' '}
+                                  {(() => {
+                                    const wDigits = (settings.whatsapp || '').replace(/\D/g, '');
+                                    const wUrl = wDigits
+                                      ? `https://wa.me/${wDigits.startsWith('55') ? wDigits : `55${wDigits}`}`
+                                      : null;
+                                    return wUrl ? (
+                                      <a
+                                        href={wUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="font-bold text-emerald-700 hover:text-emerald-800 underline"
+                                      >
+                                        falar com a gente no WhatsApp
+                                      </a>
+                                    ) : (
+                                      <strong>falar com a gente no WhatsApp</strong>
+                                    );
+                                  })()}
+                                  .
+                                </p>
+                              </div>
+                            )}
+
                             <button
                               type="button"
                               onClick={() => {
                                 setLoggedAddressMode('custom');
                                 setSaveCustomAddressToAccount(false);
                                 setDeliveryQuote(null);
-                                setCustomerDistance(null);
                                 setCepNotice('');
                                 setCep('');
                                 setAddress('');
                                 setAddressNumber('');
-                                setNeighborhood(activeAreas[0]?.name || currentCustomer.neighborhood || '');
+                                setSelectedDeliveryAreaId('');
+                                setNeighborhood('');
                                 setComplement('');
                                 setReference('');
-                                setCheckoutLat(undefined);
-                                setCheckoutLng(undefined);
-                                setCheckoutGeoLat(undefined);
-                                setCheckoutGeoLng(undefined);
-                                setShowCheckoutMap(false);
                               }}
                               className={`w-full p-3.5 rounded-2xl border-2 text-left transition-all flex items-center gap-3 cursor-pointer ${
                                 loggedAddressMode === 'custom'
@@ -3279,15 +3167,15 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                         loggedAddressMode === 'custom' ||
                         !currentCustomer.address) && (
                         <div className="space-y-3 pt-1">
-                          {/* CEP Search Card */}
+                          {/* CEP (opcional) */}
                           <div className="p-3.5 bg-amber-50/80 border border-amber-300 rounded-2xl space-y-2">
                             <div className="flex items-center justify-between">
                               <label className="text-xs font-bold text-amber-950 flex items-center gap-1.5">
                                 <Building2 className="w-3.5 h-3.5 text-amber-600" />
-                                <span>Preencher Endereço por CEP</span>
+                                <span>CEP (opcional)</span>
                               </label>
                               <span className="text-[10px] text-amber-800 font-bold bg-amber-200/60 px-2 py-0.5 rounded">
-                                Raio Máx: {settings.deliveryRadiusKm || 5} km
+                                Preenche a rua
                               </span>
                             </div>
 
@@ -3335,107 +3223,6 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                             )}
                           </div>
 
-                          {/* Delivery Radius / Coverage Info Banner */}
-                          {settings.deliveryRadiusKm && !cepNotice && (
-                            <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex flex-wrap items-center justify-between gap-2 text-xs text-amber-950">
-                              <div className="flex items-center gap-2">
-                                <Compass className="w-4 h-4 text-amber-600 shrink-0" />
-                                <span>
-                                  Entregamos em até <strong>{settings.deliveryRadiusKm} km</strong> de distância do depósito!
-                                </span>
-                              </div>
-                              {address && (
-                                <button
-                                  type="button"
-                                  onClick={handleCheckDistance}
-                                  disabled={checkingDistance}
-                                  className="text-[11px] font-bold text-amber-700 hover:text-amber-900 bg-white px-2.5 py-1 rounded-lg border border-amber-300 shadow-2xs transition-colors shrink-0"
-                                >
-                                  {checkingDistance ? 'Calculando...' : 'Checar Distância'}
-                                </button>
-                              )}
-                            </div>
-                          )}
-
-                          {customerDistance && (
-                            <div
-                              className={`p-2.5 rounded-xl text-xs flex items-center gap-2 ${
-                                customerDistance.inside
-                                  ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                                  : 'bg-red-50 text-red-800 border border-red-200'
-                              }`}
-                            >
-                              {customerDistance.inside ? (
-                                <>
-                                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                                  <span>
-                                    Distância: <strong>{customerDistance.km} km</strong> — Dentro da área de entrega!
-                                  </span>
-                                </>
-                              ) : (
-                                <>
-                                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
-                                  <span>
-                                    Distância: <strong>{customerDistance.km} km</strong> — Fora do raio máximo de{' '}
-                                    {settings.deliveryRadiusKm} km. Escolha Retirada no Depósito.
-                                  </span>
-                                </>
-                              )}
-                            </div>
-                          )}
-
-                          {/* Bairro Selector with delivery area enforcement */}
-                          <div>
-                            <label className="text-[11px] font-semibold text-neutral-700 block mb-1">
-                              Selecione seu Bairro * (Áreas Atendidas pelo Depósito)
-                            </label>
-                            {activeAreas.length === 0 ? (
-                              <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-xs">
-                                <p className="font-bold">Nenhum bairro de entrega fixo cadastrado</p>
-                                <p className="mt-0.5 text-[11px] text-amber-700">
-                                  Informe seu bairro no campo abaixo ou selecione a opção Retirada no Depósito.
-                                </p>
-                                <input
-                                  type="text"
-                                  required
-                                  placeholder="Digite seu bairro..."
-                                  value={neighborhood}
-                                  onChange={(e) => setNeighborhood(e.target.value)}
-                                  className="mt-2 w-full px-3 py-2 bg-white border border-amber-300 rounded-xl text-xs font-bold text-neutral-900"
-                                />
-                              </div>
-                            ) : (
-                              <>
-                                <select
-                                  value={neighborhood}
-                                  onChange={(e) => setNeighborhood(e.target.value)}
-                                  className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs font-bold text-neutral-900"
-                                  required
-                                >
-                                  {activeAreas.map((area) => (
-                                    <option key={area.id} value={area.name}>
-                                      {area.name} — Taxa: {formatCurrency(area.fee)} ({area.estimatedTime})
-                                    </option>
-                                  ))}
-                                </select>
-
-                                {!isAreaCovered && (
-                                  <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs flex items-start gap-2">
-                                    <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
-                                    <div>
-                                      <strong>Bairro fora da área de entrega!</strong>
-                                      <p className="mt-0.5 text-[11px]">
-                                        Nosso depósito entrega nos seguintes bairros:{' '}
-                                        {activeAreas.map((a) => a.name).join(', ')}. Você também pode escolher{' '}
-                                        <strong>Retirar no Depósito</strong>.
-                                      </p>
-                                    </div>
-                                  </div>
-                                )}
-                              </>
-                            )}
-                          </div>
-
                           <div className="grid grid-cols-3 gap-2">
                             <div className="col-span-2">
                               <label className="text-[11px] font-semibold text-neutral-600 block mb-1">
@@ -3444,6 +3231,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                               <input
                                 type="text"
                                 required
+                                maxLength={120}
                                 placeholder="Ex: Rua das Palmeiras"
                                 value={address}
                                 onChange={(e) => setAddress(e.target.value)}
@@ -3455,93 +3243,14 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                               <input
                                 type="text"
                                 required
+                                maxLength={20}
                                 placeholder="123"
                                 value={addressNumber}
                                 onChange={(e) => setAddressNumber(e.target.value)}
-                                onBlur={handleCheckoutNumberBlur}
                                 className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
                               />
                             </div>
                           </div>
-
-                          {/* Optional Map Pin in Checkout */}
-                          {!showCheckoutMap ? (
-                            <div className="flex flex-wrap items-center gap-2 pt-1">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const fallbackLat =
-                                    checkoutGeoLat ?? checkoutLat ?? settings.storeLatitude ?? -23.55052;
-                                  const fallbackLng =
-                                    checkoutGeoLng ?? checkoutLng ?? settings.storeLongitude ?? -46.633308;
-                                  if (checkoutLat === undefined || checkoutLng === undefined) {
-                                    setCheckoutLat(fallbackLat);
-                                    setCheckoutLng(fallbackLng);
-                                  }
-                                  setShowCheckoutMap(true);
-                                }}
-                                className="px-3 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 border border-neutral-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
-                              >
-                                <MapPin className="w-3.5 h-3.5 text-red-600" />
-                                <span>Ajustar no mapa (opcional)</span>
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const fallbackLat =
-                                    checkoutGeoLat ?? checkoutLat ?? settings.storeLatitude ?? -23.55052;
-                                  const fallbackLng =
-                                    checkoutGeoLng ?? checkoutLng ?? settings.storeLongitude ?? -46.633308;
-                                  if (checkoutLat === undefined || checkoutLng === undefined) {
-                                    setCheckoutLat(fallbackLat);
-                                    setCheckoutLng(fallbackLng);
-                                  }
-                                  setShowCheckoutMap(true);
-                                  setCheckoutTriggerGpsCount((c) => c + 1);
-                                }}
-                                className="px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
-                              >
-                                <Navigation className="w-3.5 h-3.5 text-amber-700" />
-                                <span>Usar minha localização atual</span>
-                              </button>
-                            </div>
-                          ) : (
-                            checkoutLat !== undefined &&
-                            checkoutLng !== undefined && (
-                              <div className="space-y-2">
-                                <AddressPinMap
-                                  latitude={checkoutLat}
-                                  longitude={checkoutLng}
-                                  geoLatitude={checkoutGeoLat ?? checkoutLat}
-                                  geoLongitude={checkoutGeoLng ?? checkoutLng}
-                                  precisao={checkoutPrecisao}
-                                  triggerGpsCount={checkoutTriggerGpsCount}
-                                  showConfirmButton={Boolean(currentCustomer && !isPinConfirmed)}
-                                  isConfirmingPin={isConfirmingPin}
-                                  pinConfirmed={isPinConfirmed}
-                                  onConfirmPin={(confirmedLat, confirmedLng) => {
-                                    setCheckoutLat(confirmedLat);
-                                    setCheckoutLng(confirmedLng);
-                                    setCheckoutError('');
-                                    persistCheckoutCoordinates(confirmedLat, confirmedLng, true);
-                                  }}
-                                  onChange={(newLat, newLng) => {
-                                    setCheckoutLat(newLat);
-                                    setCheckoutLng(newLng);
-                                    setCheckoutError('');
-                                    persistCheckoutCoordinates(newLat, newLng, true);
-                                  }}
-                                  onResetToAddress={() => {
-                                    if (checkoutGeoLat !== undefined && checkoutGeoLng !== undefined) {
-                                      setCheckoutLat(checkoutGeoLat);
-                                      setCheckoutLng(checkoutGeoLng);
-                                      persistCheckoutCoordinates(checkoutGeoLat, checkoutGeoLng, true);
-                                    }
-                                  }}
-                                />
-                              </div>
-                            )
-                          )}
 
                           <div className="grid grid-cols-2 gap-2">
                             <div>
@@ -3550,6 +3259,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                               </label>
                               <input
                                 type="text"
+                                maxLength={80}
                                 placeholder="Apto 42B"
                                 value={complement}
                                 onChange={(e) => setComplement(e.target.value)}
@@ -3558,16 +3268,74 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                             </div>
                             <div>
                               <label className="text-[11px] font-semibold text-neutral-600 block mb-1">
-                                Ponto de Referência
+                                Ponto de referência
                               </label>
                               <input
                                 type="text"
+                                maxLength={120}
                                 placeholder="Ex: Portão cinza"
                                 value={reference}
                                 onChange={(e) => setReference(e.target.value)}
                                 className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl text-xs"
                               />
                             </div>
+                          </div>
+
+                          {/* BAIRRO SELECT (1b & 1c) */}
+                          <div>
+                            <label className="text-[11px] font-semibold text-neutral-700 block mb-1">
+                              Bairro *
+                            </label>
+                            <select
+                              value={selectedDeliveryAreaId}
+                              onChange={(e) => {
+                                const nextId = e.target.value;
+                                setSelectedDeliveryAreaId(nextId);
+                                const found = activeAreas.find((a) => a.id === nextId);
+                                setNeighborhood(found ? found.name : '');
+                                setCheckoutError('');
+                              }}
+                              className="w-full px-3 py-2.5 bg-neutral-50 border border-neutral-300 rounded-xl text-xs font-bold text-neutral-900"
+                              required
+                            >
+                              <option value="">Escolha seu bairro na lista</option>
+                              {activeAreas.map((area) => (
+                                <option key={area.id} value={area.id}>
+                                  {formatDeliveryAreaOptionLabel(area)}
+                                </option>
+                              ))}
+                            </select>
+
+                            <p className="text-[11px] text-neutral-600 mt-1.5 leading-relaxed">
+                              Seu bairro não está na lista? No momento não entregamos aí — você pode escolher{' '}
+                              <button
+                                type="button"
+                                onClick={() => setDeliveryType('retirada')}
+                                className="font-bold text-amber-900 underline cursor-pointer"
+                              >
+                                Retirada na loja
+                              </button>{' '}
+                              ou{' '}
+                              {(() => {
+                                const wDigits = (settings.whatsapp || '').replace(/\D/g, '');
+                                const wUrl = wDigits
+                                  ? `https://wa.me/${wDigits.startsWith('55') ? wDigits : `55${wDigits}`}`
+                                  : null;
+                                return wUrl ? (
+                                  <a
+                                    href={wUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="font-bold text-emerald-700 hover:text-emerald-800 underline"
+                                  >
+                                    falar com a gente no WhatsApp
+                                  </a>
+                                ) : (
+                                  <strong>falar com a gente no WhatsApp</strong>
+                                );
+                              })()}
+                              .
+                            </p>
                           </div>
 
                           {/* Checkbox "Salvar este endereço na minha conta" (unchecked by default) when logged-in customer chooses "Outro endereço" */}
@@ -3773,8 +3541,19 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       </div>
                     )}
                     <div className="flex justify-between text-neutral-600">
-                      <span>Taxa de Entrega:</span>
-                      <span>{deliveryFee === 0 ? 'Grátis' : formatCurrency(deliveryFee)}</span>
+                      <span>
+                        Taxa de Entrega
+                        {deliveryType === 'delivery' && matchedArea ? ` (${matchedArea.name})` : ''}:
+                      </span>
+                      <span>
+                        {deliveryType === 'retirada'
+                          ? 'Sem taxa'
+                          : !matchedArea
+                          ? 'Escolha o bairro'
+                          : deliveryFee === 0
+                          ? 'Grátis'
+                          : formatCurrency(deliveryFee)}
+                      </span>
                     </div>
                     <div className="flex justify-between text-base font-black text-neutral-900 pt-2 border-t border-neutral-200">
                       <span>Total Final:</span>
@@ -3974,12 +3753,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
           address,
           number: addressNumber,
           neighborhood,
+          deliveryAreaId: selectedDeliveryAreaId || undefined,
           city: checkoutCity,
           state: checkoutState,
           complement,
           reference,
-          latitude: checkoutLat,
-          longitude: checkoutLng,
         }}
         onSuccess={(cust) => {
           setCurrentCustomer(cust);

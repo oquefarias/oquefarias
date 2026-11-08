@@ -193,6 +193,7 @@ export interface CustomerInfo {
   location_verified?: boolean;
   distanceKm?: number;
   isWithinDeliveryRadius?: boolean;
+  deliveryAreaId?: string;
 }
 
 export interface CustomerProfile extends CustomerInfo {
@@ -229,6 +230,7 @@ export interface OrderDeliveryAddressPayload {
   address: string;
   number: string;
   neighborhood: string;
+  deliveryAreaId?: string;
   complement?: string;
   reference?: string;
   city?: string;
@@ -263,6 +265,7 @@ export interface Order {
   updatedAt: string;
   guestToken?: string;
   trackingUrl?: string;
+  deliveryAreaId?: string;
   deliveryAddress?: OrderDeliveryAddressPayload;
   guest?: GuestOrderPayload;
 }
@@ -1140,3 +1143,62 @@ export interface PaymentsHistoryResponse {
     closedAt?: string | null;
   } | null;
 }
+
+/**
+ * Normalizes a neighborhood name for accent-insensitive and case-insensitive comparison.
+ */
+export function normalizeNeighborhoodName(name?: string | null): string {
+  if (!name) return '';
+  return String(name)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Sorts delivery areas alphabetically (A-Z) by name using pt-BR collation.
+ */
+export function sortDeliveryAreasAlphabetically(areas: DeliveryArea[]): DeliveryArea[] {
+  return [...areas].sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '', 'pt-BR', { sensitivity: 'base' })
+  );
+}
+
+/**
+ * Returns active delivery areas sorted alphabetically (A-Z).
+ */
+export function getActiveDeliveryAreasSorted(areas: DeliveryArea[]): DeliveryArea[] {
+  return sortDeliveryAreasAlphabetically(areas.filter((a) => a.active !== false));
+}
+
+/**
+ * Finds an active delivery area by exact ID or by normalized neighborhood name (ignoring accents and case).
+ */
+export function findMatchingActiveDeliveryArea(
+  areas: DeliveryArea[],
+  idOrName?: string | null
+): DeliveryArea | undefined {
+  if (!idOrName) return undefined;
+  const raw = String(idOrName).trim();
+  if (!raw) return undefined;
+  const activeAreas = areas.filter((a) => a.active !== false);
+  const byId = activeAreas.find((a) => a.id === raw);
+  if (byId) return byId;
+  const normalizedTarget = normalizeNeighborhoodName(raw);
+  if (!normalizedTarget) return undefined;
+  return activeAreas.find((a) => normalizeNeighborhoodName(a.name) === normalizedTarget);
+}
+
+/**
+ * Formats a delivery area option for <select> dropdowns: "Nome do bairro — taxa R$ X,XX — tempo"
+ */
+export function formatDeliveryAreaOptionLabel(area: DeliveryArea): string {
+  const feeFormatted = Number(area.fee || 0)
+    .toFixed(2)
+    .replace('.', ',');
+  const timeText = (area.estimatedTime || '30 a 45 min').trim();
+  return `${area.name} — taxa R$ ${feeFormatted} — ${timeText}`;
+}
+

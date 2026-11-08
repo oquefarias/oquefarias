@@ -1,30 +1,29 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { CustomerProfile, DeliveryArea, StoreSettings } from '../../types';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import {
+  CustomerProfile,
+  DeliveryArea,
+  StoreSettings,
+  getActiveDeliveryAreasSorted,
+  findMatchingActiveDeliveryArea,
+  formatDeliveryAreaOptionLabel,
+} from '../../types';
 import { api } from '../../services/api';
 import {
   User,
   Mail,
   Lock,
-  MapPin,
   X,
   ArrowRight,
   CheckCircle2,
   Building2,
   Search,
   Loader2,
-  Compass,
   LogOut,
   Eye,
   EyeOff,
-  Navigation,
+  MessageCircle,
 } from 'lucide-react';
-import {
-  fetchAddressByCep,
-  fetchCoordinatesByCepBrasilApi,
-  calculateDistanceKm,
-  resolveFullAddressOnServer,
-} from '../../utils/geo';
-import { AddressPinMap } from '../AddressPinMap';
+import { fetchAddressByCep } from '../../utils/geo';
 
 export interface InitialRegisterData {
   name?: string;
@@ -34,6 +33,7 @@ export interface InitialRegisterData {
   address?: string;
   number?: string;
   neighborhood?: string;
+  deliveryAreaId?: string;
   city?: string;
   state?: string;
   complement?: string;
@@ -85,36 +85,26 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   const [cep, setCep] = useState<string>('');
   const [address, setAddress] = useState<string>('');
   const [number, setNumber] = useState<string>('');
-  const [neighborhood, setNeighborhood] = useState<string>('');
+  const [selectedAreaId, setSelectedAreaId] = useState<string>('');
   const [city, setCity] = useState<string>('');
   const [state, setState] = useState<string>('');
   const [complement, setComplement] = useState<string>('');
   const [reference, setReference] = useState<string>('');
 
-  const [lat, setLat] = useState<number | undefined>(undefined);
-  const [lng, setLng] = useState<number | undefined>(undefined);
-  const [geoLat, setGeoLat] = useState<number | undefined>(undefined);
-  const [geoLng, setGeoLng] = useState<number | undefined>(undefined);
-  const [geoPrecisao, setGeoPrecisao] = useState<string | null>(null);
-  const [isPinManuallyAdjusted, setIsPinManuallyAdjusted] = useState<boolean>(false);
-  const [distanceKm, setDistanceKm] = useState<number | null>(null);
-  const [isWithinRadius, setIsWithinRadius] = useState<boolean | null>(null);
-
-  // Optional map state (hidden by default)
-  const [showMap, setShowMap] = useState<boolean>(false);
-  const [triggerGpsCount, setTriggerGpsCount] = useState<number>(0);
-  const [isLocatingQuickGps, setIsLocatingQuickGps] = useState<boolean>(false);
-
   const [isSearchingCep, setIsSearchingCep] = useState<boolean>(false);
-  const [cepNotFound, setCepNotFound] = useState<boolean>(false);
   const [cepStatusMessage, setCepStatusMessage] = useState<{
-    type: 'success' | 'warn' | 'error';
+    type: 'success' | 'warn';
     text: string;
   } | null>(null);
   const [registerError, setRegisterError] = useState<string>('');
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [alreadyRegisteredField, setAlreadyRegisteredField] = useState<'email' | 'phone' | null>(null);
   const [isSubmittingRegister, setIsSubmittingRegister] = useState<boolean>(false);
+
+  const activeAreasSorted = useMemo(
+    () => getActiveDeliveryAreasSorted(deliveryAreas),
+    [deliveryAreas]
+  );
 
   // Field refs for scrolling & focusing first invalid input
   const nameInputRef = useRef<HTMLInputElement | null>(null);
@@ -125,9 +115,9 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   const cepInputRef = useRef<HTMLInputElement | null>(null);
   const addressInputRef = useRef<HTMLInputElement | null>(null);
   const numberInputRef = useRef<HTMLInputElement | null>(null);
-  const neighborhoodInputRef = useRef<HTMLInputElement | null>(null);
+  const neighborhoodSelectRef = useRef<HTMLSelectElement | null>(null);
 
-  const fieldRefs: Record<string, React.RefObject<HTMLInputElement | null>> = {
+  const fieldRefs: Record<string, React.RefObject<HTMLElement | null>> = {
     name: nameInputRef,
     email: emailInputRef,
     phone: phoneInputRef,
@@ -136,7 +126,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     cep: cepInputRef,
     address: addressInputRef,
     number: numberInputRef,
-    neighborhood: neighborhoodInputRef,
+    neighborhood: neighborhoodSelectRef,
   };
 
   const clearFieldError = (field: string) => {
@@ -146,7 +136,10 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       delete next[field];
       return next;
     });
-    if ((field === 'email' && alreadyRegisteredField === 'email') || (field === 'phone' && alreadyRegisteredField === 'phone')) {
+    if (
+      (field === 'email' && alreadyRegisteredField === 'email') ||
+      (field === 'phone' && alreadyRegisteredField === 'phone')
+    ) {
       setAlreadyRegisteredField(null);
     }
   };
@@ -178,14 +171,13 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   };
 
   useEffect(() => {
-    setShowMap(false);
-    setTriggerGpsCount(0);
     setFieldErrors({});
     setAlreadyRegisteredField(null);
-    setCepNotFound(false);
     setShowPassword(false);
     setShowConfirmPassword(false);
     setShowLoginPassword(false);
+    setIsLoadingLogin(false);
+    setIsSubmittingRegister(false);
 
     if (currentCustomer) {
       setTab('perfil');
@@ -197,27 +189,17 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setCep(currentCustomer.cep || '');
       setAddress(currentCustomer.address || '');
       setNumber(currentCustomer.number || '');
-      setNeighborhood(currentCustomer.neighborhood || (deliveryAreas[0]?.name || ''));
+      const matched = findMatchingActiveDeliveryArea(
+        activeAreasSorted,
+        currentCustomer.neighborhood
+      );
+      setSelectedAreaId(matched ? matched.id : '');
       setCity(currentCustomer.city || '');
       setState(currentCustomer.state || '');
       setComplement(currentCustomer.complement || '');
       setReference(currentCustomer.reference || '');
-      setLat(currentCustomer.latitude);
-      setLng(currentCustomer.longitude);
-      setGeoLat(
-        currentCustomer.geoLatitude !== undefined && currentCustomer.geoLatitude !== null
-          ? Number(currentCustomer.geoLatitude)
-          : currentCustomer.latitude
-      );
-      setGeoLng(
-        currentCustomer.geoLongitude !== undefined && currentCustomer.geoLongitude !== null
-          ? Number(currentCustomer.geoLongitude)
-          : currentCustomer.longitude
-      );
-      setGeoPrecisao(currentCustomer.geoPrecision || null);
-      setIsPinManuallyAdjusted(false);
-      setDistanceKm(currentCustomer.distanceKm ?? null);
-      setIsWithinRadius(currentCustomer.isWithinDeliveryRadius ?? null);
+      setRegisterError('');
+      setCepStatusMessage(null);
     } else {
       const hasPrefilledData = Boolean(
         initialRegisterData &&
@@ -235,24 +217,31 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       setCep(initialRegisterData?.cep || '');
       setAddress(initialRegisterData?.address || '');
       setNumber(initialRegisterData?.number || '');
-      setNeighborhood(initialRegisterData?.neighborhood || deliveryAreas[0]?.name || '');
+
+      let initialAreaId = '';
+      if (
+        initialRegisterData?.deliveryAreaId &&
+        activeAreasSorted.some((a) => a.id === initialRegisterData.deliveryAreaId)
+      ) {
+        initialAreaId = initialRegisterData.deliveryAreaId;
+      } else if (initialRegisterData?.neighborhood) {
+        const matched = findMatchingActiveDeliveryArea(
+          activeAreasSorted,
+          initialRegisterData.neighborhood
+        );
+        if (matched) initialAreaId = matched.id;
+      }
+      setSelectedAreaId(initialAreaId);
+
       setCity(initialRegisterData?.city || '');
       setState(initialRegisterData?.state || '');
       setComplement(initialRegisterData?.complement || '');
       setReference(initialRegisterData?.reference || '');
-      setLat(initialRegisterData?.latitude);
-      setLng(initialRegisterData?.longitude);
-      setGeoLat(initialRegisterData?.latitude);
-      setGeoLng(initialRegisterData?.longitude);
-      setGeoPrecisao(null);
-      setIsPinManuallyAdjusted(false);
-      setDistanceKm(null);
-      setIsWithinRadius(null);
       setLoginError('');
       setRegisterError('');
       setCepStatusMessage(null);
     }
-  }, [currentCustomer, isOpen, deliveryAreas]);
+  }, [currentCustomer, isOpen, activeAreasSorted, initialTab]);
 
   if (!isOpen) return null;
 
@@ -268,6 +257,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     try {
       const res = await api.loginCustomer(loginEmail, loginPassword);
       if (res.success && res.customer) {
+        setIsLoadingLogin(false);
         onSuccess(res.customer);
       } else {
         setLoginError(res.error || 'E-mail ou senha incorretos.');
@@ -288,225 +278,58 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       formatted = `${val.slice(0, 5)}-${val.slice(5)}`;
     }
     setCep(formatted);
-    setCepNotFound(false);
     clearFieldError('cep');
-    setIsPinManuallyAdjusted(false);
 
     if (val.length === 8) {
       executeCepSearch(val);
     }
   };
 
-  const applyServerGeocode = (newLat: number, newLng: number, precisaoVal: string) => {
-    setGeoLat(newLat);
-    setGeoLng(newLng);
-    setGeoPrecisao(precisaoVal);
-    if (!isPinManuallyAdjusted) {
-      setLat(newLat);
-      setLng(newLng);
-    }
-
-    if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
-      const dist = calculateDistanceKm(
-        settings.storeLatitude,
-        settings.storeLongitude,
-        newLat,
-        newLng
-      );
-      setDistanceKm(dist);
-      const maxRadius = settings.deliveryRadiusKm || 5;
-      setIsWithinRadius(dist <= maxRadius);
-    }
-  };
-
-  const updatePinOnly = (newLat: number, newLng: number) => {
-    setLat(newLat);
-    setLng(newLng);
-    setIsPinManuallyAdjusted(true);
-  };
-
-  const handleOpenOptionalMap = () => {
-    const defaultLat = geoLat ?? lat ?? settings?.storeLatitude ?? -23.55052;
-    const defaultLng = geoLng ?? lng ?? settings?.storeLongitude ?? -46.633308;
-    if (lat === undefined || lng === undefined) {
-      setLat(defaultLat);
-      setLng(defaultLng);
-    }
-    setShowMap(true);
-  };
-
-  const handleUseCurrentLocationQuick = () => {
-    const defaultLat = geoLat ?? lat ?? settings?.storeLatitude ?? -23.55052;
-    const defaultLng = geoLng ?? lng ?? settings?.storeLongitude ?? -46.633308;
-    if (lat === undefined || lng === undefined) {
-      setLat(defaultLat);
-      setLng(defaultLng);
-    }
-    setShowMap(true);
-
-    if (typeof navigator !== 'undefined' && navigator.geolocation) {
-      setIsLocatingQuickGps(true);
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          setIsLocatingQuickGps(false);
-          const gpsLat = Math.round(position.coords.latitude * 1000000) / 1000000;
-          const gpsLng = Math.round(position.coords.longitude * 1000000) / 1000000;
-          updatePinOnly(gpsLat, gpsLng);
-        },
-        () => {
-          setIsLocatingQuickGps(false);
-          setTriggerGpsCount((c) => c + 1);
-        },
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-      );
-    } else {
-      setTriggerGpsCount((c) => c + 1);
-    }
-  };
-
-  const executeServerGeoResolve = async (params: {
-    rua: string;
-    numero: string;
-    bairro: string;
-    cidade: string;
-    uf: string;
-    cep: string;
-  }) => {
-    const resolved = await resolveFullAddressOnServer(params);
-    if (resolved) {
-      applyServerGeocode(resolved.latitude, resolved.longitude, resolved.precisao);
-      if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
-        const dist = calculateDistanceKm(
-          settings.storeLatitude,
-          settings.storeLongitude,
-          resolved.latitude,
-          resolved.longitude
-        );
-        const maxRadius = settings.deliveryRadiusKm || 5;
-        const inside = dist <= maxRadius;
-        setCepStatusMessage({
-          type: resolved.precisao === 'aproximada' ? 'warn' : 'success',
-          text: inside
-            ? `Endereço localizado! Distância de ${dist} km (Dentro do raio de entrega de ${maxRadius} km).`
-            : `Atenção: Endereço a ${dist} km, além do raio de entrega de ${maxRadius} km.`,
-        });
-      }
-    }
-  };
-
   const executeCepSearch = async (cleanCepArg?: string) => {
     const rawDigits = (cleanCepArg || cep).replace(/\D/g, '');
     if (rawDigits.length !== 8) {
-      setCepNotFound(true);
-      setFieldErrors((prev) => ({ ...prev, cep: 'Digite um CEP completo com 8 dígitos.' }));
-      setCepStatusMessage({
-        type: 'warn',
-        text: 'Digite um CEP completo com 8 dígitos.',
-      });
       return;
     }
 
     setIsSearchingCep(true);
     setCepStatusMessage(null);
-    setCepNotFound(false);
 
     try {
       const viaCep = await fetchAddressByCep(rawDigits);
-      const brasilApi = await fetchCoordinatesByCepBrasilApi(rawDigits);
-
-      if (!viaCep && !brasilApi) {
-        setCepNotFound(true);
-        setFieldErrors((prev) => ({
-          ...prev,
-          cep: `CEP ${rawDigits} não encontrado. Verifique os números digitados.`,
-        }));
+      if (!viaCep) {
         setCepStatusMessage({
-          type: 'error',
-          text: `CEP ${rawDigits} não encontrado. Verifique os números digitados.`,
+          type: 'warn',
+          text: 'Não foi possível buscar pelo CEP. Preencha a rua e escolha seu bairro abaixo.',
         });
         return;
       }
 
-      clearFieldError('cep');
-      const logradouro = viaCep?.logradouro || brasilApi?.street || address;
-      const bairro = viaCep?.bairro || brasilApi?.neighborhood || neighborhood;
-      const localidade = viaCep?.localidade || brasilApi?.city || city;
-      const uf = viaCep?.uf || brasilApi?.state || state;
-
-      if (logradouro) {
-        setAddress(logradouro);
+      if (viaCep.logradouro) {
+        setAddress(viaCep.logradouro);
         clearFieldError('address');
       }
-      if (bairro) {
-        setNeighborhood(bairro);
-        clearFieldError('neighborhood');
-      }
-      if (localidade) setCity(localidade);
-      if (uf) setState(uf);
+      if (viaCep.localidade) setCity(viaCep.localidade);
+      if (viaCep.uf) setState(viaCep.uf);
 
-      const resolved = await resolveFullAddressOnServer({
-        rua: logradouro,
-        numero: number.trim(),
-        bairro,
-        cidade: localidade,
-        uf,
-        cep: rawDigits,
-      });
-
-      if (resolved) {
-        applyServerGeocode(resolved.latitude, resolved.longitude, resolved.precisao);
-        if (settings?.storeLatitude !== undefined && settings?.storeLongitude !== undefined) {
-          const dist = calculateDistanceKm(
-            settings.storeLatitude,
-            settings.storeLongitude,
-            resolved.latitude,
-            resolved.longitude
-          );
-          const maxRadius = settings.deliveryRadiusKm || 5;
-          const inside = dist <= maxRadius;
-          setCepStatusMessage({
-            type: resolved.precisao === 'aproximada' ? 'warn' : 'success',
-            text: inside
-              ? `Endereço localizado! Distância de ${dist} km (Dentro do raio de entrega de ${maxRadius} km).`
-              : `Atenção: Endereço a ${dist} km, além do raio de entrega de ${maxRadius} km.`,
-          });
-        } else {
+      if (viaCep.bairro) {
+        const matched = findMatchingActiveDeliveryArea(activeAreasSorted, viaCep.bairro);
+        if (matched) {
+          setSelectedAreaId(matched.id);
+          clearFieldError('neighborhood');
           setCepStatusMessage({
             type: 'success',
-            text: 'Endereço localizado com sucesso!',
+            text: `Rua e bairro (${matched.name}) preenchidos pelo CEP!`,
           });
+          return;
         }
-      } else {
-        setCepStatusMessage({
-          type: 'success',
-          text: 'Rua e bairro preenchidos com sucesso via CEP!',
-        });
       }
-    } catch {
+
       setCepStatusMessage({
-        type: 'error',
-        text: 'Erro ao consultar o CEP.',
+        type: 'success',
+        text: 'Rua preenchida pelo CEP! Agora escolha seu bairro na lista abaixo.',
       });
-    } finally {
-      setIsSearchingCep(false);
-    }
-  };
-
-  const handleAddressOrNumberBlur = async () => {
-    const cleanCepDigits = cep.replace(/\D/g, '');
-    if (!address.trim() && cleanCepDigits.length !== 8) return;
-    if (!number.trim()) return;
-
-    setIsSearchingCep(true);
-    try {
-      await executeServerGeoResolve({
-        rua: address.trim(),
-        numero: number.trim(),
-        bairro: neighborhood.trim(),
-        cidade: city.trim(),
-        uf: state.trim(),
-        cep: cleanCepDigits,
-      });
+    } catch {
+      // Se falhar, segue normal sem travar (1b)
     } finally {
       setIsSearchingCep(false);
     }
@@ -515,13 +338,14 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   const validateFields = (isProfile: boolean): boolean => {
     const errors: Record<string, string> = {};
 
-    if (!name.trim()) {
-      errors.name = 'Informe seu nome completo.';
+    const cleanName = name.trim();
+    if (cleanName.length < 2 || cleanName.length > 80) {
+      errors.name = 'Informe seu nome completo (2 a 80 caracteres).';
     }
 
     if (!isProfile) {
       const cleanMail = email.trim();
-      if (!cleanMail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanMail)) {
+      if (cleanMail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanMail)) {
         errors.email = 'Digite um e-mail válido.';
       }
     }
@@ -548,22 +372,23 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     }
 
     const cepDigits = cep.replace(/\D/g, '');
-    if (cepNotFound) {
-      errors.cep = 'CEP não encontrado. Verifique os números digitados.';
-    } else if (cepDigits.length > 0 && cepDigits.length !== 8) {
-      errors.cep = 'Digite um CEP válido com 8 dígitos.';
+    if (cep.trim().length > 0 && cepDigits.length !== 8) {
+      errors.cep = 'Digite os 8 números do CEP ou deixe em branco.';
     }
 
-    if (!address.trim()) {
-      errors.address = 'Informe a rua / logradouro.';
+    const cleanAddress = address.trim();
+    if (cleanAddress.length < 2 || cleanAddress.length > 120) {
+      errors.address = 'Informe a rua (entre 2 e 120 caracteres).';
     }
 
-    if (!number.trim()) {
-      errors.number = 'Informe o número do imóvel.';
+    const cleanNumber = number.trim();
+    if (cleanNumber.length < 1 || cleanNumber.length > 20) {
+      errors.number = 'Informe o número (entre 1 e 20 caracteres).';
     }
 
-    if (!neighborhood.trim()) {
-      errors.neighborhood = 'Informe o bairro.';
+    const chosenArea = activeAreasSorted.find((a) => a.id === selectedAreaId);
+    if (!chosenArea) {
+      errors.neighborhood = 'Escolha um bairro da lista de entrega.';
     }
 
     setFieldErrors(errors);
@@ -594,7 +419,9 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       mapped.cep = msg;
     } else if (lower.includes('número') || lower.includes('numero')) {
       mapped.number = msg;
-    } else if (lower.includes('endereço') || lower.includes('endereco') || lower.includes('área de entrega') || lower.includes('raio')) {
+    } else if (lower.includes('bairro')) {
+      mapped.neighborhood = msg;
+    } else if (lower.includes('rua') || lower.includes('endereço') || lower.includes('endereco')) {
       mapped.address = msg;
     }
 
@@ -609,6 +436,8 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
   const handleSwitchToLoginWithEmail = () => {
     if (email.trim()) {
       setLoginEmail(email.trim());
+    } else if (phone.trim()) {
+      setLoginEmail(phone.trim());
     }
     setFieldErrors({});
     setRegisterError('');
@@ -625,28 +454,31 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       return;
     }
 
+    const chosenArea = activeAreasSorted.find((a) => a.id === selectedAreaId);
+    if (!chosenArea) {
+      setFieldErrors((prev) => ({ ...prev, neighborhood: 'Escolha um bairro da lista de entrega.' }));
+      return;
+    }
+
     setIsSubmittingRegister(true);
     try {
       const saved = await api.registerCustomer({
         name: name.trim(),
-        email: email.trim().toLowerCase(),
+        email: email.trim() ? email.trim().toLowerCase() : undefined,
         phone: phone.trim(),
         password,
-        cep: cep.trim(),
+        cep: cep.trim() || undefined,
         address: address.trim(),
         number: number.trim(),
-        neighborhood: neighborhood.trim(),
-        city: city.trim(),
-        state: state.trim(),
-        complement: complement.trim(),
-        reference: reference.trim(),
-        latitude: isPinManuallyAdjusted ? lat : undefined,
-        longitude: isPinManuallyAdjusted ? lng : undefined,
+        neighborhood: chosenArea.name,
+        deliveryAreaId: chosenArea.id,
+        city: city.trim() || undefined,
+        state: state.trim() || undefined,
+        complement: complement.trim() || undefined,
+        reference: reference.trim() || undefined,
       });
 
-      if (saved?.id) {
-        api.markCustomerPinConfirmed(saved.id);
-      }
+      setIsSubmittingRegister(false);
       onSuccess(saved);
     } catch (err: any) {
       mapServerErrorToFields(err.message || 'Erro ao realizar cadastro.');
@@ -664,27 +496,30 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
       return;
     }
 
+    const chosenArea = activeAreasSorted.find((a) => a.id === selectedAreaId);
+    if (!chosenArea) {
+      setFieldErrors((prev) => ({ ...prev, neighborhood: 'Escolha um bairro da lista de entrega.' }));
+      return;
+    }
+
     setIsSubmittingRegister(true);
     try {
       const updated = await api.updateCustomerMe({
         name: name.trim(),
         phone: phone.trim(),
         password: password ? password : undefined,
-        cep: cep.trim(),
+        cep: cep.trim() || undefined,
         address: address.trim(),
         number: number.trim(),
-        neighborhood: neighborhood.trim(),
-        city: city.trim(),
-        state: state.trim(),
-        complement: complement.trim(),
-        reference: reference.trim(),
-        latitude: isPinManuallyAdjusted ? lat : undefined,
-        longitude: isPinManuallyAdjusted ? lng : undefined,
+        neighborhood: chosenArea.name,
+        deliveryAreaId: chosenArea.id,
+        city: city.trim() || undefined,
+        state: state.trim() || undefined,
+        complement: complement.trim() || undefined,
+        reference: reference.trim() || undefined,
       });
 
-      if (updated?.id) {
-        api.markCustomerPinConfirmed(updated.id);
-      }
+      setIsSubmittingRegister(false);
       onSuccess(updated);
     } catch (err: any) {
       mapServerErrorToFields(err.message || 'Erro ao atualizar dados.');
@@ -699,7 +534,10 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
     onClose();
   };
 
-  const maxRadiusKm = settings?.deliveryRadiusKm || 5;
+  const storeWhatsappDigits = (settings?.whatsapp || '').replace(/\D/g, '');
+  const storeWhatsappUrl = storeWhatsappDigits
+    ? `https://wa.me/${storeWhatsappDigits.startsWith('55') ? storeWhatsappDigits : `55${storeWhatsappDigits}`}`
+    : null;
 
   const getInputClass = (field: string, extra = '') =>
     `w-full px-3 py-2 rounded-xl border transition-colors outline-none ${
@@ -725,11 +563,11 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
           </div>
 
           <h3 className="font-black text-xl">
-            {currentCustomer ? 'Minha Conta de Entrega' : 'Identifique-se para Comprar'}
+            {currentCustomer ? 'Minha Conta / Endereço' : 'Identifique-se para Comprar'}
           </h3>
           <p className="text-xs text-amber-100 mt-1">
             {currentCustomer
-              ? 'Visualize ou atualize seus dados de entrega.'
+              ? 'Visualize ou atualize seus dados e bairro de entrega.'
               : 'Faça login ou crie sua conta para finalizar seus pedidos com segurança.'}
           </p>
 
@@ -779,7 +617,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
           )}
         </div>
 
-        {/* Tab 1: Email + Password Login */}
+        {/* Tab 1: Email/WhatsApp + Password Login */}
         {tab === 'login' && !currentCustomer && (
           <form onSubmit={handleLogin} className="p-6 space-y-4">
             <div>
@@ -895,6 +733,7 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                 <input
                   ref={nameInputRef}
                   type="text"
+                  maxLength={80}
                   placeholder="Ex: João da Silva"
                   value={name}
                   onChange={(e) => {
@@ -910,7 +749,9 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                 <div>
-                  <label className="font-bold text-neutral-700 block mb-1">E-mail *</label>
+                  <label className="font-bold text-neutral-700 block mb-1">
+                    E-mail {tab === 'cadastro' ? '(opcional)' : ''}
+                  </label>
                   <input
                     ref={emailInputRef}
                     type="email"
@@ -1024,28 +865,38 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                         type="button"
                         tabIndex={-1}
                         onClick={() => setShowConfirmPassword((v) => !v)}
-                        aria-label={showConfirmPassword ? 'Esconder confirmação de senha' : 'Mostrar confirmação de senha'}
+                        aria-label={
+                          showConfirmPassword
+                            ? 'Esconder confirmação de senha'
+                            : 'Mostrar confirmação de senha'
+                        }
                         className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-neutral-500 hover:text-neutral-800 cursor-pointer"
                       >
-                        {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        {showConfirmPassword ? (
+                          <EyeOff className="w-4 h-4" />
+                        ) : (
+                          <Eye className="w-4 h-4" />
+                        )}
                       </button>
                     </div>
                     {fieldErrors.confirmPassword && (
-                      <p className="text-[11px] font-bold text-red-600 mt-1">{fieldErrors.confirmPassword}</p>
+                      <p className="text-[11px] font-bold text-red-600 mt-1">
+                        {fieldErrors.confirmPassword}
+                      </p>
                     )}
                   </div>
                 )}
               </div>
             </div>
 
-            {/* CEP SEARCH SECTION */}
-            <div className="p-3 bg-amber-50/80 border-2 border-amber-300/80 rounded-2xl space-y-2 mt-2">
+            {/* OPTIONAL CEP FIELD */}
+            <div className="p-3 bg-amber-50/80 border border-amber-300 rounded-2xl space-y-2 mt-2">
               <label className="font-black text-amber-950 flex items-center justify-between text-xs">
                 <span className="flex items-center gap-1">
                   <Building2 className="w-3.5 h-3.5 text-amber-600" />
-                  <span>Cadastrar Endereço por CEP</span>
+                  <span>CEP (opcional)</span>
                 </span>
-                <span className="text-[10px] text-amber-800 font-bold">Auto-completar</span>
+                <span className="text-[10px] text-amber-800 font-bold">Preenche a rua</span>
               </label>
 
               <div className="flex gap-1.5">
@@ -1066,7 +917,11 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                   disabled={isSearchingCep}
                   className="px-3 py-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black rounded-xl text-xs flex items-center gap-1 shrink-0 cursor-pointer"
                 >
-                  {isSearchingCep ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                  {isSearchingCep ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Search className="w-3.5 h-3.5" />
+                  )}
                   <span>Buscar</span>
                 </button>
               </div>
@@ -1080,30 +935,11 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                   className={`text-[10px] font-bold p-1.5 rounded-lg ${
                     cepStatusMessage.type === 'success'
                       ? 'bg-emerald-100 text-emerald-900'
-                      : cepStatusMessage.type === 'error'
-                      ? 'bg-red-100 text-red-800'
                       : 'bg-amber-100 text-amber-900'
                   }`}
                 >
                   {cepStatusMessage.text}
                 </p>
-              )}
-
-              {distanceKm !== null && (
-                <div
-                  className={`p-2 rounded-xl text-[11px] font-bold flex items-center gap-1.5 border ${
-                    isWithinRadius
-                      ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                      : 'bg-red-50 text-red-800 border-red-300'
-                  }`}
-                >
-                  <Compass className="w-3.5 h-3.5 shrink-0" />
-                  <span>
-                    {isWithinRadius
-                      ? `Dentro da área de entrega! (${distanceKm} km do depósito)`
-                      : `Atenção: A ${distanceKm} km do depósito (raio de ${maxRadiusKm} km).`}
-                  </span>
-                </div>
               )}
             </div>
 
@@ -1114,14 +950,13 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                   <input
                     ref={addressInputRef}
                     type="text"
+                    maxLength={120}
                     placeholder="Ex: Rua das Flores"
                     value={address}
                     onChange={(e) => {
                       setAddress(e.target.value);
                       clearFieldError('address');
-                      setIsPinManuallyAdjusted(false);
                     }}
-                    onBlur={handleAddressOrNumberBlur}
                     className={getInputClass('address')}
                   />
                   {fieldErrors.address && (
@@ -1133,14 +968,13 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
                   <input
                     ref={numberInputRef}
                     type="text"
+                    maxLength={20}
                     placeholder="123"
                     value={number}
                     onChange={(e) => {
                       setNumber(e.target.value);
                       clearFieldError('number');
-                      setIsPinManuallyAdjusted(false);
                     }}
-                    onBlur={handleAddressOrNumberBlur}
                     className={getInputClass('number')}
                   />
                   {fieldErrors.number && (
@@ -1151,125 +985,73 @@ export const CustomerAuthModal: React.FC<CustomerAuthModalProps> = ({
 
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="font-bold text-neutral-700 block mb-1">Bairro *</label>
-                  <input
-                    ref={neighborhoodInputRef}
-                    type="text"
-                    placeholder="Ex: Centro"
-                    value={neighborhood}
-                    onChange={(e) => {
-                      setNeighborhood(e.target.value);
-                      clearFieldError('neighborhood');
-                      setIsPinManuallyAdjusted(false);
-                    }}
-                    className={getInputClass('neighborhood', 'font-medium')}
-                  />
-                  {fieldErrors.neighborhood && (
-                    <p className="text-[11px] font-bold text-red-600 mt-1">{fieldErrors.neighborhood}</p>
-                  )}
-                </div>
-                <div>
                   <label className="font-bold text-neutral-700 block mb-1">Complemento</label>
                   <input
                     type="text"
+                    maxLength={80}
                     placeholder="Apto 42B"
                     value={complement}
                     onChange={(e) => setComplement(e.target.value)}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
                   />
                 </div>
-              </div>
-
-              <div className="grid grid-cols-3 gap-2">
-                <div className="col-span-2">
-                  <label className="font-bold text-neutral-700 block mb-1">Cidade</label>
+                <div>
+                  <label className="font-bold text-neutral-700 block mb-1">Ponto de referência</label>
                   <input
                     type="text"
-                    placeholder="São Paulo"
-                    value={city}
-                    onChange={(e) => {
-                      setCity(e.target.value);
-                      setIsPinManuallyAdjusted(false);
-                    }}
+                    maxLength={120}
+                    placeholder="Ex: Em frente à padaria"
+                    value={reference}
+                    onChange={(e) => setReference(e.target.value)}
                     className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
                   />
                 </div>
-                <div>
-                  <label className="font-bold text-neutral-700 block mb-1">UF</label>
-                  <input
-                    type="text"
-                    maxLength={2}
-                    placeholder="SP"
-                    value={state}
-                    onChange={(e) => {
-                      setState(e.target.value.toUpperCase());
-                      setIsPinManuallyAdjusted(false);
-                    }}
-                    className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl uppercase font-bold"
-                  />
-                </div>
               </div>
 
+              {/* BAIRRO SELECT */}
               <div>
-                <label className="font-bold text-neutral-700 block mb-1">Ponto de Referência</label>
-                <input
-                  type="text"
-                  placeholder="Ex: Em frente à padaria, portão preto"
-                  value={reference}
-                  onChange={(e) => setReference(e.target.value)}
-                  className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl"
-                />
+                <label className="font-bold text-neutral-700 block mb-1">Bairro *</label>
+                <select
+                  ref={neighborhoodSelectRef}
+                  value={selectedAreaId}
+                  onChange={(e) => {
+                    setSelectedAreaId(e.target.value);
+                    clearFieldError('neighborhood');
+                  }}
+                  className={getInputClass('neighborhood', 'font-bold text-neutral-900')}
+                >
+                  <option value="">Escolha seu bairro na lista</option>
+                  {activeAreasSorted.map((area) => (
+                    <option key={area.id} value={area.id}>
+                      {formatDeliveryAreaOptionLabel(area)}
+                    </option>
+                  ))}
+                </select>
+                {fieldErrors.neighborhood && (
+                  <p className="text-[11px] font-bold text-red-600 mt-1">
+                    {fieldErrors.neighborhood}
+                  </p>
+                )}
+
+                <p className="text-[11px] text-neutral-600 mt-1.5 leading-relaxed">
+                  Seu bairro não está na lista? No momento não entregamos aí — você pode escolher{' '}
+                  <strong>Retirada na loja</strong> ou{' '}
+                  {storeWhatsappUrl ? (
+                    <a
+                      href={storeWhatsappUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-emerald-700 hover:text-emerald-800 font-bold underline inline-flex items-center gap-0.5"
+                    >
+                      <MessageCircle className="w-3 h-3 inline" />
+                      <span>falar com a gente no WhatsApp</span>
+                    </a>
+                  ) : (
+                    <strong>falar com a gente no WhatsApp</strong>
+                  )}
+                  .
+                </p>
               </div>
-
-              {/* Optional Map Buttons (Map is hidden by default) */}
-              {!showMap ? (
-                <div className="flex flex-wrap items-center gap-2 pt-1">
-                  <button
-                    type="button"
-                    onClick={handleOpenOptionalMap}
-                    className="px-3 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 border border-neutral-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
-                  >
-                    <MapPin className="w-3.5 h-3.5 text-red-600" />
-                    <span>Ajustar no mapa (opcional)</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleUseCurrentLocationQuick}
-                    disabled={isLocatingQuickGps}
-                    className="px-3 py-2 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
-                  >
-                    {isLocatingQuickGps ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700" />
-                    ) : (
-                      <Navigation className="w-3.5 h-3.5 text-amber-700" />
-                    )}
-                    <span>Usar minha localização atual</span>
-                  </button>
-                </div>
-              ) : (
-                lat !== undefined &&
-                lng !== undefined && (
-                  <AddressPinMap
-                    latitude={lat}
-                    longitude={lng}
-                    geoLatitude={geoLat ?? lat}
-                    geoLongitude={geoLng ?? lng}
-                    precisao={geoPrecisao}
-                    triggerGpsCount={triggerGpsCount}
-                    onChange={(newLat, newLng) => {
-                      updatePinOnly(newLat, newLng);
-                    }}
-                    onResetToAddress={() => {
-                      setIsPinManuallyAdjusted(false);
-                      if (geoLat !== undefined && geoLng !== undefined) {
-                        setLat(geoLat);
-                        setLng(geoLng);
-                      }
-                    }}
-                  />
-                )
-              )}
             </div>
 
             <div className="pt-2">

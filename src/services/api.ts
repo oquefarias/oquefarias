@@ -58,6 +58,10 @@ export interface CouponValidationResult {
 }
 
 export interface CustomerDeliveryQuoteResult {
+  deliveryAreaId?: string | null;
+  neighborhood?: string | null;
+  estimatedTime?: string;
+  isValidArea?: boolean;
   distanceKm: number | null;
   isWithinDeliveryRadius: boolean;
   deliveryRadiusKm: number;
@@ -449,7 +453,9 @@ class ApiService {
     }
   }
 
-  public async updateCustomerMe(data: Partial<CustomerProfile> & { password?: string }): Promise<CustomerProfile> {
+  public async updateCustomerMe(
+    data: Partial<CustomerProfile> & { password?: string; deliveryAreaId?: string }
+  ): Promise<CustomerProfile> {
     const res = await fetch('/api/customer/me', {
       method: 'PUT',
       headers: this.getCustomerHeaders(),
@@ -585,7 +591,8 @@ class ApiService {
 
   public async getCustomerDeliveryQuote(
     subtotal?: number,
-    neighborhood?: string
+    neighborhood?: string,
+    deliveryAreaId?: string
   ): Promise<CustomerDeliveryQuoteResult | null> {
     const token = this.getCustomerToken();
     if (!token) return null;
@@ -597,6 +604,9 @@ class ApiService {
       }
       if (neighborhood && neighborhood.trim()) {
         params.set('neighborhood', neighborhood.trim());
+      }
+      if (deliveryAreaId && deliveryAreaId.trim()) {
+        params.set('deliveryAreaId', deliveryAreaId.trim());
       }
       const qs = params.toString();
       const res = await fetch(`/api/customer/delivery-quote${qs ? `?${qs}` : ''}`, {

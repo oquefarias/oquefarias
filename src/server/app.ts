@@ -47,6 +47,9 @@ import {
   PaymentHistoryItem,
   PaymentsHistorySummary,
   PaymentsHistoryResponse,
+  normalizeNeighborhoodName,
+  sortDeliveryAreasAlphabetically,
+  findMatchingActiveDeliveryArea,
 } from '../types/index.js';
 
 dotenv.config();
@@ -442,6 +445,14 @@ async function resolveAddressGeocodeServer(
 
 interface ValidatedCustomerGeoFields {
   error?: string;
+  area?: DeliveryArea;
+  deliveryAreaId?: string;
+  neighborhood?: string;
+  address?: string;
+  number?: string;
+  complement?: string;
+  reference?: string;
+  cep?: string;
   latitude?: number;
   longitude?: number;
   geoLatitude?: number;
@@ -459,108 +470,114 @@ async function resolveAndValidateCustomerAddress(
     address?: string;
     number?: string;
     neighborhood?: string;
+    deliveryAreaId?: string;
+    complement?: string;
+    reference?: string;
     city?: string;
     state?: string;
     cep?: string;
     pinLatitude?: number;
     pinLongitude?: number;
+    activeAreas?: DeliveryArea[];
   }
 ): Promise<ValidatedCustomerGeoFields> {
   const rua = String(input.address || '').trim();
   const numero = String(input.number || '').trim();
-  const bairro = String(input.neighborhood || '').trim();
-  const cidade = String(input.city || '').trim();
-  const uf = String(input.state || '').trim();
-  const cep = String(input.cep || '').trim();
+  const complemento = String(input.complement || '').trim();
+  const referencia = String(input.reference || '').trim();
+  const rawCep = String(input.cep || '').trim();
+  const cepDigits = rawCep.replace(/\D/g, '');
 
-  const hasAddressFields = Boolean(rua || cep.replace(/\D/g, '').length === 8);
-  const resolved = hasAddressFields
-    ? await resolveAddressGeocodeServer(supabase, {
-        rua,
-        numero,
-        bairro,
-        cidade,
-        uf,
-        cep,
-      })
-    : null;
-
-  const hasBrowserPin =
-    input.pinLatitude !== undefined &&
-    input.pinLatitude !== null &&
-    !Number.isNaN(Number(input.pinLatitude)) &&
-    input.pinLongitude !== undefined &&
-    input.pinLongitude !== null &&
-    !Number.isNaN(Number(input.pinLongitude));
-
-  if (!resolved) {
-    // Endereço não pôde ser geocodificado pelo servidor: aceite com location_verified = false e não trave o cadastro
-    const fallbackLat = hasBrowserPin ? Number(input.pinLatitude) : undefined;
-    const fallbackLng = hasBrowserPin ? Number(input.pinLongitude) : undefined;
-    const metrics = await computeCustomerServerMetrics(supabase, fallbackLat, fallbackLng);
+  if (rua.length < 2 || rua.length > 120) {
     return {
-      latitude: fallbackLat,
-      longitude: fallbackLng,
-      geoLatitude: undefined,
-      geoLongitude: undefined,
-      geoPrecision: undefined,
-      pinOffsetM: undefined,
+      error: 'Informe a rua (entre 2 e 120 caracteres).',
       locationVerified: false,
-      distanceKm: metrics.distanceKm,
-      isWithinDeliveryRadius: metrics.isWithinDeliveryRadius ?? true,
     };
   }
 
-  const geoLatitude = resolved.latitude;
-  const geoLongitude = resolved.longitude;
-  const geoPrecision = resolved.precisao;
-
-  // Quem decide se o endereço está dentro da área de entrega é o ENDEREÇO DIGITADO (posição encontrada pelo servidor)
-  const geoMetrics = await computeCustomerServerMetrics(supabase, geoLatitude, geoLongitude);
-
-  // Se o endereço digitado estiver fora da área de entrega, recuse como hoje (mesmo que o alfinete esteja dentro)
-  if (geoMetrics.isWithinDeliveryRadius === false) {
-    const distLabel = geoMetrics.distanceKm !== undefined ? ` (${geoMetrics.distanceKm} km do depósito)` : '';
+  if (numero.length < 1 || numero.length > 20) {
     return {
-      error: `Endereço fora da área de entrega${distLabel}.`,
+      error: 'Informe o número (entre 1 e 20 caracteres).',
       locationVerified: false,
-      distanceKm: geoMetrics.distanceKm,
-      isWithinDeliveryRadius: false,
     };
   }
 
-  let finalLat = geoLatitude;
-  let finalLng = geoLongitude;
-  let pinOffsetM = 0;
-  let locationVerified = geoPrecision !== 'aproximada';
-
-  if (hasBrowserPin) {
-    const pinLat = Number(input.pinLatitude);
-    const pinLng = Number(input.pinLongitude);
-    pinOffsetM = haversineMeters(geoLatitude, geoLongitude, pinLat, pinLng);
-
-    finalLat = pinLat;
-    finalLng = pinLng;
-
-    const isPinTooFar =
-      (geoPrecision === 'exata' && pinOffsetM > 300) ||
-      (geoPrecision === 'rua' && pinOffsetM > 800);
-
-    // Se o alfinete vier longe do endereço digitado (>300 m exata ou >800 m rua),
-    // aceite o cadastro/alteração, grave as coordenadas do alfinete, mas marque location_verified = false
-    locationVerified = isPinTooFar ? false : geoPrecision !== 'aproximada';
+  if (complemento.length > 80) {
+    return {
+      error: 'O complemento deve ter no máximo 80 caracteres.',
+      locationVerified: false,
+    };
   }
+
+  if (referencia.length > 120) {
+    return {
+      error: 'O ponto de referência deve ter no máximo 120 caracteres.',
+      locationVerified: false,
+    };
+  }
+
+  if (rawCep.length > 0 && cepDigits.length !== 8) {
+    return {
+      error: 'CEP inválido. Digite os 8 números do CEP.',
+      locationVerified: false,
+    };
+  }
+
+  let activeAreas = input.activeAreas;
+  if (!activeAreas) {
+    const { data: areasRows, error: areasErr } = await supabase
+      .from('delivery_areas')
+      .select('*')
+      .eq('active', true);
+
+    if (areasErr) {
+      return {
+        error: areasErr.message,
+        locationVerified: false,
+      };
+    }
+    activeAreas = (areasRows || []).map(deliveryAreaFromDB);
+  }
+
+  const rawAreaId = String(input.deliveryAreaId || '').trim();
+  const rawNeighborhood = String(input.neighborhood || '').trim();
+
+  let matchedArea: DeliveryArea | undefined;
+  if (rawAreaId) {
+    matchedArea = activeAreas.find((a) => a.active !== false && a.id === rawAreaId);
+  }
+  if (!matchedArea && rawNeighborhood) {
+    matchedArea = findMatchingActiveDeliveryArea(activeAreas, rawNeighborhood);
+  }
+
+  if (!matchedArea || matchedArea.active === false) {
+    return {
+      error: 'Escolha um bairro da lista de entrega',
+      locationVerified: false,
+    };
+  }
+
+  const formattedCep =
+    cepDigits.length === 8 ? `${cepDigits.slice(0, 5)}-${cepDigits.slice(5)}` : undefined;
 
   return {
-    latitude: finalLat,
-    longitude: finalLng,
-    geoLatitude,
-    geoLongitude,
-    geoPrecision,
-    pinOffsetM,
-    locationVerified,
-    distanceKm: geoMetrics.distanceKm,
-    isWithinDeliveryRadius: geoMetrics.isWithinDeliveryRadius,
+    area: matchedArea,
+    deliveryAreaId: matchedArea.id,
+    neighborhood: matchedArea.name,
+    address: rua,
+    number: numero,
+    complement: complemento || undefined,
+    reference: referencia || undefined,
+    cep: formattedCep,
+    latitude: undefined,
+    longitude: undefined,
+    geoLatitude: undefined,
+    geoLongitude: undefined,
+    geoPrecision: undefined,
+    pinOffsetM: undefined,
+    locationVerified: true,
+    distanceKm: undefined,
+    isWithinDeliveryRadius: true,
   };
 }
 
@@ -1014,107 +1031,9 @@ function customerFromDB(row: any): CustomerProfile {
 }
 
 async function ensureLegacyCustomerGeocoded(
-  supabase: SupabaseClient,
+  _supabase: SupabaseClient,
   custRow: any
 ): Promise<{ customer: CustomerProfile; pinRejectedError?: string }> {
-  if (custRow.geo_latitude !== null && custRow.geo_latitude !== undefined) {
-    return { customer: customerFromDB(custRow) };
-  }
-
-  const hasAddress = Boolean(
-    (custRow.address && String(custRow.address).trim()) ||
-      (custRow.cep && String(custRow.cep).replace(/\D/g, '').length === 8)
-  );
-  if (!hasAddress) {
-    return { customer: customerFromDB(custRow) };
-  }
-
-  const existingPinLat =
-    custRow.latitude !== null && custRow.latitude !== undefined && !Number.isNaN(Number(custRow.latitude))
-      ? Number(custRow.latitude)
-      : undefined;
-  const existingPinLng =
-    custRow.longitude !== null && custRow.longitude !== undefined && !Number.isNaN(Number(custRow.longitude))
-      ? Number(custRow.longitude)
-      : undefined;
-
-  const validated = await resolveAndValidateCustomerAddress(supabase, {
-    address: custRow.address,
-    number: custRow.number,
-    neighborhood: custRow.neighborhood,
-    city: custRow.city,
-    state: custRow.state,
-    cep: custRow.cep,
-    pinLatitude: existingPinLat,
-    pinLongitude: existingPinLng,
-  });
-
-  if (validated.error) {
-    // Legacy customer had a pin far from their typed address: reset their coordinates to the geocoded address and mark location_verified = false
-    const fallbackGeo = await resolveAndValidateCustomerAddress(supabase, {
-      address: custRow.address,
-      number: custRow.number,
-      neighborhood: custRow.neighborhood,
-      city: custRow.city,
-      state: custRow.state,
-      cep: custRow.cep,
-    });
-
-    if (fallbackGeo.geoLatitude !== undefined && fallbackGeo.geoLongitude !== undefined) {
-      const { data: updatedRow, error: updErr } = await supabase
-        .from('customers')
-        .update({
-          latitude: fallbackGeo.latitude ?? null,
-          longitude: fallbackGeo.longitude ?? null,
-          geo_latitude: fallbackGeo.geoLatitude,
-          geo_longitude: fallbackGeo.geoLongitude,
-          geo_precision: fallbackGeo.geoPrecision ?? null,
-          pin_offset_m: 0,
-          location_verified: false,
-          distance_km: fallbackGeo.distanceKm ?? null,
-          is_within_delivery_radius: fallbackGeo.isWithinDeliveryRadius ?? null,
-        })
-        .eq('id', custRow.id)
-        .select('*')
-        .maybeSingle();
-
-      if (!updErr && updatedRow) {
-        return {
-          customer: customerFromDB(updatedRow),
-          pinRejectedError: validated.error,
-        };
-      }
-    }
-
-    return {
-      customer: customerFromDB({ ...custRow, location_verified: false }),
-      pinRejectedError: validated.error,
-    };
-  }
-
-  if (validated.geoLatitude !== undefined && validated.geoLongitude !== undefined) {
-    const { data: updatedRow, error: updErr } = await supabase
-      .from('customers')
-      .update({
-        latitude: validated.latitude ?? null,
-        longitude: validated.longitude ?? null,
-        geo_latitude: validated.geoLatitude,
-        geo_longitude: validated.geoLongitude,
-        geo_precision: validated.geoPrecision ?? null,
-        pin_offset_m: validated.pinOffsetM ?? 0,
-        location_verified: validated.locationVerified,
-        distance_km: validated.distanceKm ?? null,
-        is_within_delivery_radius: validated.isWithinDeliveryRadius ?? null,
-      })
-      .eq('id', custRow.id)
-      .select('*')
-      .maybeSingle();
-
-    if (!updErr && updatedRow) {
-      return { customer: customerFromDB(updatedRow) };
-    }
-  }
-
   return { customer: customerFromDB(custRow) };
 }
 
@@ -1417,6 +1336,7 @@ function sanitizePublicSettings(settings: StoreSettings): StoreSettings {
   delete (clean as any).supabaseUrl;
   delete (clean as any).supabaseAnonKey;
   delete (clean as any).supabaseSecretKey;
+  clean.deliveryModel = 'neighborhoods';
 
   // Validate showOutOfStock (boolean, default false)
   clean.showOutOfStock = typeof (settings as any)?.showOutOfStock === 'boolean'
@@ -2541,12 +2461,11 @@ export function createApp(): express.Express {
       address,
       number,
       neighborhood,
+      deliveryAreaId,
       complement,
       reference,
       city,
       state,
-      latitude,
-      longitude,
       guestOrderId,
       guestToken,
     } = req.body || {};
@@ -2622,15 +2541,6 @@ export function createApp(): express.Express {
       const passwordHash = await hashPassword(password);
       const customerId = `cust-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
 
-      const parsedLat =
-        latitude !== undefined && latitude !== null && !Number.isNaN(Number(latitude))
-          ? Number(latitude)
-          : undefined;
-      const parsedLng =
-        longitude !== undefined && longitude !== null && !Number.isNaN(Number(longitude))
-          ? Number(longitude)
-          : undefined;
-
       const trimmedAddress = String(address || '').trim();
       const trimmedNumber = String(number || '').trim();
       const trimmedNeighborhood = String(neighborhood || '').trim();
@@ -2646,11 +2556,12 @@ export function createApp(): express.Express {
           address: trimmedAddress,
           number: trimmedNumber,
           neighborhood: trimmedNeighborhood,
+          deliveryAreaId: deliveryAreaId ? String(deliveryAreaId).trim() : undefined,
+          complement: complement ? String(complement) : undefined,
+          reference: reference ? String(reference) : undefined,
           city,
           state,
           cep,
-          pinLatitude: parsedLat,
-          pinLongitude: parsedLng,
         });
 
         if (geoValidation.error) {
@@ -2694,23 +2605,23 @@ export function createApp(): express.Express {
         name: name.trim(),
         email: cleanEmail,
         phone: String(phone).trim(),
-        address: isPickupPlaceholder ? '' : trimmedAddress,
-        number: isPickupPlaceholder ? '' : trimmedNumber,
-        neighborhood: isPickupPlaceholder ? '' : trimmedNeighborhood,
-        complement: complement ? complement.trim() : undefined,
-        reference: reference ? reference.trim() : undefined,
-        cep: cep ? cep.trim() : undefined,
+        address: isPickupPlaceholder ? '' : (geoValidation.address ?? trimmedAddress),
+        number: isPickupPlaceholder ? '' : (geoValidation.number ?? trimmedNumber),
+        neighborhood: isPickupPlaceholder ? '' : (geoValidation.neighborhood ?? trimmedNeighborhood),
+        complement: isPickupPlaceholder ? (complement ? String(complement).trim() : undefined) : geoValidation.complement,
+        reference: isPickupPlaceholder ? (reference ? String(reference).trim() : undefined) : geoValidation.reference,
+        cep: isPickupPlaceholder ? (cep ? String(cep).trim() : undefined) : geoValidation.cep,
         city: city ? city.trim() : undefined,
         state: state ? state.trim() : undefined,
-        latitude: geoValidation.latitude,
-        longitude: geoValidation.longitude,
-        geoLatitude: geoValidation.geoLatitude,
-        geoLongitude: geoValidation.geoLongitude,
-        geoPrecision: geoValidation.geoPrecision,
-        pinOffsetM: geoValidation.pinOffsetM,
+        latitude: undefined,
+        longitude: undefined,
+        geoLatitude: undefined,
+        geoLongitude: undefined,
+        geoPrecision: undefined,
+        pinOffsetM: undefined,
         locationVerified: geoValidation.locationVerified,
-        distanceKm: geoValidation.distanceKm,
-        isWithinDeliveryRadius: geoValidation.isWithinDeliveryRadius,
+        distanceKm: undefined,
+        isWithinDeliveryRadius: true,
         createdAt: new Date().toISOString(),
         totalOrdersCount: initialOrdersCount,
         totalSpent: initialTotalSpent,
@@ -2909,46 +2820,23 @@ export function createApp(): express.Express {
     const nextAddress = body.address !== undefined ? String(body.address).trim() : (existing.address || '');
     const nextNumber = body.number !== undefined ? String(body.number).trim() : (existing.number || '');
     const nextNeighborhood = body.neighborhood !== undefined ? String(body.neighborhood).trim() : (existing.neighborhood || '');
+    const nextDeliveryAreaId = body.deliveryAreaId !== undefined ? String(body.deliveryAreaId).trim() : undefined;
+    const nextComplement = body.complement !== undefined ? String(body.complement).trim() : (existing.complement || '');
+    const nextReference = body.reference !== undefined ? String(body.reference).trim() : (existing.reference || '');
     const nextCep = body.cep !== undefined ? String(body.cep).trim() : (existing.cep || '');
     const nextCity = body.city !== undefined ? String(body.city).trim() : (existing.city || '');
     const nextState = body.state !== undefined ? String(body.state).trim() : (existing.state || '');
-
-    const hasIncomingPin =
-      body.latitude !== undefined &&
-      body.latitude !== null &&
-      !Number.isNaN(Number(body.latitude)) &&
-      body.longitude !== undefined &&
-      body.longitude !== null &&
-      !Number.isNaN(Number(body.longitude));
-
-    const addressTextChanged =
-      nextAddress !== (existing.address || '') ||
-      nextNumber !== (existing.number || '') ||
-      nextNeighborhood !== (existing.neighborhood || '') ||
-      nextCep.replace(/\D/g, '') !== String(existing.cep || '').replace(/\D/g, '') ||
-      nextCity !== (existing.city || '') ||
-      nextState !== (existing.state || '');
-
-    const pinLat = hasIncomingPin
-      ? Number(body.latitude)
-      : !addressTextChanged && existing.latitude !== null && existing.latitude !== undefined
-      ? Number(existing.latitude)
-      : undefined;
-    const pinLng = hasIncomingPin
-      ? Number(body.longitude)
-      : !addressTextChanged && existing.longitude !== null && existing.longitude !== undefined
-      ? Number(existing.longitude)
-      : undefined;
 
     const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
       address: nextAddress,
       number: nextNumber,
       neighborhood: nextNeighborhood,
+      deliveryAreaId: nextDeliveryAreaId,
+      complement: nextComplement,
+      reference: nextReference,
       city: nextCity,
       state: nextState,
       cep: nextCep,
-      pinLatitude: pinLat,
-      pinLongitude: pinLng,
     });
 
     if (geoValidation.error) {
@@ -2957,25 +2845,25 @@ export function createApp(): express.Express {
 
     const updatedProfile: CustomerProfile = {
       ...customerFromDB(existing),
-      name: body.name !== undefined ? body.name : existing.name,
-      phone: body.phone !== undefined ? body.phone : existing.phone,
-      address: nextAddress,
-      number: nextNumber,
-      neighborhood: nextNeighborhood,
-      complement: body.complement !== undefined ? body.complement : existing.complement,
-      reference: body.reference !== undefined ? body.reference : existing.reference,
-      cep: nextCep,
-      city: nextCity,
-      state: nextState,
-      latitude: geoValidation.latitude,
-      longitude: geoValidation.longitude,
-      geoLatitude: geoValidation.geoLatitude,
-      geoLongitude: geoValidation.geoLongitude,
-      geoPrecision: geoValidation.geoPrecision,
-      pinOffsetM: geoValidation.pinOffsetM,
+      name: body.name !== undefined ? String(body.name).trim() : existing.name,
+      phone: body.phone !== undefined ? String(body.phone).trim() : existing.phone,
+      address: geoValidation.address ?? nextAddress,
+      number: geoValidation.number ?? nextNumber,
+      neighborhood: geoValidation.neighborhood ?? nextNeighborhood,
+      complement: geoValidation.complement,
+      reference: geoValidation.reference,
+      cep: geoValidation.cep,
+      city: nextCity || undefined,
+      state: nextState || undefined,
+      latitude: undefined,
+      longitude: undefined,
+      geoLatitude: undefined,
+      geoLongitude: undefined,
+      geoPrecision: undefined,
+      pinOffsetM: undefined,
       locationVerified: geoValidation.locationVerified,
-      distanceKm: geoValidation.distanceKm,
-      isWithinDeliveryRadius: geoValidation.isWithinDeliveryRadius,
+      distanceKm: undefined,
+      isWithinDeliveryRadius: true,
     };
 
     const updateDBData = customerToDB(updatedProfile, newPasswordHash);
@@ -2996,7 +2884,7 @@ export function createApp(): express.Express {
 
   // ---------------------------------------------------------------------------
   // CUSTOMER DELIVERY QUOTE: GET /customer/delivery-quote (Protected by requireCustomer)
-  // Calculates distance, radius check, and delivery fee on the server
+  // Calculates neighborhood delivery fee and estimated time on the server
   // ---------------------------------------------------------------------------
   router.get('/customer/delivery-quote', requireCustomer, async (req, res) => {
     const customerId = (req as any).customerId;
@@ -3012,72 +2900,34 @@ export function createApp(): express.Express {
     if (custRes.error || !custRes.data) {
       return res.status(404).json({ error: 'Cliente não encontrado.' });
     }
+    if (areasRes.error) return res.status(500).json({ error: areasRes.error.message });
+    if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
 
-    const { customer: dbCustomer } = await ensureLegacyCustomerGeocoded(supabase, custRes.data);
-    const dbAreas = (areasRes.data || []).map(deliveryAreaFromDB);
+    const dbCustomer = customerFromDB(custRes.data);
+    const dbAreas = sortDeliveryAreasAlphabetically((areasRes.data || []).map(deliveryAreaFromDB));
     const dbSettings: StoreSettings = settingsRes.data?.data
       ? sanitizePublicSettings(settingsRes.data.data)
       : initialSettings;
 
-    const maxRadiusKm = Number(dbSettings.deliveryRadiusKm) || 5;
-    let distanceKm: number | null = null;
-    let isWithinDeliveryRadius = true;
+    const requestedAreaId = String(req.query.deliveryAreaId || '').trim();
+    const requestedNh = String(req.query.neighborhood || dbCustomer.neighborhood || '').trim();
 
-    const quoteRefLat = dbCustomer.geoLatitude ?? dbCustomer.latitude;
-    const quoteRefLng = dbCustomer.geoLongitude ?? dbCustomer.longitude;
-
-    if (
-      quoteRefLat !== undefined &&
-      quoteRefLat !== null &&
-      quoteRefLng !== undefined &&
-      quoteRefLng !== null &&
-      dbSettings.storeLatitude !== undefined &&
-      dbSettings.storeLatitude !== null &&
-      dbSettings.storeLongitude !== undefined &&
-      dbSettings.storeLongitude !== null
-    ) {
-      distanceKm = haversineKm(
-        Number(dbSettings.storeLatitude),
-        Number(dbSettings.storeLongitude),
-        Number(quoteRefLat),
-        Number(quoteRefLng)
-      );
-      isWithinDeliveryRadius = distanceKm <= maxRadiusKm;
-
-      // Sync customer's stored distance if outdated
-      if (
-        dbCustomer.distanceKm !== distanceKm ||
-        dbCustomer.isWithinDeliveryRadius !== isWithinDeliveryRadius
-      ) {
-        await supabase
-          .from('customers')
-          .update({
-            distance_km: distanceKm,
-            is_within_delivery_radius: isWithinDeliveryRadius,
-          })
-          .eq('id', customerId);
-      }
+    let matchedArea: DeliveryArea | undefined;
+    if (requestedAreaId) {
+      matchedArea = dbAreas.find((a) => a.active !== false && a.id === requestedAreaId);
+    }
+    if (!matchedArea && requestedNh) {
+      matchedArea = findMatchingActiveDeliveryArea(dbAreas, requestedNh);
     }
 
-    const requestedNh = String(req.query.neighborhood || dbCustomer.neighborhood || '')
-      .toLowerCase()
-      .trim();
-    const matchedArea = dbAreas.find((a) => a.active && a.name.toLowerCase().trim() === requestedNh);
-
-    let rawDeliveryFee = 0;
-    if (matchedArea) {
-      rawDeliveryFee = matchedArea.fee;
-    } else {
-      rawDeliveryFee = Number(dbSettings.deliveryFee) || 5.0;
-      if (dbSettings.pricePerKm && distanceKm !== null && distanceKm > 1) {
-        rawDeliveryFee += (distanceKm - 1) * Number(dbSettings.pricePerKm);
-      }
-    }
-    rawDeliveryFee = Math.round(rawDeliveryFee * 100) / 100;
+    const rawDeliveryFee = matchedArea
+      ? Math.round(Number(matchedArea.fee) * 100) / 100
+      : 0;
 
     const subtotalParam = req.query.subtotal !== undefined ? Number(req.query.subtotal) : null;
     let deliveryFee = rawDeliveryFee;
     if (
+      matchedArea &&
       subtotalParam !== null &&
       !Number.isNaN(subtotalParam) &&
       dbSettings.freeDeliveryThreshold &&
@@ -3087,14 +2937,18 @@ export function createApp(): express.Express {
     }
 
     return res.json({
-      distanceKm,
-      isWithinDeliveryRadius,
-      deliveryRadiusKm: maxRadiusKm,
+      deliveryAreaId: matchedArea?.id ?? null,
+      neighborhood: matchedArea?.name ?? null,
+      estimatedTime: matchedArea?.estimatedTime ?? dbSettings.estimatedDeliveryTime,
+      isValidArea: Boolean(matchedArea),
+      distanceKm: null,
+      isWithinDeliveryRadius: Boolean(matchedArea),
+      deliveryRadiusKm: Number(dbSettings.deliveryRadiusKm) || 5,
       deliveryFee,
       rawDeliveryFee,
       freeDeliveryThreshold: Number(dbSettings.freeDeliveryThreshold) || 0,
-      latitude: dbCustomer.latitude ?? null,
-      longitude: dbCustomer.longitude ?? null,
+      latitude: null,
+      longitude: null,
     });
   });
 
@@ -3346,7 +3200,7 @@ export function createApp(): express.Express {
       if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
 
       const allProductRows = mapProductsFromDB(prodRes.data, imageMetaMap);
-      const deliveryAreas = (areasRes.data || []).map(deliveryAreaFromDB);
+      const deliveryAreas = sortDeliveryAreasAlphabetically((areasRes.data || []).map(deliveryAreaFromDB));
 
       let settings = sanitizePublicSettings(initialSettings);
       let shouldPersistSettings = false;
@@ -3450,7 +3304,7 @@ export function createApp(): express.Express {
       return res.json({
         products: productsWithCombos,
         orders: (orderRes.data || []).map((r: any) => orderFromDB(r, customerById)),
-        deliveryAreas: (areasRes.data || []).map(deliveryAreaFromDB),
+        deliveryAreas: sortDeliveryAreasAlphabetically((areasRes.data || []).map(deliveryAreaFromDB)),
         customers,
         coupons: (couponsRes.data || []).map(couponFromDB),
         settings,
@@ -4783,25 +4637,50 @@ export function createApp(): express.Express {
 
     const { data, error } = await supabase.from('delivery_areas').select('*').eq('active', true);
     if (error) return res.status(500).json({ error: error.message });
-    res.json((data || []).map(deliveryAreaFromDB));
+    res.json(sortDeliveryAreasAlphabetically((data || []).map(deliveryAreaFromDB)));
   });
 
   router.post('/delivery-areas', requireAdmin, async (req, res) => {
     const area = req.body as DeliveryArea;
-    if (!area || !area.id || !area.name) {
+    const cleanName = String(area?.name || '').trim();
+    if (!area || !area.id || !cleanName) {
       return res.status(400).json({ error: 'Dados da área inválidos.' });
     }
 
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
-    const { error } = await supabase.from('delivery_areas').upsert(deliveryAreaToDB(area));
+    const { data: existingRows, error: checkErr } = await supabase
+      .from('delivery_areas')
+      .select('id, name');
+    if (checkErr) {
+      console.error('[Supabase Error] delivery_areas duplicate check:', checkErr.message);
+      return res.status(500).json({ error: checkErr.message });
+    }
+
+    const targetNorm = normalizeNeighborhoodName(cleanName);
+    const duplicate = (existingRows || []).find(
+      (r: any) => r.id !== area.id && normalizeNeighborhoodName(r.name) === targetNorm
+    );
+    if (duplicate) {
+      return res.status(400).json({ error: 'Já existe um bairro cadastrado com este nome.' });
+    }
+
+    const normalizedArea: DeliveryArea = {
+      ...area,
+      name: cleanName,
+      fee: Math.max(0, Math.round((Number(area.fee) || 0) * 100) / 100),
+      estimatedTime: String(area.estimatedTime || '30-45 min').trim() || '30-45 min',
+      active: area.active !== false,
+    };
+
+    const { error } = await supabase.from('delivery_areas').upsert(deliveryAreaToDB(normalizedArea));
     if (error) {
       console.error('[Supabase Error] delivery_areas upsert:', error.message);
       return res.status(500).json({ error: error.message });
     }
 
-    res.status(201).json(area);
+    res.status(201).json(normalizedArea);
   });
 
   router.put('/delivery-areas/:id', requireAdmin, async (req, res) => {
@@ -4809,7 +4688,35 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
-    const updated: DeliveryArea = { ...req.body, id };
+    const cleanName = String(req.body?.name || '').trim();
+    if (!cleanName) {
+      return res.status(400).json({ error: 'O nome do bairro é obrigatório.' });
+    }
+
+    const { data: existingRows, error: checkErr } = await supabase
+      .from('delivery_areas')
+      .select('id, name');
+    if (checkErr) {
+      console.error('[Supabase Error] delivery_areas duplicate check:', checkErr.message);
+      return res.status(500).json({ error: checkErr.message });
+    }
+
+    const targetNorm = normalizeNeighborhoodName(cleanName);
+    const duplicate = (existingRows || []).find(
+      (r: any) => r.id !== id && normalizeNeighborhoodName(r.name) === targetNorm
+    );
+    if (duplicate) {
+      return res.status(400).json({ error: 'Já existe um bairro cadastrado com este nome.' });
+    }
+
+    const updated: DeliveryArea = {
+      ...req.body,
+      id,
+      name: cleanName,
+      fee: Math.max(0, Math.round((Number(req.body?.fee) || 0) * 100) / 100),
+      estimatedTime: String(req.body?.estimatedTime || '30-45 min').trim() || '30-45 min',
+      active: req.body?.active !== false,
+    };
     const { error } = await supabase.from('delivery_areas').upsert(deliveryAreaToDB(updated));
     if (error) {
       console.error('[Supabase Error] delivery_areas update:', error.message);
@@ -4846,7 +4753,7 @@ export function createApp(): express.Express {
   });
 
   router.post('/customers', requireAdmin, async (req, res) => {
-    const cust = req.body as CustomerProfile;
+    const cust = req.body as CustomerProfile & { deliveryAreaId?: string };
     if (!cust || !cust.name || !cust.phone) {
       return res.status(400).json({ error: 'Nome e telefone são obrigatórios.' });
     }
@@ -4854,24 +4761,16 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
 
-    const parsedLat =
-      cust.latitude !== undefined && cust.latitude !== null && !Number.isNaN(Number(cust.latitude))
-        ? Number(cust.latitude)
-        : undefined;
-    const parsedLng =
-      cust.longitude !== undefined && cust.longitude !== null && !Number.isNaN(Number(cust.longitude))
-        ? Number(cust.longitude)
-        : undefined;
-
     const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
       address: cust.address,
       number: cust.number,
       neighborhood: cust.neighborhood,
+      deliveryAreaId: cust.deliveryAreaId,
+      complement: cust.complement,
+      reference: cust.reference,
       city: cust.city,
       state: cust.state,
       cep: cust.cep,
-      pinLatitude: parsedLat,
-      pinLongitude: parsedLng,
     });
 
     if (geoValidation.error) {
@@ -4881,15 +4780,23 @@ export function createApp(): express.Express {
     const newCust: CustomerProfile = {
       ...cust,
       id: cust.id || `cust-${Date.now()}`,
-      latitude: geoValidation.latitude,
-      longitude: geoValidation.longitude,
-      geoLatitude: geoValidation.geoLatitude,
-      geoLongitude: geoValidation.geoLongitude,
-      geoPrecision: geoValidation.geoPrecision,
-      pinOffsetM: geoValidation.pinOffsetM,
+      name: String(cust.name).trim(),
+      phone: String(cust.phone).trim(),
+      address: geoValidation.address ?? String(cust.address || '').trim(),
+      number: geoValidation.number ?? String(cust.number || '').trim(),
+      neighborhood: geoValidation.neighborhood ?? String(cust.neighborhood || '').trim(),
+      complement: geoValidation.complement,
+      reference: geoValidation.reference,
+      cep: geoValidation.cep,
+      latitude: undefined,
+      longitude: undefined,
+      geoLatitude: undefined,
+      geoLongitude: undefined,
+      geoPrecision: undefined,
+      pinOffsetM: undefined,
       locationVerified: geoValidation.locationVerified,
-      distanceKm: geoValidation.distanceKm,
-      isWithinDeliveryRadius: geoValidation.isWithinDeliveryRadius,
+      distanceKm: undefined,
+      isWithinDeliveryRadius: true,
       createdAt: new Date().toISOString(),
       totalOrdersCount: 0,
       totalSpent: 0,
@@ -4924,46 +4831,23 @@ export function createApp(): express.Express {
     const nextAddress = body.address !== undefined ? String(body.address).trim() : existingMapped.address;
     const nextNumber = body.number !== undefined ? String(body.number).trim() : existingMapped.number;
     const nextNeighborhood = body.neighborhood !== undefined ? String(body.neighborhood).trim() : existingMapped.neighborhood;
+    const nextDeliveryAreaId = body.deliveryAreaId !== undefined ? String(body.deliveryAreaId).trim() : undefined;
+    const nextComplement = body.complement !== undefined ? String(body.complement).trim() : (existingMapped.complement || '');
+    const nextReference = body.reference !== undefined ? String(body.reference).trim() : (existingMapped.reference || '');
     const nextCep = body.cep !== undefined ? String(body.cep).trim() : (existingMapped.cep || '');
     const nextCity = body.city !== undefined ? String(body.city).trim() : (existingMapped.city || '');
     const nextState = body.state !== undefined ? String(body.state).trim() : (existingMapped.state || '');
-
-    const hasIncomingPin =
-      body.latitude !== undefined &&
-      body.latitude !== null &&
-      !Number.isNaN(Number(body.latitude)) &&
-      body.longitude !== undefined &&
-      body.longitude !== null &&
-      !Number.isNaN(Number(body.longitude));
-
-    const addressTextChanged =
-      nextAddress !== existingMapped.address ||
-      nextNumber !== existingMapped.number ||
-      nextNeighborhood !== existingMapped.neighborhood ||
-      nextCep.replace(/\D/g, '') !== String(existingMapped.cep || '').replace(/\D/g, '') ||
-      nextCity !== (existingMapped.city || '') ||
-      nextState !== (existingMapped.state || '');
-
-    const pinLat = hasIncomingPin
-      ? Number(body.latitude)
-      : !addressTextChanged && existingMapped.latitude !== undefined
-      ? existingMapped.latitude
-      : undefined;
-    const pinLng = hasIncomingPin
-      ? Number(body.longitude)
-      : !addressTextChanged && existingMapped.longitude !== undefined
-      ? existingMapped.longitude
-      : undefined;
 
     const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
       address: nextAddress,
       number: nextNumber,
       neighborhood: nextNeighborhood,
+      deliveryAreaId: nextDeliveryAreaId,
+      complement: nextComplement,
+      reference: nextReference,
       city: nextCity,
       state: nextState,
       cep: nextCep,
-      pinLatitude: pinLat,
-      pinLongitude: pinLng,
     });
 
     if (geoValidation.error) {
@@ -4974,21 +4858,25 @@ export function createApp(): express.Express {
       ...existingMapped,
       ...body,
       id,
-      address: nextAddress,
-      number: nextNumber,
-      neighborhood: nextNeighborhood,
-      cep: nextCep || undefined,
+      name: body.name !== undefined ? String(body.name).trim() : existingMapped.name,
+      phone: body.phone !== undefined ? String(body.phone).trim() : existingMapped.phone,
+      address: geoValidation.address ?? nextAddress,
+      number: geoValidation.number ?? nextNumber,
+      neighborhood: geoValidation.neighborhood ?? nextNeighborhood,
+      complement: geoValidation.complement,
+      reference: geoValidation.reference,
+      cep: geoValidation.cep,
       city: nextCity || undefined,
       state: nextState || undefined,
-      latitude: geoValidation.latitude,
-      longitude: geoValidation.longitude,
-      geoLatitude: geoValidation.geoLatitude,
-      geoLongitude: geoValidation.geoLongitude,
-      geoPrecision: geoValidation.geoPrecision,
-      pinOffsetM: geoValidation.pinOffsetM,
+      latitude: undefined,
+      longitude: undefined,
+      geoLatitude: undefined,
+      geoLongitude: undefined,
+      geoPrecision: undefined,
+      pinOffsetM: undefined,
       locationVerified: geoValidation.locationVerified,
-      distanceKm: geoValidation.distanceKm,
-      isWithinDeliveryRadius: geoValidation.isWithinDeliveryRadius,
+      distanceKm: undefined,
+      isWithinDeliveryRadius: true,
     };
     const { data: saved, error } = await supabase
       .from('customers')
@@ -5106,15 +4994,13 @@ export function createApp(): express.Express {
     if (areasRes.error) return res.status(500).json({ error: areasRes.error.message });
     if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
     const dbProducts = mapProductsFromDB(prodRes.data);
-    const dbAreas = (areasRes.data || []).map(deliveryAreaFromDB);
+    const dbAreas = sortDeliveryAreasAlphabetically((areasRes.data || []).map(deliveryAreaFromDB));
     const dbSettings = settingsRes.data?.data ? sanitizePublicSettings(settingsRes.data.data) : initialSettings;
     reconcileSettingsCategoriesAndOrders(dbSettings, dbProducts);
 
-    const maxRadiusKm = Number(dbSettings.deliveryRadiusKm) || 5;
     let customerId: string | undefined = undefined;
     let customerData: any = null;
-    let serverDistanceKm: number | undefined = undefined;
-    let serverIsWithinRadius: boolean | undefined = undefined;
+    let validatedDeliveryArea: DeliveryArea | undefined = undefined;
     let guestToken: string | undefined = undefined;
     let guestPhoneDigitsForRateLimit = '';
     const clientIpForRateLimit = getClientIp(req);
@@ -5144,154 +5030,118 @@ export function createApp(): express.Express {
         return res.status(401).json({ error: 'Cliente não encontrado. Faça login novamente.' });
       }
 
-      let dbCustomer = customerFromDB(custRow);
+      const dbCustomer = customerFromDB(custRow);
       const isDeliveryOrder = rawOrder.deliveryType !== 'retirada';
       const customAddr =
         isDeliveryOrder && rawOrder.deliveryAddress && typeof rawOrder.deliveryAddress === 'object'
           ? rawOrder.deliveryAddress
           : null;
 
-      if (customAddr) {
-        const cAddress = String(customAddr.address || '').trim();
-        const cNumber = String(customAddr.number || '').trim();
-        const cNeighborhood = String(customAddr.neighborhood || '').trim();
-        const cCep = customAddr.cep ? String(customAddr.cep).trim() : undefined;
+      if (!isDeliveryOrder) {
+        customerData = {
+          name: dbCustomer.name,
+          phone: dbCustomer.phone,
+          email: dbCustomer.email || undefined,
+          address: 'Retirada no Depósito',
+          number: 'S/N',
+          neighborhood: 'Depósito',
+          locationVerified: true,
+          location_verified: true,
+        };
+      } else if (customAddr) {
         const cCity = customAddr.city ? String(customAddr.city).trim() : undefined;
         const cState = customAddr.state ? String(customAddr.state).trim() : undefined;
-        const cComplement = customAddr.complement ? String(customAddr.complement).trim() : undefined;
-        const cReference = customAddr.reference ? String(customAddr.reference).trim() : undefined;
-
-        if (!cAddress || !cNumber || !cNeighborhood) {
-          return res.status(400).json({
-            error: 'Preencha rua, número e bairro do endereço de entrega.',
-          });
-        }
-
-        const parsedPinLat =
-          customAddr.latitude !== undefined &&
-          customAddr.latitude !== null &&
-          !Number.isNaN(Number(customAddr.latitude))
-            ? Number(customAddr.latitude)
-            : undefined;
-        const parsedPinLng =
-          customAddr.longitude !== undefined &&
-          customAddr.longitude !== null &&
-          !Number.isNaN(Number(customAddr.longitude))
-            ? Number(customAddr.longitude)
-            : undefined;
 
         const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
-          address: cAddress,
-          number: cNumber,
-          neighborhood: cNeighborhood,
+          address: customAddr.address,
+          number: customAddr.number,
+          neighborhood: customAddr.neighborhood,
+          deliveryAreaId: customAddr.deliveryAreaId || rawOrder.deliveryAreaId,
+          complement: customAddr.complement,
+          reference: customAddr.reference,
           city: cCity,
           state: cState,
-          cep: cCep,
-          pinLatitude: parsedPinLat,
-          pinLongitude: parsedPinLng,
+          cep: customAddr.cep,
+          activeAreas: dbAreas,
         });
 
-        if (geoValidation.error) {
-          return res.status(400).json({ error: geoValidation.error });
+        if (geoValidation.error || !geoValidation.area) {
+          return res.status(400).json({ error: geoValidation.error || 'Escolha um bairro da lista de entrega' });
         }
 
-        serverDistanceKm = geoValidation.distanceKm;
-        serverIsWithinRadius = geoValidation.isWithinDeliveryRadius;
+        validatedDeliveryArea = geoValidation.area;
+        customerData = {
+          name: dbCustomer.name,
+          phone: dbCustomer.phone,
+          email: dbCustomer.email || undefined,
+          address: geoValidation.address,
+          number: geoValidation.number,
+          neighborhood: geoValidation.area.name,
+          deliveryAreaId: geoValidation.area.id,
+          complement: geoValidation.complement,
+          reference: geoValidation.reference,
+          cep: geoValidation.cep,
+          city: cCity,
+          state: cState,
+          locationVerified: true,
+          location_verified: true,
+          isWithinDeliveryRadius: true,
+        };
+      } else {
+        const selectedAreaId =
+          rawOrder.deliveryAreaId ||
+          rawOrder.customer?.deliveryAreaId ||
+          undefined;
+        const fallbackNeighborhood =
+          dbCustomer.neighborhood ||
+          rawOrder.customer?.neighborhood ||
+          '';
 
-        if (dbAreas.length > 0 && dbSettings.deliveryModel !== 'radius') {
-          const matchedNh = dbAreas.find(
-            (a) => a.active && a.name.toLowerCase().trim() === cNeighborhood.toLowerCase()
-          );
-          if (!matchedNh) {
-            return res.status(400).json({
-              error: `Desculpe! O bairro "${cNeighborhood}" não está na nossa área de entrega atendida.`,
-            });
+        const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
+          address: dbCustomer.address || rawOrder.customer?.address || '',
+          number: dbCustomer.number || rawOrder.customer?.number || '',
+          neighborhood: fallbackNeighborhood,
+          deliveryAreaId: selectedAreaId,
+          complement: dbCustomer.complement || rawOrder.customer?.complement || undefined,
+          reference: dbCustomer.reference || rawOrder.customer?.reference || undefined,
+          city: dbCustomer.city || rawOrder.customer?.city || undefined,
+          state: dbCustomer.state || rawOrder.customer?.state || undefined,
+          cep: dbCustomer.cep || rawOrder.customer?.cep || undefined,
+          activeAreas: dbAreas,
+        });
+
+        if (geoValidation.error || !geoValidation.area) {
+          return res.status(400).json({ error: geoValidation.error || 'Escolha um bairro da lista de entrega' });
+        }
+
+        validatedDeliveryArea = geoValidation.area;
+
+        if (dbCustomer.neighborhood !== geoValidation.area.name) {
+          const { error: syncNhErr } = await supabase
+            .from('customers')
+            .update({ neighborhood: geoValidation.area.name })
+            .eq('id', customerId);
+          if (syncNhErr) {
+            console.warn('[Supabase Warning] sync customer neighborhood on order:', syncNhErr.message);
           }
         }
 
-        const verifiedFlag = Boolean(geoValidation.locationVerified);
         customerData = {
           name: dbCustomer.name,
           phone: dbCustomer.phone,
           email: dbCustomer.email || undefined,
-          address: cAddress,
-          number: cNumber,
-          neighborhood: cNeighborhood,
-          complement: cComplement,
-          reference: cReference,
-          cep: cCep,
-          city: cCity,
-          state: cState,
-          latitude: geoValidation.latitude,
-          longitude: geoValidation.longitude,
-          geoLatitude: geoValidation.geoLatitude,
-          geoLongitude: geoValidation.geoLongitude,
-          geoPrecision: geoValidation.geoPrecision,
-          pinOffsetM: geoValidation.pinOffsetM,
-          locationVerified: verifiedFlag,
-          geo_latitude: geoValidation.geoLatitude ?? null,
-          geo_longitude: geoValidation.geoLongitude ?? null,
-          geo_precision: geoValidation.geoPrecision ?? null,
-          pin_offset_m: geoValidation.pinOffsetM ?? null,
-          location_verified: verifiedFlag,
-          distanceKm: serverDistanceKm,
-          isWithinDeliveryRadius: serverIsWithinRadius,
-        };
-      } else {
-        if (isDeliveryOrder && (custRow.geo_latitude === null || custRow.geo_latitude === undefined)) {
-          const legacyResult = await ensureLegacyCustomerGeocoded(supabase, custRow);
-          dbCustomer = legacyResult.customer;
-        }
-
-        const orderRefLat = dbCustomer.geoLatitude ?? dbCustomer.latitude;
-        const orderRefLng = dbCustomer.geoLongitude ?? dbCustomer.longitude;
-        if (
-          orderRefLat !== undefined &&
-          orderRefLat !== null &&
-          orderRefLng !== undefined &&
-          orderRefLng !== null &&
-          dbSettings.storeLatitude !== undefined &&
-          dbSettings.storeLatitude !== null &&
-          dbSettings.storeLongitude !== undefined &&
-          dbSettings.storeLongitude !== null
-        ) {
-          serverDistanceKm = haversineKm(
-            Number(dbSettings.storeLatitude),
-            Number(dbSettings.storeLongitude),
-            Number(orderRefLat),
-            Number(orderRefLng)
-          );
-          serverIsWithinRadius = serverDistanceKm <= maxRadiusKm;
-        }
-
-        const verifiedFlag = isDeliveryOrder ? Boolean(dbCustomer.locationVerified) : true;
-
-        customerData = {
-          name: dbCustomer.name,
-          phone: dbCustomer.phone,
-          email: dbCustomer.email || undefined,
-          address: isDeliveryOrder ? (dbCustomer.address || rawOrder.customer?.address || '') : 'Retirada no Depósito',
-          number: isDeliveryOrder ? (dbCustomer.number || rawOrder.customer?.number || '') : 'S/N',
-          neighborhood: isDeliveryOrder ? (dbCustomer.neighborhood || rawOrder.customer?.neighborhood || '') : 'Depósito',
-          complement: dbCustomer.complement || rawOrder.customer?.complement || undefined,
-          reference: dbCustomer.reference || rawOrder.customer?.reference || undefined,
-          cep: dbCustomer.cep || rawOrder.customer?.cep || undefined,
+          address: geoValidation.address,
+          number: geoValidation.number,
+          neighborhood: geoValidation.area.name,
+          deliveryAreaId: geoValidation.area.id,
+          complement: geoValidation.complement,
+          reference: geoValidation.reference,
+          cep: geoValidation.cep,
           city: dbCustomer.city || rawOrder.customer?.city || undefined,
           state: dbCustomer.state || rawOrder.customer?.state || undefined,
-          latitude: dbCustomer.latitude,
-          longitude: dbCustomer.longitude,
-          geoLatitude: dbCustomer.geoLatitude,
-          geoLongitude: dbCustomer.geoLongitude,
-          geoPrecision: dbCustomer.geoPrecision,
-          pinOffsetM: dbCustomer.pinOffsetM,
-          locationVerified: verifiedFlag,
-          geo_latitude: dbCustomer.geoLatitude ?? null,
-          geo_longitude: dbCustomer.geoLongitude ?? null,
-          geo_precision: dbCustomer.geoPrecision ?? null,
-          pin_offset_m: dbCustomer.pinOffsetM ?? null,
-          location_verified: verifiedFlag,
-          distanceKm: serverDistanceKm,
-          isWithinDeliveryRadius: serverIsWithinRadius,
+          locationVerified: true,
+          location_verified: true,
+          isWithinDeliveryRadius: true,
         };
       }
     } else if (rawOrder.guest && typeof rawOrder.guest === 'object') {
@@ -5345,89 +5195,42 @@ export function createApp(): express.Express {
       const isDeliveryOrder = rawOrder.deliveryType !== 'retirada';
 
       if (isDeliveryOrder) {
-        const gAddress = String(guestObj.address || '').trim();
-        const gNumber = String(guestObj.number || '').trim();
-        const gNeighborhood = String(guestObj.neighborhood || '').trim();
-        const gCep = guestObj.cep ? String(guestObj.cep).trim() : undefined;
         const gCity = guestObj.city ? String(guestObj.city).trim() : undefined;
         const gState = guestObj.state ? String(guestObj.state).trim() : undefined;
-        const gComplement = guestObj.complement ? String(guestObj.complement).trim() : undefined;
-        const gReference = guestObj.reference ? String(guestObj.reference).trim() : undefined;
-
-        if (!gAddress || !gNumber || !gNeighborhood) {
-          return res.status(400).json({
-            error: 'Preencha rua, número e bairro do endereço de entrega.',
-          });
-        }
-
-        const parsedPinLat =
-          guestObj.latitude !== undefined &&
-          guestObj.latitude !== null &&
-          !Number.isNaN(Number(guestObj.latitude))
-            ? Number(guestObj.latitude)
-            : undefined;
-        const parsedPinLng =
-          guestObj.longitude !== undefined &&
-          guestObj.longitude !== null &&
-          !Number.isNaN(Number(guestObj.longitude))
-            ? Number(guestObj.longitude)
-            : undefined;
 
         const geoValidation = await resolveAndValidateCustomerAddress(supabase, {
-          address: gAddress,
-          number: gNumber,
-          neighborhood: gNeighborhood,
+          address: guestObj.address,
+          number: guestObj.number,
+          neighborhood: guestObj.neighborhood,
+          deliveryAreaId: guestObj.deliveryAreaId || rawOrder.deliveryAreaId,
+          complement: guestObj.complement,
+          reference: guestObj.reference,
           city: gCity,
           state: gState,
-          cep: gCep,
-          pinLatitude: parsedPinLat,
-          pinLongitude: parsedPinLng,
+          cep: guestObj.cep,
+          activeAreas: dbAreas,
         });
 
-        if (geoValidation.error) {
-          return res.status(400).json({ error: geoValidation.error });
+        if (geoValidation.error || !geoValidation.area) {
+          return res.status(400).json({ error: geoValidation.error || 'Escolha um bairro da lista de entrega' });
         }
 
-        serverDistanceKm = geoValidation.distanceKm;
-        serverIsWithinRadius = geoValidation.isWithinDeliveryRadius;
-
-        if (dbAreas.length > 0 && dbSettings.deliveryModel !== 'radius') {
-          const matchedNh = dbAreas.find(
-            (a) => a.active && a.name.toLowerCase().trim() === gNeighborhood.toLowerCase()
-          );
-          if (!matchedNh) {
-            return res.status(400).json({
-              error: `Desculpe! O bairro "${gNeighborhood}" não está na nossa área de entrega atendida.`,
-            });
-          }
-        }
-
-        const verifiedFlag = Boolean(geoValidation.locationVerified);
+        validatedDeliveryArea = geoValidation.area;
         customerData = {
           name: gName,
           phone: gPhoneRaw,
-          address: gAddress,
-          number: gNumber,
-          neighborhood: gNeighborhood,
-          complement: gComplement,
-          reference: gReference,
-          cep: gCep,
+          address: geoValidation.address,
+          number: geoValidation.number,
+          neighborhood: geoValidation.area.name,
+          deliveryAreaId: geoValidation.area.id,
+          complement: geoValidation.complement,
+          reference: geoValidation.reference,
+          cep: geoValidation.cep,
           city: gCity,
           state: gState,
-          latitude: geoValidation.latitude,
-          longitude: geoValidation.longitude,
-          geoLatitude: geoValidation.geoLatitude,
-          geoLongitude: geoValidation.geoLongitude,
-          geoPrecision: geoValidation.geoPrecision,
-          pinOffsetM: geoValidation.pinOffsetM,
-          locationVerified: verifiedFlag,
-          geo_latitude: geoValidation.geoLatitude ?? null,
-          geo_longitude: geoValidation.geoLongitude ?? null,
-          geo_precision: geoValidation.geoPrecision ?? null,
-          pin_offset_m: geoValidation.pinOffsetM ?? null,
-          location_verified: verifiedFlag,
-          distanceKm: serverDistanceKm,
-          isWithinDeliveryRadius: serverIsWithinRadius,
+          locationVerified: true,
+          location_verified: true,
+          isWithinDeliveryRadius: true,
         };
       } else {
         customerData = {
@@ -5654,38 +5457,17 @@ export function createApp(): express.Express {
     const deliveryType = rawOrder.deliveryType === 'retirada' ? 'retirada' : 'delivery';
     let deliveryFee = 0;
 
-    if (deliveryType === 'delivery') {
-      if (effectiveSource !== 'balcao' && !customerData.address?.trim()) {
+    if (deliveryType === 'delivery' && effectiveSource !== 'balcao') {
+      if (!validatedDeliveryArea || validatedDeliveryArea.active === false) {
         return res.status(400).json({
-          error: 'Preencha seu endereço de entrega antes de finalizar o pedido, ou escolha Retirar no Depósito.',
-        });
-      }
-      if (effectiveSource !== 'balcao' && serverDistanceKm !== undefined && serverDistanceKm > maxRadiusKm) {
-        return res.status(400).json({
-          error: `Endereço fora do raio de entrega de ${maxRadiusKm} km. Escolha Retirar no Depósito.`,
+          error: 'Escolha um bairro da lista de entrega',
         });
       }
 
-      const customerNh = (customerData.neighborhood || '').toLowerCase().trim();
-      const matchedArea = dbAreas.find((a) => a.active && a.name.toLowerCase().trim() === customerNh);
+      customerData.neighborhood = validatedDeliveryArea.name;
+      customerData.deliveryAreaId = validatedDeliveryArea.id;
 
-      if (effectiveSource !== 'balcao' && dbAreas.length > 0 && dbSettings.deliveryModel !== 'radius' && !matchedArea) {
-        return res.status(400).json({
-          error: `Desculpe! O bairro "${customerData.neighborhood || ''}" não está na nossa área de entrega atendida.`,
-        });
-      }
-
-      if (matchedArea) {
-        deliveryFee = matchedArea.fee;
-      } else {
-        deliveryFee = dbSettings.deliveryFee || 5.0;
-        if (dbSettings.pricePerKm && serverDistanceKm !== undefined) {
-          if (serverDistanceKm > 1) {
-            deliveryFee += (serverDistanceKm - 1) * dbSettings.pricePerKm;
-          }
-        }
-      }
-      deliveryFee = Math.round(deliveryFee * 100) / 100;
+      deliveryFee = Math.round(Number(validatedDeliveryArea.fee) * 100) / 100;
 
       if (dbSettings.freeDeliveryThreshold && recalculatedSubtotal >= dbSettings.freeDeliveryThreshold) {
         deliveryFee = 0;

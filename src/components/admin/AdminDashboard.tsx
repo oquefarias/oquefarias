@@ -37,6 +37,8 @@ import {
   isProductHiddenFromStore,
   CashSession,
   CashSessionSummary,
+  normalizeNeighborhoodName,
+  sortDeliveryAreasAlphabetically,
 } from '../../types';
 import {
   api,
@@ -47,7 +49,6 @@ import { soundService } from '../../utils/sound';
 import { PrintReceiptModal } from '../PrintReceiptModal';
 import { ProductAddonsModal } from '../ProductAddonsModal';
 import { QRCodeModal } from '../QRCodeModal';
-import { GoogleDeliveryRadiusMap } from './GoogleDeliveryRadiusMap';
 import { CustomerModal } from './CustomerModal';
 import { ImportProductsModal } from './ImportProductsModal';
 import { TablesManager } from './tables/TablesManager';
@@ -64,7 +65,6 @@ import {
 } from './CashSessionModals';
 import { PaymentsHistorySection } from './PaymentsHistorySection';
 import {
-  calculateDistanceKm,
   buildSingleDeliveryRouteUrl,
   buildMultiStopDeliveryRoute,
 } from '../../utils/geo';
@@ -491,6 +491,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Delivery Areas state
   const [isAreaModalOpen, setIsAreaModalOpen] = useState<boolean>(false);
   const [editingArea, setEditingArea] = useState<DeliveryArea | null>(null);
+  const [areaSearch, setAreaSearch] = useState<string>('');
+  const [areaModalError, setAreaModalError] = useState<string>('');
+  const [isSavingArea, setIsSavingArea] = useState<boolean>(false);
   const [areaForm, setAreaForm] = useState<{ id: string; name: string; fee: number; estimatedTime: string; active: boolean }>({
     id: '',
     name: '',
@@ -498,6 +501,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     estimatedTime: '30 a 45 min',
     active: true,
   });
+
+  const sortedFilteredDeliveryAreas = useMemo(() => {
+    const sorted = sortDeliveryAreasAlphabetically(deliveryAreas);
+    if (!areaSearch.trim()) return sorted;
+    const q = normalizeNeighborhoodName(areaSearch);
+    return sorted.filter((a) => normalizeNeighborhoodName(a.name).includes(q));
+  }, [deliveryAreas, areaSearch]);
 
   // Customers state
   const [isCustomerModalOpen, setIsCustomerModalOpen] = useState<boolean>(false);
@@ -737,9 +747,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       return next.length === prev.length ? prev : next;
     });
   }, [localOrders]);
-
-  // Sub-tab for Delivery Areas (Map vs Neighborhoods)
-  const [areaSubTab, setAreaSubTab] = useState<'mapa' | 'bairros'>('mapa');
 
   const [panelError, setPanelError] = useState<string>('');
   const [confirmModal, setConfirmModal] = useState<{
@@ -1344,6 +1351,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Delivery Area handlers
   const handleOpenNewArea = () => {
     setEditingArea(null);
+    setAreaModalError('');
+    setIsSavingArea(false);
     setAreaForm({
       id: `area-${Date.now()}`,
       name: '',
@@ -1356,21 +1365,59 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const handleOpenEditArea = (area: DeliveryArea) => {
     setEditingArea(area);
+    setAreaModalError('');
+    setIsSavingArea(false);
     setAreaForm({ ...area });
     setIsAreaModalOpen(true);
   };
 
   const handleSaveArea = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!areaForm.name.trim()) return;
-    await api.saveDeliveryArea(areaForm);
-    setIsAreaModalOpen(false);
+    setAreaModalError('');
+    const trimmedName = areaForm.name.trim();
+    if (!trimmedName) {
+      setAreaModalError('Informe o nome do bairro.');
+      return;
+    }
+    const targetNorm = normalizeNeighborhoodName(trimmedName);
+    const duplicate = deliveryAreas.find(
+      (a) => a.id !== areaForm.id && normalizeNeighborhoodName(a.name) === targetNorm
+    );
+    if (duplicate) {
+      setAreaModalError(`Já existe um bairro cadastrado com o nome "${duplicate.name}".`);
+      return;
+    }
+
+    setIsSavingArea(true);
+    try {
+      await api.saveDeliveryArea({
+        ...areaForm,
+        name: trimmedName,
+      });
+      setIsSavingArea(false);
+      setIsAreaModalOpen(false);
+    } catch (err: any) {
+      setAreaModalError(err?.message || 'Erro ao salvar bairro.');
+    } finally {
+      setIsSavingArea(false);
+    }
+  };
+
+  const handleToggleAreaActive = async (area: DeliveryArea) => {
+    try {
+      await api.saveDeliveryArea({
+        ...area,
+        active: !area.active,
+      });
+    } catch (err: any) {
+      setPanelError(err?.message || 'Erro ao atualizar status do bairro.');
+    }
   };
 
   const handleDeleteArea = (id: string) => {
     setConfirmModal({
       title: 'Remover Bairro',
-      message: 'Tem certeza que deseja remover este bairro da sua área de entrega?',
+      message: 'Tem certeza que deseja remover este bairro da sua lista de entrega?',
       onConfirm: async () => {
         await api.deleteDeliveryArea(id);
       },
@@ -2246,7 +2293,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await api.updateSettings(settingsForm);
+      await api.updateSettings({
+        ...settingsForm,
+        deliveryModel: 'neighborhoods',
+      });
       setSettingsSavedMessage(true);
       setTimeout(() => setSettingsSavedMessage(false), 3000);
     } catch (err) {
@@ -3091,24 +3141,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <div className="bg-neutral-50 p-3 rounded-2xl text-xs mb-3 space-y-1.5 border border-neutral-100">
                         {order.deliveryType === 'delivery' ? (
                           <>
-                            {!(order.customer.location_verified ?? order.customer.locationVerified) && (
-                              <div className="px-2.5 py-1.5 rounded-xl bg-amber-100 border border-amber-300 text-amber-900 font-bold text-[11px] flex items-center gap-1.5">
-                                <span>⚠ Localização não verificada — confira o endereço antes de enviar</span>
-                              </div>
-                            )}
                             <div className="flex items-center justify-between gap-2">
                               <div className="flex items-center gap-1.5 font-bold text-neutral-900">
                                 <Truck className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                                 <span>Entrega</span>
                               </div>
                               <a
-                                href={buildSingleDeliveryRouteUrl(order.customer)}
+                                href={buildSingleDeliveryRouteUrl(order.customer, settings.address)}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 font-bold text-[11px] transition-colors shrink-0"
                               >
                                 <MapPin className="w-3 h-3" />
-                                <span>Ver no mapa</span>
+                                <span>Ver rota no Google Maps</span>
                               </a>
                             </div>
                             <p className="text-neutral-800 font-medium leading-snug">
@@ -3314,136 +3359,162 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* ========================================================= */}
-      {/* TAB: ÁREAS DE ENTREGA & BAIRROS ATENDIDOS                */}
+      {/* TAB: BAIRROS ATENDIDOS (ÁREAS DE ENTREGA)                 */}
       {/* ========================================================= */}
       {activeTab === 'areas' && (
         <div className="space-y-6">
-          {/* Sub-tab Navigation */}
-          <div className="flex flex-wrap items-center gap-2 p-1.5 bg-neutral-100 rounded-2xl w-fit">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-white p-5 rounded-3xl border border-neutral-200">
+            <div>
+              <h3 className="font-black text-lg text-neutral-900 flex items-center gap-2">
+                <MapPin className="w-5 h-5 text-amber-500" />
+                <span>Bairros atendidos ({deliveryAreas.length})</span>
+              </h3>
+              <p className="text-xs text-neutral-500 mt-1 max-w-2xl">
+                Cadastre os bairros que sua loja atende com a taxa e o tempo estimado de cada um. Na loja online o cliente escolhe o bairro diretamente desta lista (em ordem alfabética).
+              </p>
+            </div>
+
             <button
               type="button"
-              onClick={() => setAreaSubTab('mapa')}
-              className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-xs transition-all ${
-                areaSubTab === 'mapa'
-                  ? 'bg-white text-neutral-900 shadow-xs'
-                  : 'text-neutral-600 hover:text-neutral-900'
-              }`}
+              onClick={handleOpenNewArea}
+              className="flex items-center gap-1.5 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-xl text-xs shadow-xs transition-colors shrink-0 cursor-pointer"
             >
-              <Compass className="w-4 h-4 text-amber-500" />
-              <span>🗺️ Raio no Mapa (km)</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setAreaSubTab('bairros')}
-              className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-xs transition-all ${
-                areaSubTab === 'bairros'
-                  ? 'bg-white text-neutral-900 shadow-xs'
-                  : 'text-neutral-600 hover:text-neutral-900'
-              }`}
-            >
-              <MapPin className="w-4 h-4 text-amber-500" />
-              <span>📋 Bairros Cadastrados ({deliveryAreas.length})</span>
+              <Plus className="w-4 h-4" />
+              <span>Adicionar Bairro</span>
             </button>
           </div>
 
-          {areaSubTab === 'mapa' ? (
-            <GoogleDeliveryRadiusMap
-              settings={settings}
-              onSave={async (updated) => {
-                await api.updateSettings(updated);
-              }}
-            />
-          ) : (
-            <div className="space-y-6">
-              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-white p-5 rounded-3xl border border-neutral-200">
-                <div>
-                  <h3 className="font-black text-lg text-neutral-900 flex items-center gap-2">
-                    <MapPin className="w-5 h-5 text-amber-500" />
-                    <span>Bairros e Regiões de Entrega Permitidas</span>
-                  </h3>
-                  <p className="text-xs text-neutral-500 mt-1 max-w-2xl">
-                    Cadastre aqui bairros específicos atendidos pelo seu depósito com taxas individuais por bairro.
-                  </p>
-                </div>
-
+          {/* Search bar */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="relative w-full sm:max-w-md">
+              <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-neutral-400" />
+              <input
+                type="text"
+                data-admin-search="areas"
+                placeholder="Buscar bairro pelo nome..."
+                value={areaSearch}
+                onChange={(e) => setAreaSearch(e.target.value)}
+                className="w-full pl-9 pr-4 py-2.5 bg-white border border-neutral-200 rounded-2xl text-xs font-medium focus:outline-none focus:ring-2 focus:ring-amber-500 shadow-2xs"
+              />
+              {areaSearch && (
                 <button
+                  type="button"
+                  onClick={() => setAreaSearch('')}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-600 text-xs font-bold cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            <span className="text-xs text-neutral-500 font-medium">
+              Ativos na loja:{' '}
+              <strong className="text-emerald-700">
+                {deliveryAreas.filter((a) => a.active).length}
+              </strong>{' '}
+              de {deliveryAreas.length}
+            </span>
+          </div>
+
+          {sortedFilteredDeliveryAreas.length === 0 ? (
+            <div className="bg-white rounded-3xl p-12 text-center border border-dashed border-neutral-300">
+              <MapPin className="w-12 h-12 text-neutral-300 mx-auto mb-3" />
+              <h4 className="font-bold text-base text-neutral-800">
+                {areaSearch ? 'Nenhum bairro encontrado para esta busca' : 'Nenhum bairro cadastrado'}
+              </h4>
+              <p className="text-xs text-neutral-500 mt-1 max-w-sm mx-auto">
+                {areaSearch
+                  ? 'Tente outro termo ou limpe a busca.'
+                  : 'Adicione os bairros que sua loja atende para que os clientes possam escolhê-los no pedido.'}
+              </p>
+              {!areaSearch && (
+                <button
+                  type="button"
                   onClick={handleOpenNewArea}
-                  className="flex items-center gap-1.5 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs shadow-xs transition-colors shrink-0"
+                  className="mt-4 inline-flex items-center gap-1.5 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black rounded-xl text-xs transition-colors shadow-xs cursor-pointer"
                 >
                   <Plus className="w-4 h-4" />
-                  <span>Cadastrar Novo Bairro</span>
+                  <span>Adicionar Primeiro Bairro</span>
                 </button>
-              </div>
-
-              {deliveryAreas.length === 0 ? (
-                <div className="bg-white rounded-3xl p-12 text-center border border-dashed border-neutral-300">
-                  <MapPin className="w-12 h-12 text-neutral-300 mx-auto mb-3" />
-                  <h4 className="font-bold text-base text-neutral-800">Nenhum bairro individual cadastrado</h4>
-                  <p className="text-xs text-neutral-500 mt-1 max-w-sm mx-auto">
-                    Você pode usar o <strong>Raio no Mapa (km)</strong> acima para atender automaticamente qualquer cliente dentro da sua distância, ou cadastrar bairros pontuais aqui.
-                  </p>
-                  <button
-                    onClick={handleOpenNewArea}
-                    className="mt-4 inline-flex items-center gap-1.5 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs transition-colors shadow-xs"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Cadastrar Bairro Específico</span>
-                  </button>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {deliveryAreas.map(area => (
-                    <div
-                      key={area.id}
-                      className={`bg-white rounded-3xl border p-5 transition-all shadow-xs flex flex-col justify-between ${
-                        area.active ? 'border-neutral-200' : 'border-neutral-200 bg-neutral-50 opacity-60'
-                      }`}
-                    >
+              )}
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {sortedFilteredDeliveryAreas.map((area) => (
+                <div
+                  key={area.id}
+                  className={`bg-white rounded-3xl border p-5 transition-all shadow-xs flex flex-col justify-between ${
+                    area.active
+                      ? 'border-neutral-200'
+                      : 'border-neutral-200 bg-neutral-50 opacity-70'
+                  }`}
+                >
+                  <div>
+                    <div className="flex items-start justify-between gap-2">
                       <div>
-                        <div className="flex items-start justify-between">
-                          <div>
-                            <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Bairro / Região</span>
-                            <h4 className="text-base font-black text-neutral-900">{area.name}</h4>
-                          </div>
-                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-                            area.active ? 'bg-emerald-100 text-emerald-800' : 'bg-neutral-200 text-neutral-600'
-                          }`}>
-                            {area.active ? 'Ativo' : 'Pausado'}
-                          </span>
-                        </div>
-
-                        <div className="mt-4 pt-3 border-t border-neutral-100 space-y-2 text-xs">
-                          <div className="flex justify-between items-center">
-                            <span className="text-neutral-500">Taxa de Entrega:</span>
-                            <span className="font-black text-sm text-neutral-900">{formatCurrency(area.fee)}</span>
-                          </div>
-                          <div className="flex justify-between items-center">
-                            <span className="text-neutral-500">Tempo Estimado:</span>
-                            <span className="font-semibold text-neutral-700">{area.estimatedTime}</span>
-                          </div>
-                        </div>
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">
+                          Bairro Atendido
+                        </span>
+                        <h4 className="text-base font-black text-neutral-900">{area.name}</h4>
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => handleToggleAreaActive(area)}
+                        title={area.active ? 'Clique para desativar este bairro' : 'Clique para ativar este bairro'}
+                        className={`px-2.5 py-1 rounded-full text-[10px] font-black uppercase cursor-pointer transition-colors ${
+                          area.active
+                            ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200'
+                            : 'bg-neutral-200 text-neutral-600 hover:bg-neutral-300'
+                        }`}
+                      >
+                        {area.active ? 'Ativo' : 'Inativo'}
+                      </button>
+                    </div>
 
-                      <div className="mt-4 pt-3 border-t border-neutral-100 flex items-center justify-end gap-1">
-                        <button
-                          onClick={() => handleOpenEditArea(area)}
-                          className="p-1.5 text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg text-xs font-semibold flex items-center gap-1"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                          <span>Editar</span>
-                        </button>
-                        <button
-                          onClick={() => handleDeleteArea(area.id)}
-                          className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg text-xs"
-                          title="Excluir bairro"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                    <div className="mt-4 pt-3 border-t border-neutral-100 space-y-2 text-xs">
+                      <div className="flex justify-between items-center">
+                        <span className="text-neutral-500">Taxa de Entrega:</span>
+                        <span className="font-black text-sm text-neutral-900">
+                          {formatCurrency(area.fee)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-neutral-500">Tempo Estimado:</span>
+                        <span className="font-semibold text-neutral-700">{area.estimatedTime}</span>
                       </div>
                     </div>
-                  ))}
+                  </div>
+
+                  <div className="mt-4 pt-3 border-t border-neutral-100 flex items-center justify-between gap-1">
+                    <button
+                      type="button"
+                      onClick={() => handleToggleAreaActive(area)}
+                      className="px-2.5 py-1.5 text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg text-xs font-bold transition-colors cursor-pointer"
+                    >
+                      {area.active ? 'Desativar' : 'Ativar'}
+                    </button>
+
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => handleOpenEditArea(area)}
+                        className="p-1.5 text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                      >
+                        <Edit2 className="w-3.5 h-3.5" />
+                        <span>Editar</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteArea(area.id)}
+                        className="p-1.5 text-neutral-400 hover:text-red-600 hover:bg-red-50 rounded-lg text-xs cursor-pointer"
+                        title="Excluir bairro"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
                 </div>
-              )}
+              ))}
             </div>
           )}
         </div>
@@ -3461,7 +3532,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <span>Base de Clientes Cadastrados</span>
               </h3>
               <p className="text-xs text-neutral-500 mt-1">
-                Cadastre clientes diretamente pelo <strong>CEP</strong> para preencher o endereço automático e verificar se o cliente está dentro do raio de entrega de <strong>{settings.deliveryRadiusKm || 5} km</strong>.
+                Gerencie seus clientes cadastrados e os respectivos endereços e bairros de entrega.
               </p>
             </div>
 
@@ -3480,7 +3551,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 className="px-5 py-3 bg-amber-500 hover:bg-amber-600 text-neutral-950 rounded-2xl font-black text-xs shadow-sm transition-all flex items-center gap-2 shrink-0 cursor-pointer"
               >
                 <Plus className="w-4 h-4" />
-                <span>Cadastrar Cliente por CEP</span>
+                <span>Cadastrar Cliente</span>
               </button>
             </div>
           </div>
@@ -3507,10 +3578,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </button>
               )}
             </div>
-
-            <span className="text-xs text-neutral-500 font-medium hidden sm:inline">
-              Raio de entrega da loja: <strong>{settings.deliveryRadiusKm || 5} km</strong>
-            </span>
           </div>
 
           <div className="bg-white rounded-3xl border border-neutral-200 overflow-hidden shadow-xs">
@@ -3521,8 +3588,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <th className="py-3 px-4">Nome do Cliente</th>
                     <th className="py-3 px-4">WhatsApp / Telefone</th>
                     <th className="py-3 px-4">Endereço Principal</th>
-                    <th className="py-3 px-4">CEP & Bairro</th>
-                    <th className="py-3 px-4 text-center">Raio de Entrega</th>
+                    <th className="py-3 px-4">Bairro & CEP</th>
                     <th className="py-3 px-4 text-center">Pedidos</th>
                     <th className="py-3 px-4 text-right">Total Gasto</th>
                     <th className="py-3 px-4 text-right">Ações</th>
@@ -3546,13 +3612,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     if (filtered.length === 0) {
                       return (
                         <tr>
-                          <td colSpan={8} className="py-12 text-center text-neutral-400">
+                          <td colSpan={7} className="py-12 text-center text-neutral-400">
                             <Users className="w-10 h-10 mx-auto mb-2 text-neutral-300" />
                             <p className="font-bold text-neutral-700 text-sm">
                               {customerSearch ? 'Nenhum cliente encontrado na busca' : 'Nenhum cliente cadastrado ainda'}
                             </p>
                             <p className="text-xs text-neutral-400 mt-1 max-w-md mx-auto">
-                              Clique no botão <strong>"Cadastrar Cliente por CEP"</strong> acima para cadastrar seu primeiro cliente ou aguarde os pedidos automáticos pelo site.
+                              Clique no botão <strong>"Cadastrar Cliente"</strong> acima para cadastrar seu primeiro cliente ou aguarde os pedidos pelo site.
                             </p>
                           </td>
                         </tr>
@@ -3560,20 +3626,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     }
 
                     return filtered.map((c) => {
-                      // Calculate or retrieve delivery radius status
-                      let dist = c.distanceKm;
-                      let inside = c.isWithinDeliveryRadius;
-
-                      if (dist === undefined && c.latitude && c.longitude && settings.storeLatitude && settings.storeLongitude) {
-                        dist = calculateDistanceKm(
-                          settings.storeLatitude,
-                          settings.storeLongitude,
-                          c.latitude,
-                          c.longitude
-                        );
-                        inside = dist <= (settings.deliveryRadiusKm || 5);
-                      }
-
                       return (
                         <tr key={c.id} className="hover:bg-neutral-50/80 transition-colors">
                           <td className="py-3.5 px-4 font-bold text-neutral-900 text-sm">
@@ -3608,42 +3660,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
                           <td className="py-3.5 px-4">
                             <div className="space-y-0.5">
+                              <span className="block font-semibold text-neutral-800">{c.neighborhood}</span>
                               {c.cep && (
                                 <span className="inline-block px-1.5 py-0.5 bg-neutral-100 border border-neutral-200 rounded font-mono text-[10px] font-bold text-neutral-700">
                                   CEP {c.cep}
                                 </span>
                               )}
-                              <span className="block font-semibold text-neutral-800">{c.neighborhood}</span>
                             </div>
-                          </td>
-
-                          {/* RAIO DE ENTREGA */}
-                          <td className="py-3.5 px-4 text-center">
-                            {dist !== undefined ? (
-                              <span
-                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-black border ${
-                                  inside
-                                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                                    : 'bg-red-50 text-red-800 border-red-300'
-                                }`}
-                              >
-                                {inside ? (
-                                  <>
-                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                                    <span>No raio ({dist} km)</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <AlertTriangle className="w-3.5 h-3.5 text-red-600" />
-                                    <span>Fora ({dist} km)</span>
-                                  </>
-                                )}
-                              </span>
-                            ) : (
-                              <span className="text-[11px] text-neutral-400 italic">
-                                CEP sem GPS
-                              </span>
-                            )}
                           </td>
 
                           <td className="py-3.5 px-4 text-center font-black">
@@ -3663,7 +3686,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                   setEditingCustomer(c);
                                   setIsCustomerModalOpen(true);
                                 }}
-                                title="Editar Cliente / Conferir CEP"
+                                title="Editar Cliente"
                                 className="p-1.5 text-neutral-600 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-colors cursor-pointer"
                               >
                                 <Edit2 className="w-4 h-4" />
@@ -6253,8 +6276,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
             </div>
 
-            <div className="pt-4 border-t border-neutral-100">
-              <h4 className="font-black text-sm text-neutral-900 mb-1">Regras Gerais de Entrega</h4>
+            <div className="pt-4 border-t border-neutral-100 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h4 className="font-black text-sm text-neutral-900">Entrega por Bairros</h4>
+                  <p className="text-[11px] text-neutral-500">
+                    A entrega funciona exclusivamente pelos bairros atendidos cadastrados ({deliveryAreas.filter((a) => a.active).length} ativos de {deliveryAreas.length}).
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('areas')}
+                  className="px-3.5 py-2 bg-amber-100 hover:bg-amber-200 text-amber-950 font-black rounded-xl text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <MapPin className="w-3.5 h-3.5 text-amber-700" />
+                  <span>Gerenciar Bairros Atendidos ({deliveryAreas.length})</span>
+                </button>
+              </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
                 <div>
                   <label className="font-bold text-neutral-700 block mb-1">Frete Grátis a partir de (R$)</label>
@@ -6516,25 +6554,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <div className="bg-white rounded-3xl max-w-md w-full shadow-2xl overflow-hidden border border-neutral-200">
             <div className="p-5 bg-neutral-900 text-white flex items-center justify-between">
               <h3 className="font-black text-base">
-                {editingArea ? 'Editar Bairro de Entrega' : 'Novo Bairro Atendido'}
+                {editingArea ? 'Editar Bairro Atendido' : 'Novo Bairro Atendido'}
               </h3>
               <button
+                type="button"
                 onClick={() => setIsAreaModalOpen(false)}
-                className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400"
+                className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             <form onSubmit={handleSaveArea} className="p-6 space-y-4 text-xs">
+              {areaModalError && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-red-700 font-bold flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-red-600" />
+                  <span>{areaModalError}</span>
+                </div>
+              )}
+
               <div>
-                <label className="font-bold text-neutral-700 block mb-1">Nome do Bairro / Região *</label>
+                <label className="font-bold text-neutral-700 block mb-1">Nome do Bairro *</label>
                 <input
                   type="text"
                   required
                   placeholder="Ex: Jardim América, Centro, Vila Nova..."
                   value={areaForm.name}
-                  onChange={(e) => setAreaForm({ ...areaForm, name: e.target.value })}
+                  onChange={(e) => {
+                    setAreaForm({ ...areaForm, name: e.target.value });
+                    if (areaModalError) setAreaModalError('');
+                  }}
                   className="w-full px-3 py-2 bg-neutral-50 border border-neutral-300 rounded-xl font-bold text-neutral-900 text-sm"
                 />
               </div>
@@ -6554,7 +6603,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </div>
 
                 <div>
-                  <label className="font-bold text-neutral-700 block mb-1">Tempo Estimado</label>
+                  <label className="font-bold text-neutral-700 block mb-1">Tempo Estimado *</label>
                   <input
                     type="text"
                     required
@@ -6581,16 +6630,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div className="pt-3 border-t border-neutral-200 flex justify-end gap-2">
                 <button
                   type="button"
+                  disabled={isSavingArea}
                   onClick={() => setIsAreaModalOpen(false)}
-                  className="px-4 py-2 font-medium text-neutral-600 hover:bg-neutral-100 rounded-xl"
+                  className="px-4 py-2 font-medium text-neutral-600 hover:bg-neutral-100 rounded-xl cursor-pointer"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl shadow-xs"
+                  disabled={isSavingArea}
+                  className="px-5 py-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-neutral-950 font-black rounded-xl shadow-xs cursor-pointer"
                 >
-                  Salvar Bairro
+                  {isSavingArea ? 'Salvando...' : 'Salvar Bairro'}
                 </button>
               </div>
             </form>
@@ -7842,7 +7893,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     {multiRouteResult.orderedStops.length === 1 ? 'parada' : 'paradas'})
                   </h3>
                   <p className="text-[11px] text-neutral-400">
-                    Ordenada automaticamente pela parada mais próxima a partir do depósito
+                    Roteiro com endereços escritos a partir do depósito
                   </p>
                 </div>
               </div>
@@ -7925,11 +7976,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       </p>
                       {ord.customer.reference && (
                         <p className="text-neutral-600 italic">Ref: {ord.customer.reference}</p>
-                      )}
-                      {!stop.isVerified && (
-                        <p className="font-bold text-amber-900 bg-amber-100 px-2 py-0.5 rounded inline-block text-[11px]">
-                          ⚠ Confira o endereço escrito
-                        </p>
                       )}
                       <div className="pt-1 border-t border-dashed border-neutral-200 flex flex-wrap items-center justify-between gap-2 text-[11px]">
                         <span>
