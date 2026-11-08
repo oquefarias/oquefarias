@@ -126,11 +126,16 @@ function sleepMs(ms: number): Promise<void> {
 
 class ApiService {
   private listeners: Array<() => void> = [];
+  private adminChangeListeners: Array<(changes: AdminChangesResponse) => void> = [];
   private version: number = 0;
   private pollingInterval: any = null;
-  private productPollingInterval: any = null;
-  private tokenRefreshInterval: any = null;
   private visibilityListener: (() => void) | null = null;
+  private interactionListener: (() => void) | null = null;
+  private lastUserInteractionMs: number = Date.now();
+  private currentPollIntervalMs: number = 20000;
+  private lastPollCheckMs: number = 0;
+  private isPollingInFlight: boolean = false;
+  private lastChangesSyncTime: string = '';
   private lastOrdersSyncTime: string = '';
   private lastProductsSyncTime: string = '';
   private adminSessionExpiredMessage: string = '';
@@ -654,6 +659,23 @@ class ApiService {
     return this.version;
   }
 
+  public subscribeAdminChanges(listener: (changes: AdminChangesResponse) => void): () => void {
+    this.adminChangeListeners.push(listener);
+    return () => {
+      this.adminChangeListeners = this.adminChangeListeners.filter((l) => l !== listener);
+    };
+  }
+
+  private notifyAdminChangeListeners(changes: AdminChangesResponse) {
+    for (const fn of this.adminChangeListeners) {
+      try {
+        fn(changes);
+      } catch (err) {
+        console.error('Error notifying admin change listener:', err);
+      }
+    }
+  }
+
   // ================= ORDER & STOCK POLLING =================
   private isDocumentVisible(): boolean {
     if (typeof document === 'undefined') return true;
@@ -686,11 +708,15 @@ class ApiService {
 
     const existingIds = new Set(this.state.orders.map((o) => o.id));
     const hasNewPendingOrder = fetchedOrders.some(
-      (fo) => !existingIds.has(fo.id) && fo.status === 'pendente' && fo.source !== 'mesa'
+      (fo) =>
+        !existingIds.has(fo.id) &&
+        fo.status === 'pendente' &&
+        fo.source !== 'mesa' &&
+        fo.source !== 'balcao'
     );
 
     if (hasNewPendingOrder) {
-      soundService.playNewOrderSound();
+      void soundService.playNewOrderSound();
     }
 
     const byId = new Map<string, Order>();
@@ -740,95 +766,140 @@ class ApiService {
     }
   }
 
-  private async pollAdminChanges(options: { checkOrders: boolean; checkProducts: boolean }): Promise<void> {
+  private static readonly ACTIVE_POLL_INTERVAL_MS = 20000; // 20s active (180 req/h)
+  private static readonly IDLE_POLL_INTERVAL_MS = 60000; // 60s idle after 10 min (60 req/h)
+  private static readonly IDLE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+
+  public async pollAdminChanges(): Promise<AdminChangesResponse | null> {
     const token = this.getAdminToken();
     if (!token) {
       this.stopOrderPolling();
-      return;
+      return null;
     }
 
     if (!this.isDocumentVisible()) {
-      return;
+      return null;
     }
 
-    try {
-      let since = '';
-      if (options.checkOrders && options.checkProducts) {
-        if (this.lastOrdersSyncTime && this.lastProductsSyncTime) {
-          since =
-            new Date(this.lastOrdersSyncTime).getTime() <= new Date(this.lastProductsSyncTime).getTime()
-              ? this.lastOrdersSyncTime
-              : this.lastProductsSyncTime;
-        } else {
-          since = this.lastOrdersSyncTime || this.lastProductsSyncTime;
-        }
-      } else if (options.checkOrders) {
-        since = this.lastOrdersSyncTime;
-      } else if (options.checkProducts) {
-        since = this.lastProductsSyncTime;
-      }
+    if (this.isPollingInFlight) {
+      return null;
+    }
 
+    this.isPollingInFlight = true;
+    this.lastPollCheckMs = Date.now();
+
+    try {
+      void this.checkAndRefreshAdminToken();
+
+      const since =
+        this.lastChangesSyncTime || this.lastOrdersSyncTime || this.lastProductsSyncTime || '';
       const changes = await this.checkAdminChanges(since);
-      if (!changes) return;
+      if (!changes) return null;
+
+      const srvTime = changes.serverTime || new Date().toISOString();
+      this.lastChangesSyncTime = srvTime;
 
       const tasks: Promise<any>[] = [];
 
-      if (options.checkOrders && changes.ordersChanged) {
-        const prevSince = this.lastOrdersSyncTime;
-        this.lastOrdersSyncTime = changes.serverTime || new Date().toISOString();
-        tasks.push(this.fetchUpdatedAdminOrders(prevSince));
-      } else if (options.checkOrders && !this.lastOrdersSyncTime) {
-        this.lastOrdersSyncTime = changes.serverTime || new Date().toISOString();
+      if (changes.ordersChanged) {
+        const prevOrdersSince = this.lastOrdersSyncTime;
+        this.lastOrdersSyncTime = srvTime;
+        tasks.push(this.fetchUpdatedAdminOrders(prevOrdersSince));
+      } else if (!this.lastOrdersSyncTime) {
+        this.lastOrdersSyncTime = srvTime;
       }
 
-      if (options.checkProducts && changes.productsChanged) {
-        this.lastProductsSyncTime = changes.serverTime || new Date().toISOString();
+      if (changes.productsChanged) {
+        this.lastProductsSyncTime = srvTime;
         tasks.push(this.reloadProducts());
-      } else if (options.checkProducts && !this.lastProductsSyncTime) {
-        this.lastProductsSyncTime = changes.serverTime || new Date().toISOString();
+      } else if (!this.lastProductsSyncTime) {
+        this.lastProductsSyncTime = srvTime;
       }
 
       if (tasks.length > 0) {
         await Promise.all(tasks);
       }
+
+      this.notifyAdminChangeListeners(changes);
+      return changes;
     } catch {
-      // Background poll silently continues
+      return null;
+    } finally {
+      this.isPollingInFlight = false;
     }
+  }
+
+  private scheduleCentralClock(intervalMs: number) {
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
+    }
+    this.currentPollIntervalMs = intervalMs;
+    this.pollingInterval = setInterval(() => {
+      if (!this.isAdminAuthenticated()) {
+        this.stopOrderPolling();
+        return;
+      }
+      const idleElapsedMs = Date.now() - this.lastUserInteractionMs;
+      if (
+        idleElapsedMs >= ApiService.IDLE_THRESHOLD_MS &&
+        this.currentPollIntervalMs !== ApiService.IDLE_POLL_INTERVAL_MS
+      ) {
+        this.scheduleCentralClock(ApiService.IDLE_POLL_INTERVAL_MS);
+      }
+      if (this.isDocumentVisible()) {
+        void this.pollAdminChanges();
+      }
+    }, intervalMs);
   }
 
   private startOrderPolling() {
     this.stopOrderPolling();
     if (!this.isAdminAuthenticated()) return;
 
-    this.checkAndRefreshAdminToken();
+    const now = Date.now();
+    this.lastUserInteractionMs = now;
+    this.lastPollCheckMs = now;
+    void this.checkAndRefreshAdminToken();
 
     if (typeof document !== 'undefined') {
       this.visibilityListener = () => {
         if (document.visibilityState === 'visible' && this.isAdminAuthenticated()) {
-          this.pollAdminChanges({ checkOrders: true, checkProducts: true });
+          this.lastUserInteractionMs = Date.now();
+          if (this.currentPollIntervalMs !== ApiService.ACTIVE_POLL_INTERVAL_MS) {
+            this.scheduleCentralClock(ApiService.ACTIVE_POLL_INTERVAL_MS);
+          }
+          void this.pollAdminChanges();
         }
       };
       document.addEventListener('visibilitychange', this.visibilityListener);
     }
 
-    // Poll orders every 15s ONLY while tab is visible
-    this.pollingInterval = setInterval(() => {
-      if (this.isDocumentVisible()) {
-        this.pollAdminChanges({ checkOrders: true, checkProducts: false });
+    if (typeof window !== 'undefined') {
+      this.interactionListener = () => {
+        const ts = Date.now();
+        this.lastUserInteractionMs = ts;
+        if (
+          this.currentPollIntervalMs !== ApiService.ACTIVE_POLL_INTERVAL_MS &&
+          this.isAdminAuthenticated()
+        ) {
+          this.scheduleCentralClock(ApiService.ACTIVE_POLL_INTERVAL_MS);
+          if (
+            this.isDocumentVisible() &&
+            ts - this.lastPollCheckMs >= ApiService.ACTIVE_POLL_INTERVAL_MS
+          ) {
+            void this.pollAdminChanges();
+          }
+        }
+      };
+      const events = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'pointerdown'] as const;
+      for (const ev of events) {
+        window.addEventListener(ev, this.interactionListener, { passive: true });
       }
-    }, 15000);
+    }
 
-    // Poll products/stock every 60s ONLY while tab is visible
-    this.productPollingInterval = setInterval(() => {
-      if (this.isDocumentVisible()) {
-        this.pollAdminChanges({ checkOrders: false, checkProducts: true });
-      }
-    }, 60000);
-
-    // Check token expiration every 30 minutes and auto-renew if < 2h remaining
-    this.tokenRefreshInterval = setInterval(() => {
-      this.checkAndRefreshAdminToken();
-    }, 30 * 60 * 1000);
+    // Single central clock: 20s while active, 60s after 10 min without interaction
+    this.scheduleCentralClock(ApiService.ACTIVE_POLL_INTERVAL_MS);
   }
 
   private stopOrderPolling() {
@@ -836,17 +907,16 @@ class ApiService {
       clearInterval(this.pollingInterval);
       this.pollingInterval = null;
     }
-    if (this.productPollingInterval) {
-      clearInterval(this.productPollingInterval);
-      this.productPollingInterval = null;
-    }
-    if (this.tokenRefreshInterval) {
-      clearInterval(this.tokenRefreshInterval);
-      this.tokenRefreshInterval = null;
-    }
     if (this.visibilityListener && typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.visibilityListener);
       this.visibilityListener = null;
+    }
+    if (this.interactionListener && typeof window !== 'undefined') {
+      const events = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'pointerdown'] as const;
+      for (const ev of events) {
+        window.removeEventListener(ev, this.interactionListener);
+      }
+      this.interactionListener = null;
     }
   }
 
@@ -866,6 +936,7 @@ class ApiService {
         if (res.ok) {
           const data = await res.json();
           const srvTime = data.serverTime || new Date().toISOString();
+          this.lastChangesSyncTime = srvTime;
           this.lastOrdersSyncTime = srvTime;
           this.lastProductsSyncTime = srvTime;
           this.state = {
@@ -1080,15 +1151,28 @@ class ApiService {
     return updated;
   }
 
-  public async saveProduct(product: Product): Promise<Product> {
+  public async saveProduct(
+    product: Omit<Product, 'image'> & { image?: string | null }
+  ): Promise<Product> {
     const isEdit = this.state.products.some((p) => p.id === product.id);
     const url = isEdit ? `/api/products/${product.id}` : '/api/products';
     const method = isEdit ? 'PUT' : 'POST';
 
+    const payload: Record<string, any> = { ...product };
+    if (isEdit) {
+      if (
+        payload.image === undefined ||
+        (typeof payload.image === 'string' &&
+          (payload.image.trim() === '' || payload.image.trim().startsWith('/api/products/')))
+      ) {
+        delete payload.image;
+      }
+    }
+
     const res = await fetch(url, {
       method,
       headers: this.getAdminHeaders(),
-      body: JSON.stringify(product),
+      body: JSON.stringify(payload),
     });
 
     if (res.status === 401) {
@@ -1531,7 +1615,6 @@ class ApiService {
     // Refresh products on server to sync atomic real-time stock
     await this.reloadProducts().catch(() => {});
 
-    soundService.playNewOrderSound();
     this.notifyListeners();
     return createdOrder;
   }

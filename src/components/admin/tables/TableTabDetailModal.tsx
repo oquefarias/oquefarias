@@ -20,8 +20,11 @@ import {
   isComboProduct,
   calculateComboMetrics,
   formatOrderItemComboLine,
+  formatUnitAndCaseCount,
+  formatCartItemsUnitAndCaseSummary,
 } from '../../../types';
 import { api } from '../../../services/api';
+import { ProductThumb } from '../../common/ProductThumb';
 import {
   X,
   Search,
@@ -176,6 +179,34 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
     }
   }, [isOpen, tabId]);
 
+  // Reload open tab detail when central clock reports tabsChanged or when returning to the browser tab
+  useEffect(() => {
+    if (!isOpen || !tabId) return;
+
+    const unsubscribeChanges = api.subscribeAdminChanges((changes) => {
+      if (changes.tabsChanged) {
+        loadDetail();
+      }
+    });
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        loadDetail();
+      }
+    };
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+
+    return () => {
+      unsubscribeChanges();
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      }
+    };
+  }, [isOpen, tabId]);
+
   useEffect(() => {
     if (!lastLaunchedItemKey || !tabDetail) return;
     const timer = window.setTimeout(() => {
@@ -202,6 +233,11 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
   const knownCategoryIds = useMemo(
     () => new Set(storeCategories.map((c) => c.id)),
     [storeCategories]
+  );
+
+  const productById = useMemo(
+    () => new Map(products.map((p) => [p.id, p])),
+    [products]
   );
 
   const categoryPills = useMemo(() => {
@@ -740,7 +776,11 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                 <div>
                   <h3 className="text-sm font-black text-neutral-900">Itens Consumidos</h3>
                   <p className="text-xs text-neutral-500">
-                    {activeItems.length} {activeItems.length === 1 ? 'lançamento' : 'lançamentos'}
+                    {activeItems.length > 0
+                      ? `${formatCartItemsUnitAndCaseSummary(activeItems)} (${activeItems.length} ${
+                          activeItems.length === 1 ? 'lançamento' : 'lançamentos'
+                        })`
+                      : '0 un'}
                   </p>
                 </div>
                 <div className="text-right">
@@ -770,6 +810,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                     const isCase = group.saleUnit === 'case' && group.unitsPerSale > 1;
                     const totalUnits = group.quantity * group.unitsPerSale;
                     const targetItem = group.items[group.items.length - 1];
+                    const groupProduct = productById.get(group.productId);
                     return (
                       <div
                         key={group.key}
@@ -777,15 +818,20 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                         data-tab-item-product={group.productId}
                         className="p-3 bg-white rounded-2xl border border-neutral-200 shadow-2xs flex items-center justify-between gap-3 hover:border-amber-300 transition-colors"
                       >
-                        <div className="flex items-center gap-3 min-w-0">
+                        <div className="flex items-center gap-2.5 min-w-0">
                           <div className="px-2 h-9 min-w-[36px] rounded-xl bg-amber-50 border border-amber-200 text-amber-900 font-black text-xs flex items-center justify-center shrink-0">
-                            {isCase ? `${group.quantity} cx` : `${group.quantity}x`}
+                            {isCase ? `${group.quantity} cx` : `${group.quantity} un`}
                           </div>
+                          <ProductThumb
+                            product={groupProduct}
+                            alt={group.productName}
+                            size="sm"
+                          />
                           <div className="min-w-0">
                             <span className="text-xs font-bold text-neutral-900 block">
                               {isCase
-                                ? `${group.quantity} cx ${group.productName} (${totalUnits} un)`
-                                : group.productName}
+                                ? `${group.quantity} cx (${totalUnits} un) — ${group.productName}`
+                                : `${group.quantity} un — ${group.productName}`}
                             </span>
                             {group.comboItems && group.comboItems.length > 0 && (
                               <div className="mt-0.5 space-y-0.5">
@@ -1003,6 +1049,17 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                     const comboMetrics = isCombo ? calculateComboMetrics(p, settings, products) : null;
                     const isOutOfStock = p.stock <= 0;
                     const hasAddons = getProductAddonGroups(p, settings).length > 0;
+                    const productActiveItems = activeItems.filter((it) => it.productId === p.id);
+                    const inTabUnitQty = productActiveItems
+                      .filter((it) => it.saleUnit !== 'case')
+                      .reduce((sum, it) => sum + it.quantity, 0);
+                    const inTabCaseQty = productActiveItems
+                      .filter((it) => it.saleUnit === 'case')
+                      .reduce((sum, it) => sum + it.quantity, 0);
+                    const inTabSummary =
+                      inTabUnitQty > 0 || inTabCaseQty > 0
+                        ? formatUnitAndCaseCount(inTabUnitQty, inTabCaseQty, p.caseSize)
+                        : '';
 
                     return (
                       <div
@@ -1024,25 +1081,17 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                         }`}
                       >
                         <div className="flex items-center gap-3 min-w-0">
-                          {p.imageUrl || p.image ? (
-                            <img
-                              src={p.imageUrl || p.image}
-                              alt={p.name}
-                              width={40}
-                              height={40}
-                              loading="lazy"
-                              className="w-10 h-10 rounded-xl object-cover bg-neutral-100 shrink-0"
-                            />
-                          ) : (
-                            <div className="w-10 h-10 rounded-xl bg-amber-100 text-amber-800 font-bold text-xs flex items-center justify-center shrink-0">
-                              🍺
-                            </div>
-                          )}
+                          <ProductThumb product={p} alt={p.name} size="md" />
                           <div className="min-w-0">
                             <div className="flex items-center gap-1.5 flex-wrap">
                               <span className="text-xs font-bold text-neutral-900 truncate">
                                 {p.name}
                               </span>
+                              {inTabSummary && (
+                                <span className="px-1.5 py-0.2 bg-emerald-100 text-emerald-800 border border-emerald-300 text-[9px] font-black rounded shrink-0">
+                                  {inTabSummary}
+                                </span>
+                              )}
                               {isCombo && (
                                 <span className="px-1.5 py-0.2 bg-amber-100 text-amber-900 border border-amber-300 text-[9px] font-black rounded uppercase shrink-0">
                                   Combo
@@ -1125,6 +1174,29 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                   ? Math.max(1, Math.floor(selectedProduct.stock / Number(selectedProduct.caseSize)))
                   : Math.max(1, selectedProduct.stock);
 
+                const selectedInTabItems = activeItems.filter(
+                  (it) => it.productId === selectedProduct.id
+                );
+                const selectedInTabUnitQty = selectedInTabItems
+                  .filter((it) => it.saleUnit !== 'case')
+                  .reduce((sum, it) => sum + it.quantity, 0);
+                const selectedInTabCaseQty = selectedInTabItems
+                  .filter((it) => it.saleUnit === 'case')
+                  .reduce((sum, it) => sum + it.quantity, 0);
+                const selectedInTabSummary =
+                  selectedInTabUnitQty > 0 || selectedInTabCaseQty > 0
+                    ? formatUnitAndCaseCount(
+                        selectedInTabUnitQty,
+                        selectedInTabCaseQty,
+                        selectedProduct.caseSize
+                      )
+                    : '';
+                const launchQtyLabel = formatUnitAndCaseCount(
+                  !isCase ? itemQuantity : 0,
+                  isCase ? itemQuantity : 0,
+                  selectedProduct.caseSize
+                );
+
                 return (
                   <>
                     {/* Compact Drawer Backdrop (<640px width or <800px height) */}
@@ -1151,7 +1223,16 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
 
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0 flex-1">
-                          <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider block">Lançar Item</span>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider">
+                              Lançar Item
+                            </span>
+                            {selectedInTabSummary && (
+                              <span className="text-[10px] font-black px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800 border border-emerald-300">
+                                Na comanda: {selectedInTabSummary}
+                              </span>
+                            )}
+                          </div>
                           <span className="text-xs font-black text-neutral-900 truncate block">
                             {selectedProduct.name}
                             {isCase ? ` — Caixa c/${selectedProduct.caseSize}` : ''}
@@ -1253,8 +1334,10 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                           disabled={isAddingItem || selectedProduct.stock <= 0}
                           className="w-full h-12 sm:h-auto py-2.5 px-3 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-neutral-950 font-black rounded-xl text-xs flex items-center justify-center gap-1.5 shadow-xs transition-colors"
                         >
-                          <Plus className="w-4 h-4" />
-                          <span>{isAddingItem ? 'Lançando...' : 'Adicionar'}</span>
+                          <Plus className="w-4 h-4 shrink-0" />
+                          <span className="truncate">
+                            {isAddingItem ? 'Lançando...' : `Adicionar (${launchQtyLabel})`}
+                          </span>
                         </button>
                       </div>
 
@@ -1377,8 +1460,8 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                             <div className="pr-2">
                               <span>
                                 {isCase
-                                  ? `${it.quantity} cx ${it.productName} (c/${it.unitsPerSale})`
-                                  : `${it.quantity}x ${it.productName}`}
+                                  ? `${it.quantity} cx (${it.quantity * it.unitsPerSale} un) ${it.productName}`
+                                  : `${it.quantity} un ${it.productName}`}
                               </span>
                               {it.comboItems && it.comboItems.length > 0 && (
                                 <div className="pl-2 mt-0.5 space-y-0.5 text-[10px] text-neutral-600 font-semibold">
@@ -1388,7 +1471,7 @@ export const TableTabDetailModal: React.FC<TableTabDetailModalProps> = ({
                                 </div>
                               )}
                               <div className="text-[10px] text-neutral-400">
-                                {it.quantity} {isCase ? 'cx' : 'x'} R$ {it.unitPrice.toFixed(2)}
+                                {it.quantity} {isCase ? 'cx' : 'un'} × R$ {it.unitPrice.toFixed(2)}
                               </div>
                             </div>
                             <span className="font-bold whitespace-nowrap">

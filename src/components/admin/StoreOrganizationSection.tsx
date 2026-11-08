@@ -41,9 +41,13 @@ import {
   AlertTriangle,
   Layers,
   LayoutList,
+  Boxes,
+  ListPlus,
 } from 'lucide-react';
 import { AddonGroupsManager } from './AddonGroupsManager';
 import { CombosManager } from './CombosManager';
+import { CollapsibleSection } from '../common/CollapsibleSection';
+import { ProductThumb } from '../common/ProductThumb';
 
 const STORAGE_KEY_SHOW_ARROWS = 'deposito_admin_show_sort_arrows_v1';
 
@@ -102,6 +106,8 @@ interface StoreOrganizationSectionProps {
   onSettingsUpdated?: (next: Partial<StoreSettings>) => void;
   externalEditingComboId?: string | null;
   onClearExternalEditingComboId?: () => void;
+  collapsedSections?: Record<string, boolean>;
+  onToggleSection?: (sectionId: string) => void;
 }
 
 export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> = ({
@@ -110,7 +116,12 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
   onSettingsUpdated,
   externalEditingComboId,
   onClearExternalEditingComboId,
+  collapsedSections = {},
+  onToggleSection,
 }) => {
+  const handleToggleSection = (sectionId: string) => {
+    onToggleSection?.(sectionId);
+  };
   // Show/hide optional arrows persisted in localStorage
   const [showArrows, setShowArrows] = useState<boolean>(() => {
     try {
@@ -597,19 +608,15 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
       {/* =================================================================== */}
       {/* 1. ORDEM DE PREFERÊNCIA NA LOJA ("Mostrar primeiro")                */}
       {/* =================================================================== */}
-      <div className="bg-white p-5 rounded-3xl border border-amber-200 shadow-xs space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <ArrowUp className="w-5 h-5 text-amber-600" />
-            <h3 className="font-black text-sm sm:text-base text-neutral-900">
-              Ordem de preferência na loja ({featuredProductsList.length}/50)
-            </h3>
-          </div>
-          <span className="text-xs text-neutral-500">
-            Esses produtos aparecem antes dos outros na loja, na busca e na categoria deles
-          </span>
-        </div>
-
+      <CollapsibleSection
+        sectionId="estoque_preferencia"
+        title={`Ordem de preferência na loja (${featuredProductsList.length}/50)`}
+        subtitle="Esses produtos aparecem antes dos outros na loja, na busca e na categoria deles"
+        icon={<ArrowUp className="w-5 h-5 text-amber-600" />}
+        collapsed={Boolean(collapsedSections['estoque_preferencia'])}
+        onToggle={handleToggleSection}
+        variant="amber"
+      >
         {featuredProductsList.length === 0 ? (
           <div className="p-4 rounded-2xl bg-amber-50/50 border border-dashed border-amber-200 text-xs text-neutral-500 text-center">
             Nenhum produto na ordem de preferência. Clique em <strong>"Mostrar primeiro"</strong> em qualquer produto na tabela abaixo para que ele apareça antes dos outros.
@@ -634,20 +641,7 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
                           <span className="w-6 h-6 rounded-lg bg-amber-500 text-neutral-950 font-black flex items-center justify-center shrink-0">
                             {idx + 1}º
                           </span>
-                          {fp.imageUrl || fp.image ? (
-                            <img
-                              src={fp.imageUrl || fp.image}
-                              alt={fp.name}
-                              width={36}
-                              height={36}
-                              loading="lazy"
-                              className="w-9 h-9 rounded-lg object-cover border border-neutral-200 shrink-0"
-                            />
-                          ) : (
-                            <div className="w-9 h-9 rounded-lg bg-neutral-100 flex items-center justify-center text-neutral-400 shrink-0">
-                              <Package className="w-4 h-4" />
-                            </div>
-                          )}
+                          <ProductThumb product={fp} alt={fp.name} size="sm" />
                           <div className="min-w-0">
                             <div className="font-bold text-neutral-900 truncate flex items-center gap-1.5 flex-wrap">
                               <span>{fp.name}</span>
@@ -724,26 +718,22 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
             </SortableContext>
           </DndContext>
         )}
-      </div>
+      </CollapsibleSection>
 
       {/* =================================================================== */}
       {/* 2. SEÇÃO "CATEGORIAS" & 3. "ORGANIZAR LOJA"                         */}
       {/* =================================================================== */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
         {/* CATEGORIAS GERENCIÁVEIS */}
-        <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs space-y-4 flex flex-col justify-between">
+        <CollapsibleSection
+          sectionId="estoque_categorias"
+          title={`Categorias (${localCategories.length}/50)`}
+          subtitle="Vale para a loja, PDV Balcão e Mesas"
+          icon={<Layers className="w-5 h-5 text-amber-500" />}
+          collapsed={Boolean(collapsedSections['estoque_categorias'])}
+          onToggle={handleToggleSection}
+        >
           <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <Layers className="w-5 h-5 text-amber-500" />
-                <h3 className="font-black text-sm sm:text-base text-neutral-900">
-                  Categorias ({localCategories.length}/50)
-                </h3>
-              </div>
-              <span className="text-[11px] text-neutral-500">
-                Vale para a loja, PDV Balcão e Mesas
-              </span>
-            </div>
 
             {/* Add Category Form */}
             <form onSubmit={handleAddCategory} className="flex items-center gap-2">
@@ -891,33 +881,33 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
               </p>
             )}
           </div>
-        </div>
+        </CollapsibleSection>
 
         {/* ORGANIZAR LOJA (ORDEM DOS PRODUTOS) */}
-        <div className="bg-white p-5 rounded-3xl border border-neutral-200 shadow-xs space-y-4 flex flex-col justify-between">
-          <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <LayoutList className="w-5 h-5 text-amber-500" />
-                <h3 className="font-black text-sm sm:text-base text-neutral-900">
-                  Organizar loja
-                </h3>
-              </div>
-
-              <div className="flex items-center gap-2 text-xs">
-                <label className="font-bold text-neutral-600">Ordem na loja:</label>
-                <select
-                  value={currentSortMode}
-                  onChange={(e) => handleChangeSortMode(e.target.value as ProductSortMode)}
-                  className="px-2.5 py-1.5 bg-neutral-50 border border-neutral-300 rounded-xl font-bold text-neutral-900 text-xs focus:outline-none focus:ring-2 focus:ring-amber-500"
-                >
-                  <option value="manual">Manual (arrastar)</option>
-                  <option value="az">Ordem alfabética (A–Z)</option>
-                  <option value="price_asc">Menor preço primeiro</option>
-                  <option value="price_desc">Maior preço primeiro</option>
-                </select>
-              </div>
+        <CollapsibleSection
+          sectionId="estoque_ordem"
+          title="Ordem dos produtos na loja"
+          subtitle="Defina a ordenação automática ou arraste para organizar por categoria"
+          icon={<LayoutList className="w-5 h-5 text-amber-500" />}
+          collapsed={Boolean(collapsedSections['estoque_ordem'])}
+          onToggle={handleToggleSection}
+          rightContent={
+            <div className="flex items-center gap-1.5 text-xs">
+              <label className="font-bold text-neutral-600 hidden sm:inline">Ordem:</label>
+              <select
+                value={currentSortMode}
+                onChange={(e) => handleChangeSortMode(e.target.value as ProductSortMode)}
+                className="px-2.5 py-1 bg-neutral-50 border border-neutral-300 rounded-xl font-bold text-neutral-900 text-xs focus:outline-none focus:ring-2 focus:ring-amber-500"
+              >
+                <option value="manual">Manual (arrastar)</option>
+                <option value="az">Ordem alfabética (A–Z)</option>
+                <option value="price_asc">Menor preço primeiro</option>
+                <option value="price_desc">Maior preço primeiro</option>
+              </select>
             </div>
+          }
+        >
+          <div className="space-y-4">
 
             {currentSortMode !== 'manual' && (
               <div className="p-3 rounded-2xl bg-amber-50 border border-amber-200 text-amber-950 text-xs flex items-center justify-between gap-2">
@@ -996,20 +986,7 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
                               <span className="w-5 text-center font-mono font-bold text-[11px] text-neutral-400 shrink-0">
                                 {idx + 1}.
                               </span>
-                              {prod.imageUrl || prod.image ? (
-                                <img
-                                  src={prod.imageUrl || prod.image}
-                                  alt={prod.name}
-                                  width={32}
-                                  height={32}
-                                  loading="lazy"
-                                  className="w-8 h-8 rounded-lg object-cover border border-neutral-200 shrink-0"
-                                />
-                              ) : (
-                                <div className="w-8 h-8 rounded-lg bg-neutral-100 flex items-center justify-center text-neutral-400 shrink-0">
-                                  <Package className="w-4 h-4" />
-                                </div>
-                              )}
+                              <ProductThumb product={prod} alt={prod.name} size="sm" />
                               <div className="min-w-0">
                                 <div className="font-bold text-neutral-900 text-xs truncate flex items-center gap-1.5 flex-wrap">
                                   <span className="truncate">{prod.name}</span>
@@ -1069,31 +1046,49 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
               </DndContext>
             )}
           </div>
-        </div>
+        </CollapsibleSection>
       </div>
 
       {/* Section 4: Combos */}
-      <CombosManager
-        products={products}
-        categories={localCategories}
-        settings={settings}
-        onSettingsUpdated={onSettingsUpdated}
-        onSavedFeedback={showSavedFeedback}
-        onErrorNotice={setErrorNotice}
-        externalEditingComboId={externalEditingComboId}
-        onClearExternalEditingComboId={onClearExternalEditingComboId}
-      />
+      <CollapsibleSection
+        sectionId="estoque_combos"
+        title="Combos"
+        subtitle="Monte kits com desconto que baixam automaticamente o estoque das bebidas de dentro"
+        icon={<Boxes className="w-5 h-5 text-amber-500" />}
+        collapsed={Boolean(collapsedSections['estoque_combos'] && !externalEditingComboId)}
+        onToggle={handleToggleSection}
+      >
+        <CombosManager
+          products={products}
+          categories={localCategories}
+          settings={settings}
+          onSettingsUpdated={onSettingsUpdated}
+          onSavedFeedback={showSavedFeedback}
+          onErrorNotice={setErrorNotice}
+          externalEditingComboId={externalEditingComboId}
+          onClearExternalEditingComboId={onClearExternalEditingComboId}
+        />
+      </CollapsibleSection>
 
       {/* Section 5: Addon Groups ("Adicionais") */}
-      <AddonGroupsManager
-        products={products}
-        categories={localCategories}
-        settings={settings}
-        showArrows={showArrows}
-        onSettingsUpdated={onSettingsUpdated}
-        onSavedFeedback={showSavedFeedback}
-        onErrorNotice={setErrorNotice}
-      />
+      <CollapsibleSection
+        sectionId="estoque_adicionais"
+        title={`Adicionais (${Array.isArray(settings.addonGroups) ? settings.addonGroups.length : 0}/30)`}
+        subtitle="Gelo, copo, limão, energético e outros complementos para produtos"
+        icon={<ListPlus className="w-5 h-5 text-amber-500" />}
+        collapsed={Boolean(collapsedSections['estoque_adicionais'])}
+        onToggle={handleToggleSection}
+      >
+        <AddonGroupsManager
+          products={products}
+          categories={localCategories}
+          settings={settings}
+          showArrows={showArrows}
+          onSettingsUpdated={onSettingsUpdated}
+          onSavedFeedback={showSavedFeedback}
+          onErrorNotice={setErrorNotice}
+        />
+      </CollapsibleSection>
 
       {/* Modal: Remove Category that has products (choose moveTo category) */}
       {removeCatDialog && (

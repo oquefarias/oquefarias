@@ -3,25 +3,90 @@
 class SoundService {
   private ctx: AudioContext | null = null;
   private soundEnabled: boolean = true;
+  private audioBlocked: boolean = false;
+  private listeners: Set<(blocked: boolean) => void> = new Set();
 
   constructor() {
-    // AudioContext will be initialized on first user interaction to comply with browser autoplay policy
+    // AudioContext will be initialized on first user interaction or alert to comply with browser autoplay policy
+    if (typeof window !== 'undefined') {
+      const unlockOnGesture = () => {
+        if (this.ctx && this.ctx.state === 'suspended') {
+          this.ctx
+            .resume()
+            .then(() => {
+              if (this.ctx && this.ctx.state === 'running') {
+                this.setAudioBlocked(false);
+              }
+            })
+            .catch(() => {});
+        }
+      };
+      window.addEventListener('pointerdown', unlockOnGesture, { passive: true });
+      window.addEventListener('keydown', unlockOnGesture, { passive: true });
+    }
+  }
+
+  private setAudioBlocked(blocked: boolean) {
+    if (this.audioBlocked !== blocked) {
+      this.audioBlocked = blocked;
+      this.listeners.forEach((cb) => {
+        try {
+          cb(this.audioBlocked);
+        } catch {
+          // ignore listener error
+        }
+      });
+    }
+  }
+
+  public isAudioBlocked(): boolean {
+    return this.audioBlocked;
+  }
+
+  public onBlockedChange(cb: (blocked: boolean) => void): () => void {
+    this.listeners.add(cb);
+    return () => {
+      this.listeners.delete(cb);
+    };
   }
 
   private initContext() {
     if (!this.ctx && typeof window !== 'undefined') {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (AudioCtx) {
         this.ctx = new AudioCtx();
+        this.ctx.onstatechange = () => {
+          if (this.ctx?.state === 'running') {
+            this.setAudioBlocked(false);
+          }
+        };
       }
     }
-    if (this.ctx && this.ctx.state === 'suspended') {
-      this.ctx.resume();
+  }
+
+  public async unlockAudio(): Promise<boolean> {
+    try {
+      this.initContext();
+      if (!this.ctx) return false;
+      if (this.ctx.state === 'suspended') {
+        await this.ctx.resume();
+      }
+      const running = this.ctx.state === 'running';
+      this.setAudioBlocked(!running);
+      return running;
+    } catch {
+      this.setAudioBlocked(true);
+      return false;
     }
   }
 
   public setSoundEnabled(enabled: boolean) {
     this.soundEnabled = enabled;
+    if (!enabled) {
+      this.setAudioBlocked(false);
+    }
   }
 
   public isEnabled() {
@@ -29,12 +94,29 @@ class SoundService {
   }
 
   // Dual-tone classic store bell / cash register chime for new orders
-  public playNewOrderSound() {
-    if (!this.soundEnabled) return;
+  public async playNewOrderSound(): Promise<boolean> {
+    if (!this.soundEnabled) return false;
     try {
       this.initContext();
-      if (!this.ctx) return;
+      if (!this.ctx) return false;
 
+      if (this.ctx.state === 'suspended') {
+        try {
+          await Promise.race([
+            this.ctx.resume(),
+            new Promise((resolve) => setTimeout(resolve, 250)),
+          ]);
+        } catch {
+          // ignore resume error
+        }
+      }
+
+      if (this.ctx.state !== 'running') {
+        this.setAudioBlocked(true);
+        return false;
+      }
+
+      this.setAudioBlocked(false);
       const now = this.ctx.currentTime;
 
       // Note 1: High crisp ding (G5 ~ 784Hz)
@@ -57,7 +139,7 @@ class SoundService {
       const osc2 = this.ctx.createOscillator();
       const gain2 = this.ctx.createGain();
       osc2.type = 'sine';
-      osc2.frequency.setValueAtTime(1046.50, now + 0.15);
+      osc2.frequency.setValueAtTime(1046.5, now + 0.15);
 
       gain2.gain.setValueAtTime(0.01, now + 0.15);
       gain2.gain.exponentialRampToValueAtTime(0.4, now + 0.18);
@@ -83,8 +165,11 @@ class SoundService {
       osc3.start(now + 0.28);
       osc3.stop(now + 1.2);
 
+      return true;
     } catch (e) {
       console.warn('Audio playback error:', e);
+      this.setAudioBlocked(true);
+      return false;
     }
   }
 
@@ -94,6 +179,9 @@ class SoundService {
     try {
       this.initContext();
       if (!this.ctx) return;
+      if (this.ctx.state === 'suspended') {
+        this.ctx.resume().catch(() => {});
+      }
       const now = this.ctx.currentTime;
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();
@@ -117,6 +205,9 @@ class SoundService {
     try {
       this.initContext();
       if (!this.ctx) return;
+      if (this.ctx.state === 'suspended') {
+        this.ctx.resume().catch(() => {});
+      }
 
       const now = this.ctx.currentTime;
       const osc = this.ctx.createOscillator();
@@ -141,3 +232,4 @@ class SoundService {
 }
 
 export const soundService = new SoundService();
+

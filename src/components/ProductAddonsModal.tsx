@@ -6,6 +6,7 @@ import {
   OrderItemAddon,
   hasProductCase,
   getEffectiveProductPrice,
+  formatUnitAndCaseCount,
 } from '../types';
 import { X, Plus, Minus, Check, AlertCircle, ShoppingBag, Package } from 'lucide-react';
 
@@ -14,6 +15,7 @@ interface ProductAddonsModalProps {
   initialSaleUnit?: SaleUnit;
   addonGroups: AddonGroup[];
   availableStockUnits: number;
+  inCartSummary?: string;
   onClose: () => void;
   onConfirm: (payload: {
     product: Product;
@@ -29,6 +31,7 @@ export const ProductAddonsModal: React.FC<ProductAddonsModalProps> = ({
   initialSaleUnit = 'unit',
   addonGroups,
   availableStockUnits,
+  inCartSummary,
   onClose,
   onConfirm,
 }) => {
@@ -194,6 +197,11 @@ export const ProductAddonsModal: React.FC<ProductAddonsModalProps> = ({
                 <span className="text-sm font-black text-amber-400">
                   R$ {baseUnitPrice.toFixed(2).replace('.', ',')}
                 </span>
+                {inCartSummary && (
+                  <span className="text-[11px] font-bold px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                    No carrinho: {inCartSummary}
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -431,51 +439,62 @@ export const ProductAddonsModal: React.FC<ProductAddonsModalProps> = ({
 
         {/* Sticky Footer with Quantity & Add to Cart Button */}
         <div className="p-4 border-t border-zinc-800 bg-zinc-950/90 space-y-3 shrink-0">
-          <div className="flex items-center justify-between text-xs text-zinc-400">
-            <span>
-              (Produto R$ {baseUnitPrice.toFixed(2).replace('.', ',')} + Adicionais R${' '}
-              {addonsTotal.toFixed(2).replace('.', ',')}) × {effectiveQuantity}
-            </span>
-            <span className="text-base font-black text-emerald-400">
-              Total: R$ {finalLineTotal.toFixed(2).replace('.', ',')}
-            </span>
-          </div>
+          {(() => {
+            const qtyLabel = formatUnitAndCaseCount(
+              saleUnit === 'unit' ? effectiveQuantity : 0,
+              saleUnit === 'case' ? effectiveQuantity : 0,
+              canSellCase ? caseSize : null
+            );
+            return (
+              <>
+                <div className="flex items-center justify-between text-xs text-zinc-400">
+                  <span>
+                    (Produto R$ {baseUnitPrice.toFixed(2).replace('.', ',')} + Adicionais R${' '}
+                    {addonsTotal.toFixed(2).replace('.', ',')}) × {qtyLabel}
+                  </span>
+                  <span className="text-base font-black text-emerald-400">
+                    Total: R$ {finalLineTotal.toFixed(2).replace('.', ',')}
+                  </span>
+                </div>
 
-          <div className="flex items-center gap-3">
-            {/* Item Quantity Stepper */}
-            <div className="flex items-center bg-zinc-900 border border-zinc-800 rounded-xl p-1 shrink-0">
-              <button
-                type="button"
-                disabled={effectiveQuantity <= 1}
-                onClick={() => setQuantity((q) => Math.max(1, q - 1))}
-                className="w-9 h-9 rounded-lg hover:bg-zinc-800 disabled:opacity-40 text-zinc-300 flex items-center justify-center transition-colors"
-              >
-                <Minus className="w-4 h-4" />
-              </button>
-              <span className="w-9 text-center font-black text-white text-sm">
-                {effectiveQuantity}
-              </span>
-              <button
-                type="button"
-                disabled={effectiveQuantity >= maxItemQty}
-                onClick={() => setQuantity((q) => Math.min(maxItemQty, q + 1))}
-                className="w-9 h-9 rounded-lg hover:bg-zinc-800 disabled:opacity-40 text-zinc-300 flex items-center justify-center transition-colors"
-              >
-                <Plus className="w-4 h-4" />
-              </button>
-            </div>
+                <div className="flex items-center gap-3">
+                  {/* Item Quantity Stepper */}
+                  <div className="flex items-center bg-zinc-900 border border-zinc-800 rounded-xl p-1 shrink-0">
+                    <button
+                      type="button"
+                      disabled={effectiveQuantity <= 1}
+                      onClick={() => setQuantity((q) => Math.max(1, q - 1))}
+                      className="w-9 h-9 rounded-lg hover:bg-zinc-800 disabled:opacity-40 text-zinc-300 flex items-center justify-center transition-colors"
+                    >
+                      <Minus className="w-4 h-4" />
+                    </button>
+                    <span className="px-2 min-w-12 text-center font-black text-white text-xs">
+                      {qtyLabel}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={effectiveQuantity >= maxItemQty}
+                      onClick={() => setQuantity((q) => Math.min(maxItemQty, q + 1))}
+                      className="w-9 h-9 rounded-lg hover:bg-zinc-800 disabled:opacity-40 text-zinc-300 flex items-center justify-center transition-colors"
+                    >
+                      <Plus className="w-4 h-4" />
+                    </button>
+                  </div>
 
-            {/* Confirm Button */}
-            <button
-              type="button"
-              disabled={!canConfirm}
-              onClick={handleConfirm}
-              className="flex-1 py-3 px-4 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed text-zinc-950 font-black text-sm transition-all flex items-center justify-between gap-2 shadow-lg shadow-amber-500/10"
-            >
-              <span>Adicionar ao carrinho</span>
-              <span>R$ {finalLineTotal.toFixed(2).replace('.', ',')}</span>
-            </button>
-          </div>
+                  {/* Confirm Button */}
+                  <button
+                    type="button"
+                    disabled={!canConfirm}
+                    onClick={handleConfirm}
+                    className="flex-1 py-3 px-4 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed text-zinc-950 font-black text-sm transition-all flex items-center justify-between gap-2 shadow-lg shadow-amber-500/10"
+                  >
+                    <span>Adicionar ({qtyLabel})</span>
+                    <span>R$ {finalLineTotal.toFixed(2).replace('.', ',')}</span>
+                  </button>
+                </div>
+              </>
+            );
+          })()}
         </div>
       </div>
     </div>

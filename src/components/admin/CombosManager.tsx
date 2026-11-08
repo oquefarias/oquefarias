@@ -77,6 +77,7 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
   const [modalError, setModalError] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
+  const [initialImage, setInitialImage] = useState('');
   const [photoOptimizedSummary, setPhotoOptimizedSummary] = useState('');
   const [showPhotoHelp, setShowPhotoHelp] = useState(false);
   const [confirmDeleteCombo, setConfirmDeleteCombo] = useState<Product | null>(null);
@@ -145,6 +146,7 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
     setPriceStr('');
     setCategory(suggestedCombosCategoryId);
     setImage('');
+    setInitialImage('');
     setPhotoOptimizedSummary('');
     setShowPhotoHelp(false);
     setIsCold(true);
@@ -161,11 +163,13 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
 
   const openEditComboModal = (comboProd: Product) => {
     const currentItems = settings.combos?.[comboProd.id] || [];
+    const currentImg = comboProd.imageUrl || comboProd.image || '';
     setEditingComboId(comboProd.id);
     setName(comboProd.name);
     setPriceStr(String(comboProd.price || ''));
     setCategory(comboProd.category || suggestedCombosCategoryId);
-    setImage(comboProd.imageUrl || comboProd.image || '');
+    setImage(currentImg);
+    setInitialImage(currentImg);
     setPhotoOptimizedSummary('');
     setShowPhotoHelp(false);
     setIsCold(comboProd.isCold !== false);
@@ -351,7 +355,22 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
       .join(' + ')
       .slice(0, 80);
 
-    const comboProductPayload: Product = {
+    const trimmedImg = image.trim();
+    const hadImageBefore = Boolean(initialImage.trim());
+    let imageFieldForSave: string | null | undefined = undefined;
+    if (isNew) {
+      imageFieldForSave = trimmedImg;
+    } else if (trimmedImg === '' && hadImageBefore) {
+      imageFieldForSave = null;
+    } else if (
+      trimmedImg !== '' &&
+      trimmedImg !== initialImage.trim() &&
+      !trimmedImg.startsWith('/api/products/')
+    ) {
+      imageFieldForSave = trimmedImg;
+    }
+
+    const comboProductPayload: Omit<Product, 'image'> & { image?: string | null } = {
       id: comboId,
       name: trimmedName,
       category: category || suggestedCombosCategoryId,
@@ -365,7 +384,7 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
       stock: liveModalMetrics.availableStock,
       minStock: existingProduct?.minStock ?? 5,
       isCold,
-      image: image.trim(),
+      ...(imageFieldForSave !== undefined ? { image: imageFieldForSave } : {}),
       sku: existingProduct?.sku || '',
       active,
       description: description.trim(),
@@ -432,8 +451,9 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
 
   const handleToggleComboActive = async (combo: Product) => {
     try {
+      const { image: _ignoredImage, ...comboWithoutImage } = combo;
       const saved = await api.saveProduct({
-        ...combo,
+        ...comboWithoutImage,
         active: !combo.active,
       });
       onProductSaved?.(saved, false);
@@ -817,9 +837,9 @@ export const CombosManager: React.FC<CombosManagerProps> = ({
                         )}
                       </div>
                       <input
-                        type="url"
+                        type="text"
                         placeholder="Ou cole o link (URL) da imagem..."
-                        value={image}
+                        value={/^https?:\/\//i.test(image) ? image : ''}
                         onChange={(e) => {
                           setImage(e.target.value);
                           setPhotoOptimizedSummary('');

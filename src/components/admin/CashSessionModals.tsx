@@ -471,6 +471,75 @@ export const CloseCashSessionModal: React.FC<CloseCashSessionModalProps> = ({
               </div>
             </div>
 
+            {/* Lucro / Prejuízo dos Produtos */}
+            {(() => {
+              const netProfit = Number(summary.netProfit || 0);
+              const productsRev = Number(summary.productsRevenue ?? summary.totalRevenue ?? 0);
+              const totalCost = Number(summary.totalCost ?? 0);
+              const marginPct =
+                typeof summary.profitMarginPercent === 'number'
+                  ? summary.profitMarginPercent
+                  : productsRev > 0
+                  ? Math.round((netProfit / productsRev) * 1000) / 10
+                  : 0;
+              const missingCost = Math.max(0, Math.floor(Number(summary.missingCostItemsCount) || 0));
+              const isLoss = netProfit < 0;
+
+              return (
+                <div
+                  className={`rounded-xl p-3 border space-y-1.5 ${
+                    isLoss
+                      ? 'bg-red-50/80 border-red-200 text-red-950'
+                      : 'bg-emerald-50/60 border-emerald-200 text-emerald-950'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-black uppercase tracking-wider text-[10px] opacity-80">
+                      Resultado dos Produtos (sem taxas)
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded-md text-[10px] font-black ${
+                        isLoss
+                          ? 'bg-red-100 text-red-700 border border-red-200'
+                          : 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                      }`}
+                    >
+                      Margem: {marginPct.toFixed(1).replace('.', ',')}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-neutral-700 text-[11px]">
+                    <span>Produtos vendidos (− descontos):</span>
+                    <span className="font-bold">{formatCurrencyBRL(productsRev)}</span>
+                  </div>
+                  <div className="flex justify-between text-neutral-700 text-[11px]">
+                    <span>− Custo dos itens vendidos:</span>
+                    <span className="font-bold">{formatCurrencyBRL(totalCost)}</span>
+                  </div>
+                  <div
+                    className={`flex justify-between items-center pt-1.5 border-t text-sm font-black ${
+                      isLoss
+                        ? 'border-red-200 text-red-700'
+                        : 'border-emerald-200 text-emerald-700'
+                    }`}
+                  >
+                    <span>{isLoss ? 'Prejuízo estimado:' : 'Lucro estimado:'}</span>
+                    <span>
+                      {isLoss
+                        ? `Prejuízo ${formatCurrencyBRL(Math.abs(netProfit))}`
+                        : `Lucro ${formatCurrencyBRL(netProfit)}`}
+                    </span>
+                  </div>
+                  {missingCost > 0 && (
+                    <p className="text-[10px] text-amber-800 bg-amber-50/90 border border-amber-200 rounded-lg px-2.5 py-1.5 font-semibold leading-snug">
+                      {missingCost} {missingCost === 1 ? 'item vendido' : 'itens vendidos'} sem
+                      preço de custo — o lucro pode estar maior que o real. Cadastre o custo em
+                      Estoque.
+                    </p>
+                  )}
+                </div>
+              );
+            })()}
+
             {/* Conferência da Gaveta */}
             <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-3 space-y-1">
               <div className="flex justify-between text-neutral-700">
@@ -764,6 +833,57 @@ export const CashClosingReceiptModal: React.FC<CashClosingReceiptModalProps> = (
               <span className="font-bold">{formatCurrencyBRL(s.avgTicket)}</span>
             </div>
           </div>
+
+          {/* Resultado (Lucro / Prejuízo) */}
+          {(() => {
+            const netProfit = Number(s.netProfit || 0);
+            const productsRev = Number(s.productsRevenue ?? s.totalRevenue ?? 0);
+            const totalCost = Number(s.totalCost ?? 0);
+            const marginPct =
+              typeof s.profitMarginPercent === 'number'
+                ? s.profitMarginPercent
+                : productsRev > 0
+                ? Math.round((netProfit / productsRev) * 1000) / 10
+                : 0;
+            const missingCost = Math.max(0, Math.floor(Number(s.missingCostItemsCount) || 0));
+            const isLoss = netProfit < 0;
+
+            return (
+              <div className="space-y-1 border-b border-dashed border-neutral-300 pb-3 text-[11px]">
+                <p className="font-black uppercase text-neutral-700 mb-1">
+                  Resultado dos Produtos
+                </p>
+                <div className="flex justify-between">
+                  <span>Venda de produtos (− desc.):</span>
+                  <span className="font-bold">{formatCurrencyBRL(productsRev)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Custo dos itens vendidos:</span>
+                  <span className="font-bold">{formatCurrencyBRL(totalCost)}</span>
+                </div>
+                <div
+                  className={`flex justify-between font-black pt-1 border-t border-neutral-200 ${
+                    isLoss ? 'text-red-700' : 'text-emerald-700'
+                  }`}
+                >
+                  <span>{isLoss ? 'PREJUÍZO ESTIMADO:' : 'LUCRO ESTIMADO:'}</span>
+                  <span>
+                    {isLoss
+                      ? `Prejuízo ${formatCurrencyBRL(Math.abs(netProfit))}`
+                      : `Lucro ${formatCurrencyBRL(netProfit)}`}{' '}
+                    ({marginPct.toFixed(1).replace('.', ',')}%)
+                  </span>
+                </div>
+                {missingCost > 0 && (
+                  <p className="text-[10px] text-amber-800 pt-1 leading-snug">
+                    * {missingCost} {missingCost === 1 ? 'item vendido' : 'itens vendidos'} sem
+                    preço de custo — o lucro pode estar maior que o real. Cadastre o custo em
+                    Estoque.
+                  </p>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Conferência da Gaveta */}
           <div className="space-y-1 border-b border-dashed border-neutral-300 pb-3 text-[11px]">

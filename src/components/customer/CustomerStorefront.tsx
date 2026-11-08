@@ -253,9 +253,18 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     }
   };
 
-  // Poll placedOrder status every 15 seconds ONLY while the tab is visible (supports both logged-in and guest orders)
+  // Poll placedOrder status every 30 seconds ONLY while the tab is visible; stop when concluido, entregue, or cancelado
   useEffect(() => {
     if (!placedOrder) return;
+    const currentStatus = String(placedOrder.status || '').toLowerCase();
+    if (
+      currentStatus === 'concluido' ||
+      currentStatus === 'entregue' ||
+      currentStatus === 'cancelado'
+    ) {
+      return;
+    }
+
     const orderId = placedOrder.id;
     const guestTok =
       placedOrder.guestToken || trackedGuestToken || api.getGuestTokenForOrder(orderId) || '';
@@ -285,11 +294,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
     const handleVisibility = () => {
       if (document.visibilityState === 'visible') {
-        fetchCurrentOrder();
+        void fetchCurrentOrder();
       }
     };
 
-    const interval = setInterval(fetchCurrentOrder, 15000);
+    const interval = setInterval(fetchCurrentOrder, 30000);
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleVisibility);
     }
@@ -300,7 +309,13 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         document.removeEventListener('visibilitychange', handleVisibility);
       }
     };
-  }, [placedOrder?.id, placedOrder?.customerId, placedOrder?.guestToken, trackedGuestToken]);
+  }, [
+    placedOrder?.id,
+    placedOrder?.status,
+    placedOrder?.customerId,
+    placedOrder?.guestToken,
+    trackedGuestToken,
+  ]);
 
   const applySavedCustomerAddressToState = (cust: CustomerProfile) => {
     setCustomerName(cust.name);

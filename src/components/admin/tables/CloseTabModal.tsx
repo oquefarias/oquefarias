@@ -7,6 +7,7 @@ import {
   StoreSettings,
   DEFAULT_SHORTCUTS,
   formatOrderItemComboLine,
+  formatCartItemsUnitAndCaseSummary,
 } from '../../../types';
 import {
   api,
@@ -113,24 +114,25 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
       }
     };
 
+    // Check once when opening the modal
+    void checkTabUpdate();
+
     const handleVisibility = () => {
       if (document.visibilityState === 'visible') {
-        checkTabUpdate();
+        void checkTabUpdate();
       }
     };
 
-    const interval = setInterval(checkTabUpdate, 15000);
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleVisibility);
     }
 
     return () => {
-      clearInterval(interval);
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', handleVisibility);
       }
     };
-  }, [isOpen, currentTab, isSubmitting, computeTotalForSubtotal]);
+  }, [isOpen, currentTab?.id, isSubmitting, computeTotalForSubtotal]);
 
   const allTableNumbers = React.useMemo(() => {
     if (!currentTab) return '';
@@ -328,7 +330,10 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
                 Fechar Conta • Mesa {allTableNumbers}
               </h2>
               <p className="text-xs text-neutral-400 truncate">
-                {currentTab.customerName || 'Sem identificação'} • {currentTab.items.filter((i) => i.status === 'active').length} itens
+                {currentTab.customerName || 'Sem identificação'} •{' '}
+                {formatCartItemsUnitAndCaseSummary(
+                  currentTab.items.filter((i) => i.status === 'active')
+                )}
               </p>
             </div>
           </div>
@@ -398,8 +403,8 @@ export const CloseTabModal: React.FC<CloseTabModalProps> = ({
                       <div className="flex justify-between items-center">
                         <span className="truncate pr-2">
                           {isCase
-                            ? `${it.quantity} cx ${it.productName} (${totalUnits} un)`
-                            : `${it.quantity}x ${it.productName}`}
+                            ? `${it.quantity} cx (${totalUnits} un) — ${it.productName}`
+                            : `${it.quantity} un — ${it.productName}`}
                         </span>
                         <span className="font-bold text-neutral-800 shrink-0">
                           R$ {(it.unitPrice * it.quantity).toFixed(2)}

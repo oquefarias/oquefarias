@@ -146,8 +146,8 @@ export const TableReceiptModal: React.FC<TableReceiptModalProps> = ({
                   <div className="pr-2">
                     <span>
                       {isCase
-                        ? `${it.quantity} cx ${it.name} (c/${it.unitsPerSale})`
-                        : `${it.quantity}x ${it.name}`}
+                        ? `${it.quantity} cx (${it.quantity * (it.unitsPerSale || 1)} un) ${it.name}`
+                        : `${it.quantity} un ${it.name}`}
                     </span>
                     {it.volume && <span className="text-[10px] text-neutral-500"> ({it.volume})</span>}
                     {it.comboItems && it.comboItems.length > 0 && (
@@ -158,7 +158,7 @@ export const TableReceiptModal: React.FC<TableReceiptModalProps> = ({
                       </div>
                     )}
                     <div className="text-[10px] text-neutral-400">
-                      {it.quantity} {isCase ? 'cx' : 'x'} R$ {it.price.toFixed(2)}
+                      {it.quantity} {isCase ? 'cx' : 'un'} × R$ {it.price.toFixed(2)}
                     </div>
                   </div>
                   <span className="font-bold whitespace-nowrap">

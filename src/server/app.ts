@@ -50,6 +50,7 @@ import {
   normalizeNeighborhoodName,
   sortDeliveryAreasAlphabetically,
   findMatchingActiveDeliveryArea,
+  formatCartItemsUnitAndCaseSummary,
 } from '../types/index.js';
 
 dotenv.config();
@@ -647,12 +648,102 @@ export interface ProductImageMeta {
   versionMs: number;
 }
 
+export interface PublicStateCachePayload {
+  products: Array<Omit<Product, 'costPrice' | 'minStock'>>;
+  deliveryAreas: DeliveryArea[];
+  settings: StoreSettings;
+}
+
+const PUBLIC_STATE_CACHE_TTL_MS = 30_000; // 30 seconds
+
+let publicStateCache: {
+  payload: PublicStateCachePayload;
+  expiresAt: number;
+} | null = null;
+
 let productImageMetaCache: {
   map: Map<string, ProductImageMeta>;
   expiresAt: number;
 } | null = null;
 
+export const MAX_PRODUCT_IMAGE_CACHE_BYTES = 25 * 1024 * 1024; // ~25 MB
+
+export interface CachedProductImageEntry {
+  productId: string;
+  versionMs: number;
+  etag: string;
+  contentType: string;
+  binaryBuffer: Buffer | null;
+  redirectUrl: string | null;
+  storageBytes: number;
+  byteSize: number;
+}
+
+const productImageBinaryCache = new Map<string, CachedProductImageEntry>();
+const productImageLatestKeyByProductId = new Map<string, string>();
+let productImageBinaryCacheTotalBytes = 0;
+
+export function invalidateProductImageCache(productId?: string): void {
+  if (!productId) {
+    productImageBinaryCache.clear();
+    productImageLatestKeyByProductId.clear();
+    productImageBinaryCacheTotalBytes = 0;
+    return;
+  }
+  const cleanId = String(productId);
+  productImageLatestKeyByProductId.delete(cleanId);
+  const prefix = `${cleanId}:`;
+  for (const [key, entry] of productImageBinaryCache.entries()) {
+    if (key.startsWith(prefix) || entry.productId === cleanId) {
+      productImageBinaryCache.delete(key);
+      productImageBinaryCacheTotalBytes = Math.max(
+        0,
+        productImageBinaryCacheTotalBytes - entry.byteSize
+      );
+    }
+  }
+}
+
+function setProductImageCacheEntry(key: string, entry: CachedProductImageEntry): void {
+  if (productImageBinaryCache.has(key)) {
+    const prev = productImageBinaryCache.get(key)!;
+    productImageBinaryCache.delete(key);
+    productImageBinaryCacheTotalBytes = Math.max(
+      0,
+      productImageBinaryCacheTotalBytes - prev.byteSize
+    );
+  }
+  while (
+    productImageBinaryCacheTotalBytes + entry.byteSize > MAX_PRODUCT_IMAGE_CACHE_BYTES &&
+    productImageBinaryCache.size > 0
+  ) {
+    const oldestKey = productImageBinaryCache.keys().next().value;
+    if (!oldestKey) break;
+    const oldest = productImageBinaryCache.get(oldestKey);
+    productImageBinaryCache.delete(oldestKey);
+    if (oldest) {
+      productImageBinaryCacheTotalBytes = Math.max(
+        0,
+        productImageBinaryCacheTotalBytes - oldest.byteSize
+      );
+      if (productImageLatestKeyByProductId.get(oldest.productId) === oldestKey) {
+        productImageLatestKeyByProductId.delete(oldest.productId);
+      }
+    }
+  }
+  if (entry.byteSize <= MAX_PRODUCT_IMAGE_CACHE_BYTES) {
+    productImageBinaryCache.set(key, entry);
+    productImageLatestKeyByProductId.set(entry.productId, key);
+    productImageBinaryCacheTotalBytes += entry.byteSize;
+  }
+}
+
 export function invalidateProductImageMetaCache(): void {
+  productImageMetaCache = null;
+}
+
+export function invalidatePublicCache(): void {
+  publicStateCache = null;
   productImageMetaCache = null;
 }
 
@@ -746,13 +837,16 @@ export function validateIncomingProductImage(rawImage: unknown): {
     return { value: null, keepExisting: false };
   }
 
-  const localApiMatch = trimmed.match(/^\/api\/products\/([^/?#]+)\/image/i);
-  if (localApiMatch) {
-    let sourceId = localApiMatch[1];
-    try {
-      sourceId = decodeURIComponent(sourceId);
-    } catch {
-      // ignore decode error
+  if (trimmed.startsWith('/api/products/')) {
+    const localApiMatch = trimmed.match(/^\/api\/products\/([^/?#]+)\/image/i);
+    let sourceId: string | undefined = undefined;
+    if (localApiMatch && localApiMatch[1]) {
+      sourceId = localApiMatch[1];
+      try {
+        sourceId = decodeURIComponent(sourceId);
+      } catch {
+        // ignore decode error
+      }
     }
     return {
       value: null,
@@ -3130,6 +3224,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
+    invalidatePublicCache();
     res.status(201).json(newCoupon);
   });
 
@@ -3163,6 +3258,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error?.message || 'Cupom não encontrado.' });
     }
 
+    invalidatePublicCache();
     res.json(couponFromDB(data));
   });
 
@@ -3175,8 +3271,76 @@ export function createApp(): express.Express {
     const { error } = await supabase.from('coupons').delete().eq('code', cleanCode);
     if (error) return res.status(500).json({ error: error.message });
 
+    invalidatePublicCache();
     res.json({ success: true });
   });
+
+  // Helper to fetch or return cached public store state (TTL: 30s)
+  const getOrBuildPublicStatePayload = async (
+    supabase: SupabaseClient
+  ): Promise<{ payload?: PublicStateCachePayload; error?: string }> => {
+    const now = Date.now();
+    if (publicStateCache && publicStateCache.expiresAt > now) {
+      return { payload: publicStateCache.payload };
+    }
+
+    const [prodRes, imageMetaMap, areasRes, settingsRes] = await Promise.all([
+      supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE),
+      fetchProductImageMetaMap(supabase),
+      supabase.from('delivery_areas').select('*').eq('active', true),
+      supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+    ]);
+
+    if (prodRes.error) return { error: prodRes.error.message };
+    if (areasRes.error) return { error: areasRes.error.message };
+    if (settingsRes.error) return { error: settingsRes.error.message };
+
+    const allProductRows = mapProductsFromDB(prodRes.data, imageMetaMap);
+    const deliveryAreas = sortDeliveryAreasAlphabetically((areasRes.data || []).map(deliveryAreaFromDB));
+
+    let settings = sanitizePublicSettings(initialSettings);
+    let shouldPersistSettings = false;
+    if (settingsRes.data && settingsRes.data.data) {
+      settings = sanitizePublicSettings(settingsRes.data.data);
+    } else {
+      shouldPersistSettings = true;
+    }
+
+    const reconciled = reconcileSettingsCategoriesAndOrders(settings, allProductRows as any);
+    settings = reconciled.settings;
+    if (reconciled.changed) {
+      shouldPersistSettings = true;
+    }
+
+    const productsWithCombos = applyCombosStockAndCost(allProductRows, settings);
+    const products = productsWithCombos
+      .filter((p) => p.active !== false)
+      .map(sanitizePublicProduct);
+
+    if (shouldPersistSettings) {
+      const { error: persistErr } = await supabase.from('store_settings').upsert({
+        id: 'default',
+        data: settings,
+        updated_at: new Date().toISOString(),
+      });
+      if (persistErr) {
+        console.error('[Supabase Error] store_settings persist in /state:', persistErr.message);
+      }
+    }
+
+    const payload: PublicStateCachePayload = {
+      products,
+      deliveryAreas,
+      settings,
+    };
+
+    publicStateCache = {
+      payload,
+      expiresAt: Date.now() + PUBLIC_STATE_CACHE_TTL_MS,
+    };
+
+    return { payload };
+  };
 
   // ---------------------------------------------------------------------------
   // PUBLIC STATE: GET /state
@@ -3188,55 +3352,11 @@ export function createApp(): express.Express {
     }
 
     try {
-      const [prodRes, imageMetaMap, areasRes, settingsRes] = await Promise.all([
-        supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE),
-        fetchProductImageMetaMap(supabase),
-        supabase.from('delivery_areas').select('*').eq('active', true),
-        supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
-      ]);
-
-      if (prodRes.error) return res.status(500).json({ error: prodRes.error.message });
-      if (areasRes.error) return res.status(500).json({ error: areasRes.error.message });
-      if (settingsRes.error) return res.status(500).json({ error: settingsRes.error.message });
-
-      const allProductRows = mapProductsFromDB(prodRes.data, imageMetaMap);
-      const deliveryAreas = sortDeliveryAreasAlphabetically((areasRes.data || []).map(deliveryAreaFromDB));
-
-      let settings = sanitizePublicSettings(initialSettings);
-      let shouldPersistSettings = false;
-      if (settingsRes.data && settingsRes.data.data) {
-        settings = sanitizePublicSettings(settingsRes.data.data);
-      } else {
-        shouldPersistSettings = true;
+      const built = await getOrBuildPublicStatePayload(supabase);
+      if (built.error || !built.payload) {
+        return res.status(500).json({ error: built.error || 'Erro ao carregar estado da loja.' });
       }
-
-      const reconciled = reconcileSettingsCategoriesAndOrders(settings, allProductRows as any);
-      settings = reconciled.settings;
-      if (reconciled.changed) {
-        shouldPersistSettings = true;
-      }
-
-      const productsWithCombos = applyCombosStockAndCost(allProductRows, settings);
-      const products = productsWithCombos
-        .filter((p) => p.active !== false)
-        .map(sanitizePublicProduct);
-
-      if (shouldPersistSettings) {
-        const { error: persistErr } = await supabase.from('store_settings').upsert({
-          id: 'default',
-          data: settings,
-          updated_at: new Date().toISOString(),
-        });
-        if (persistErr) {
-          console.error('[Supabase Error] store_settings persist in /state:', persistErr.message);
-        }
-      }
-
-      return res.json({
-        products,
-        deliveryAreas,
-        settings,
-      });
+      return res.json(built.payload);
     } catch (err: any) {
       console.error('[Server Error] GET /api/state:', err);
       return res.status(500).json({ error: err.message || 'Erro interno ao carregar dados.' });
@@ -3344,12 +3464,20 @@ export function createApp(): express.Express {
         ordersChanged: true,
         productsChanged: true,
         tabsChanged: true,
+        cashSessionChanged: true,
         serverTime: new Date().toISOString(),
       });
     }
 
     try {
-      const [latestOrderRes, latestProdRes, latestMovRes, latestTabRes, latestTabItemRes] = await Promise.all([
+      const [
+        latestOrderRes,
+        latestProdRes,
+        latestMovRes,
+        latestTabRes,
+        latestTabItemRes,
+        latestCashSessionRes,
+      ] = await Promise.all([
         supabase
           .from('orders')
           .select('created_at,updated_at')
@@ -3380,6 +3508,12 @@ export function createApp(): express.Express {
           .order('created_at', { ascending: false })
           .limit(1)
           .maybeSingle(),
+        supabase
+          .from('cash_sessions')
+          .select('opened_at,closed_at,created_at')
+          .order('opened_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
       ]);
 
       if (latestOrderRes.error) {
@@ -3396,6 +3530,9 @@ export function createApp(): express.Express {
       }
       if (latestTabItemRes.error) {
         console.error('[Supabase Error] /admin/changes table_tab_items:', latestTabItemRes.error.message);
+      }
+      if (latestCashSessionRes.error) {
+        console.error('[Supabase Error] /admin/changes cash_sessions:', latestCashSessionRes.error.message);
       }
 
       const toMs = (v: unknown): number => {
@@ -3418,6 +3555,11 @@ export function createApp(): express.Express {
         toMs(latestTabItemRes.data?.created_at),
         toMs(latestTabItemRes.data?.cancelled_at)
       );
+      const latestCashSessionMs = Math.max(
+        toMs(latestCashSessionRes.data?.opened_at),
+        toMs(latestCashSessionRes.data?.closed_at),
+        toMs(latestCashSessionRes.data?.created_at)
+      );
 
       // Add a small 2s safety overlap window
       const thresholdMs = Math.max(0, sinceMs - 2000);
@@ -3426,6 +3568,7 @@ export function createApp(): express.Express {
         ordersChanged: latestOrderMs >= thresholdMs,
         productsChanged: latestProdMs >= thresholdMs,
         tabsChanged: latestTabMs >= thresholdMs,
+        cashSessionChanged: latestCashSessionMs >= thresholdMs,
         serverTime: new Date().toISOString(),
       });
     } catch (err: any) {
@@ -3520,6 +3663,20 @@ export function createApp(): express.Express {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: 'Supabase não configurado.' });
 
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+    const signed = token ? verifySignedToken(token) : null;
+    const isAdmin = signed?.role === 'admin';
+
+    // Non-admin requests use the 30s public cache (never exposes admin/cost fields)
+    if (!isAdmin) {
+      const built = await getOrBuildPublicStatePayload(supabase);
+      if (built.error || !built.payload) {
+        return res.status(500).json({ error: built.error || 'Erro ao carregar produtos.' });
+      }
+      return res.json(built.payload.products);
+    }
+
     const [{ data, error }, imageMetaMap, { data: settingsRow, error: settingsErr }] = await Promise.all([
       supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE).order('name'),
       fetchProductImageMetaMap(supabase),
@@ -3528,22 +3685,57 @@ export function createApp(): express.Express {
     if (error) return res.status(500).json({ error: error.message });
     if (settingsErr) return res.status(500).json({ error: settingsErr.message });
 
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
-    const signed = token ? verifySignedToken(token) : null;
-    const isAdmin = signed?.role === 'admin';
-
     const dbSettings = settingsRow?.data ? sanitizePublicSettings(settingsRow.data) : initialSettings;
     const mapped = applyCombosStockAndCost(mapProductsFromDB(data, imageMetaMap), dbSettings);
-    res.json(isAdmin ? mapped : mapped.filter((p) => p.active).map(sanitizePublicProduct));
+    res.json(mapped);
   });
 
   // ---------------------------------------------------------------------------
   // PUBLIC PRODUCT IMAGE ROUTE: GET /products/:id/image
-  // Reads ONLY image, updated_at of that single product and serves binary with immutable cache
+  // Serves from ~25 MB in-memory binary cache (keyed by id + versionMs/v) or reads from DB once
   // ---------------------------------------------------------------------------
   router.get('/products/:id/image', async (req, res) => {
-    const { id } = req.params;
+    const id = String(req.params.id || '').trim();
+    if (!id) {
+      return res.status(404).end();
+    }
+
+    const rawQueryV = typeof req.query.v === 'string' ? req.query.v.trim() : '';
+    const requestedKey = rawQueryV ? `${id}:${rawQueryV}` : productImageLatestKeyByProductId.get(id) || '';
+    const cachedEntry =
+      (requestedKey ? productImageBinaryCache.get(requestedKey) : undefined) ||
+      (!rawQueryV && productImageLatestKeyByProductId.has(id)
+        ? productImageBinaryCache.get(productImageLatestKeyByProductId.get(id)!)
+        : undefined);
+
+    if (cachedEntry) {
+      // Refresh LRU position in Map
+      const hitKey = `${cachedEntry.productId}:${cachedEntry.versionMs}`;
+      if (productImageBinaryCache.has(hitKey)) {
+        productImageBinaryCache.delete(hitKey);
+        productImageBinaryCache.set(hitKey, cachedEntry);
+      }
+
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      res.setHeader('ETag', cachedEntry.etag);
+
+      if (req.headers['if-none-match'] === cachedEntry.etag) {
+        return res.status(304).end();
+      }
+
+      if (cachedEntry.redirectUrl) {
+        return res.redirect(302, cachedEntry.redirectUrl);
+      }
+
+      if (cachedEntry.binaryBuffer && cachedEntry.binaryBuffer.length > 0) {
+        res.setHeader('Content-Type', cachedEntry.contentType);
+        res.setHeader('Content-Length', String(cachedEntry.binaryBuffer.length));
+        res.setHeader('X-Image-Storage-Bytes', String(cachedEntry.storageBytes));
+        res.setHeader('X-Image-Decoded-Bytes', String(cachedEntry.binaryBuffer.length));
+        return res.status(200).send(cachedEntry.binaryBuffer);
+      }
+    }
+
     const supabase = getSupabase();
     if (!supabase) {
       return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
@@ -3567,15 +3759,25 @@ export function createApp(): express.Express {
 
     const versionMs = parseUpdatedAtVersionMs(data.updated_at);
     const etag = `W/"prod-img-${Buffer.from(String(id)).toString('hex')}-${versionMs}-${rawImage.length}"`;
+    const cacheKey = `${id}:${versionMs}`;
 
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     res.setHeader('ETag', etag);
 
-    if (req.headers['if-none-match'] === etag) {
-      return res.status(304).end();
-    }
-
     if (/^https?:\/\//i.test(rawImage)) {
+      setProductImageCacheEntry(cacheKey, {
+        productId: id,
+        versionMs,
+        etag,
+        contentType: 'text/plain',
+        binaryBuffer: null,
+        redirectUrl: rawImage,
+        storageBytes: Buffer.byteLength(rawImage, 'utf8'),
+        byteSize: Buffer.byteLength(rawImage, 'utf8') + 128,
+      });
+      if (req.headers['if-none-match'] === etag) {
+        return res.status(304).end();
+      }
       return res.redirect(302, rawImage);
     }
 
@@ -3592,9 +3794,25 @@ export function createApp(): express.Express {
       return res.status(404).end();
     }
 
+    const storageBytes = Buffer.byteLength(rawImage, 'utf8');
+    setProductImageCacheEntry(cacheKey, {
+      productId: id,
+      versionMs,
+      etag,
+      contentType,
+      binaryBuffer,
+      redirectUrl: null,
+      storageBytes,
+      byteSize: binaryBuffer.length + 128,
+    });
+
+    if (req.headers['if-none-match'] === etag) {
+      return res.status(304).end();
+    }
+
     res.setHeader('Content-Type', contentType);
     res.setHeader('Content-Length', String(binaryBuffer.length));
-    res.setHeader('X-Image-Storage-Bytes', String(Buffer.byteLength(rawImage, 'utf8')));
+    res.setHeader('X-Image-Storage-Bytes', String(storageBytes));
     res.setHeader('X-Image-Decoded-Bytes', String(binaryBuffer.length));
     return res.status(200).send(binaryBuffer);
   });
@@ -3632,7 +3850,8 @@ export function createApp(): express.Express {
       return res.status(404).json({ error: 'Produto não encontrado.' });
     }
 
-    invalidateProductImageMetaCache();
+    invalidateProductImageCache(id);
+    invalidatePublicCache();
     const versionMs = parseUpdatedAtVersionMs(data.updated_at);
     const hasImage = Boolean(imgValidation.value);
     const externalUrl =
@@ -3718,7 +3937,8 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
-    invalidateProductImageMetaCache();
+    invalidateProductImageCache(product.id);
+    invalidatePublicCache();
     const imageMetaMap = await fetchProductImageMetaMap(supabase, true);
     let savedProduct = data ? productFromDB(data, imageMetaMap) : normalizedProduct;
     const { data: settingsRow, error: settingsErr } = await supabase
@@ -3749,6 +3969,7 @@ export function createApp(): express.Express {
         return res.status(500).json({ error: adjErr.message });
       }
       savedProduct.stock = Number(newStockVal ?? requestedStock);
+      invalidatePublicCache();
     }
 
     if (isCombo) {
@@ -3834,7 +4055,10 @@ export function createApp(): express.Express {
       updated_at: new Date().toISOString(),
     };
 
-    if (!imgValidation.keepExisting) {
+    if (
+      !imgValidation.keepExisting &&
+      !(typeof body.image === 'string' && body.image.trim().startsWith('/api/products/'))
+    ) {
       updateData.image = imgValidation.value;
     }
 
@@ -3860,7 +4084,8 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error?.message || 'Produto não encontrado.' });
     }
 
-    invalidateProductImageMetaCache();
+    invalidateProductImageCache(id);
+    invalidatePublicCache();
     const imageMetaMap = await fetchProductImageMetaMap(supabase, true);
     let updatedProduct = productFromDB(data, imageMetaMap);
 
@@ -3884,6 +4109,7 @@ export function createApp(): express.Express {
         return res.status(500).json({ error: msg });
       }
       updatedProduct.stock = Number(newStockVal ?? targetStock);
+      invalidatePublicCache();
     }
 
     if (isCombo) {
@@ -3948,6 +4174,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: updateErr?.message || 'Erro ao salvar promoção.' });
     }
 
+    invalidatePublicCache();
     const imageMetaMap = await fetchProductImageMetaMap(supabase);
     res.json(productFromDB(updated, imageMetaMap));
   });
@@ -3973,6 +4200,7 @@ export function createApp(): express.Express {
       return res.status(404).json({ error: updateErr?.message || 'Produto não encontrado.' });
     }
 
+    invalidatePublicCache();
     const imageMetaMap = await fetchProductImageMetaMap(supabase);
     res.json(productFromDB(updated, imageMetaMap));
   });
@@ -4062,6 +4290,7 @@ export function createApp(): express.Express {
       return res.status(400).json({ error: msg || 'Não foi possível ajustar o estoque.' });
     }
 
+    invalidatePublicCache();
     return res.json({ stock: Number(newStock ?? 0) });
   };
 
@@ -4295,7 +4524,8 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
-    invalidateProductImageMetaCache();
+    invalidateProductImageCache(id);
+    invalidatePublicCache();
 
     // If deleted product was in store_settings (combos, hiddenFromStoreIds, featuredProductIds, caseSaleChannels), clean it up
     const { data: settingsRow, error: settingsErr } = await supabase
@@ -4334,6 +4564,7 @@ export function createApp(): express.Express {
       }
     }
 
+    invalidatePublicCache();
     res.json({ success: true });
   });
 
@@ -4618,7 +4849,8 @@ export function createApp(): express.Express {
       updated++;
     }
 
-    invalidateProductImageMetaCache();
+    invalidateProductImageCache();
+    invalidatePublicCache();
 
     return res.json({
       created,
@@ -4680,6 +4912,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
+    invalidatePublicCache();
     res.status(201).json(normalizedArea);
   });
 
@@ -4723,6 +4956,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
+    invalidatePublicCache();
     res.json(updated);
   });
 
@@ -4737,6 +4971,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
+    invalidatePublicCache();
     res.json({ success: true });
   });
 
@@ -5651,6 +5886,8 @@ export function createApp(): express.Express {
       }
     }
 
+    invalidatePublicCache();
+
     if (guestToken) {
       recordGuestOrderRateLimit(clientIpForRateLimit, guestPhoneDigitsForRateLimit);
       const sanitizedGuestOrder = sanitizeCustomerOrder(newOrder);
@@ -5904,6 +6141,7 @@ export function createApp(): express.Express {
       }
     }
 
+    invalidatePublicCache();
     res.json(orderFromDB(updatedRow));
   });
 
@@ -5947,6 +6185,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
+    invalidatePublicCache();
     res.json({ success: true });
   });
 
@@ -6069,6 +6308,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: error.message });
     }
 
+    invalidatePublicCache();
     res.json(cleanSettings);
   });
 
@@ -6167,6 +6407,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: saveSettingsErr.message });
     }
 
+    invalidatePublicCache();
     return res.json({
       settings: sanitizedFinal,
       movedCount: productsInCategory.length,
@@ -6221,7 +6462,10 @@ export function createApp(): express.Express {
 
     const links = linksData || [];
 
-    const tabItemsMap = new Map<string, { itemsCount: number; subtotal: number }>();
+    const tabItemsMap = new Map<
+      string,
+      { itemsCount: number; subtotal: number; rawItems: TableTabItem[] }
+    >();
 
     if (openTabs.length > 0) {
       const tabIds = openTabs.map((t) => t.id);
@@ -6238,10 +6482,18 @@ export function createApp(): express.Express {
 
       const items = (itemsData || []).map(tableTabItemFromDB);
       for (const item of items) {
-        const current = tabItemsMap.get(item.tabId) || { itemsCount: 0, subtotal: 0 };
-        const unitsPerSale = item.saleUnit === 'case' && item.unitsPerSale && item.unitsPerSale > 1 ? item.unitsPerSale : 1;
+        const current = tabItemsMap.get(item.tabId) || {
+          itemsCount: 0,
+          subtotal: 0,
+          rawItems: [],
+        };
+        const unitsPerSale =
+          item.saleUnit === 'case' && item.unitsPerSale && item.unitsPerSale > 1
+            ? item.unitsPerSale
+            : 1;
         current.itemsCount += item.quantity * unitsPerSale;
         current.subtotal += item.unitPrice * item.quantity;
+        current.rawItems.push(item);
         tabItemsMap.set(item.tabId, current);
       }
     }
@@ -6250,7 +6502,11 @@ export function createApp(): express.Express {
       // 1. If primary table of an open tab
       const tab = openTabs.find((t) => t.tableId === tbl.id);
       if (tab) {
-        const itemStats = tabItemsMap.get(tab.id) || { itemsCount: 0, subtotal: 0 };
+        const itemStats = tabItemsMap.get(tab.id) || {
+          itemsCount: 0,
+          subtotal: 0,
+          rawItems: [],
+        };
         const tabLinks = links.filter((l: any) => l.tab_id === tab.id);
         const linkedTables: LinkedTable[] = [];
         for (const l of tabLinks) {
@@ -6270,6 +6526,7 @@ export function createApp(): express.Express {
           currentTab: {
             ...tab,
             itemsCount: itemStats.itemsCount,
+            itemsSummary: formatCartItemsUnitAndCaseSummary(itemStats.rawItems),
             subtotal: Math.round(itemStats.subtotal * 100) / 100,
           },
           linkedTables: linkedTables.length > 0 ? linkedTables : undefined,
@@ -6757,6 +7014,7 @@ export function createApp(): express.Express {
         return res.status(400).json({ error: translateTabRpcError(msg) });
       }
 
+      invalidatePublicCache();
       return res.status(201).json({ success: true, itemId });
     }
 
@@ -6792,6 +7050,7 @@ export function createApp(): express.Express {
       return res.status(400).json({ error: translateTabRpcError(rpcErr.message) });
     }
 
+    invalidatePublicCache();
     res.status(201).json({ success: true, itemId });
   });
 
@@ -6836,6 +7095,7 @@ export function createApp(): express.Express {
       return res.status(400).json({ error: translateTabRpcError(rpcErr.message) });
     }
 
+    invalidatePublicCache();
     res.json({ success: true });
   });
 
@@ -7302,6 +7562,7 @@ export function createApp(): express.Express {
       return res.status(500).json({ error: translateTabRpcError(closeRpcErr.message) });
     }
 
+    invalidatePublicCache();
     res.json({ success: true, order: newOrder });
   });
 
@@ -7335,6 +7596,7 @@ export function createApp(): express.Express {
         .eq('id', req.params.id);
     }
 
+    invalidatePublicCache();
     res.json({ success: true });
   });
 
@@ -7402,7 +7664,9 @@ export function createApp(): express.Express {
 
     let ordersCount = 0;
     let totalRevenue = 0;
+    let productsGrossTotal = 0;
     let totalCost = 0;
+    let missingCostItemsCount = 0;
     let onlineCount = 0;
     let onlineRevenue = 0;
     let posCount = 0;
@@ -7456,21 +7720,43 @@ export function createApp(): express.Express {
         paymentBreakdown.pix += total;
       }
 
-      if (row.notes) {
-        serviceFeeTotal += extractServiceFeeFromNotes(String(row.notes));
-      }
+      const orderServiceFee = row.notes ? extractServiceFeeFromNotes(String(row.notes)) : 0;
+      serviceFeeTotal += orderServiceFee;
 
       const items = Array.isArray(row.items) ? row.items : [];
+      let itemsPriceSum = 0;
       for (const it of items) {
-        const price = Number(it?.price) || 0;
-        const cost = Number(it?.costPrice) || price * 0.65;
+        const price = Math.max(0, Number(it?.price) || 0);
         const qty = Math.max(1, Number(it?.quantity) || 1);
-        totalCost += cost * qty;
+        itemsPriceSum += price * qty;
+
+        const rawCost = Number(it?.costPrice);
+        if (Number.isFinite(rawCost) && rawCost > 0) {
+          totalCost += rawCost * qty;
+        } else {
+          missingCostItemsCount += qty;
+        }
       }
+
+      const rowSubtotal = Number(row.subtotal);
+      const orderProductsValue =
+        Number.isFinite(rowSubtotal) && rowSubtotal > 0
+          ? rowSubtotal
+          : itemsPriceSum > 0
+          ? itemsPriceSum
+          : Math.max(0, total + discount - (Number(row.delivery_fee) || 0) - orderServiceFee);
+
+      productsGrossTotal += orderProductsValue;
     }
 
     totalRevenue = Math.round(totalRevenue * 100) / 100;
-    const netProfit = Math.max(0, Math.round((totalRevenue - totalCost) * 100) / 100);
+    discountTotal = Math.round(discountTotal * 100) / 100;
+    const productsRevenue = Math.max(0, Math.round((productsGrossTotal - discountTotal) * 100) / 100);
+    totalCost = Math.round(totalCost * 100) / 100;
+    const netProfit = Math.round((productsRevenue - totalCost) * 100) / 100;
+    const profitMarginPercent =
+      productsRevenue > 0 ? Math.round((netProfit / productsRevenue) * 1000) / 10 : 0;
+
     const avgTicket = ordersCount > 0 ? Math.round((totalRevenue / ordersCount) * 100) / 100 : 0;
     onlineRevenue = Math.round(onlineRevenue * 100) / 100;
     posRevenue = Math.round(posRevenue * 100) / 100;
@@ -7480,7 +7766,6 @@ export function createApp(): express.Express {
     paymentBreakdown.cartao_debito = Math.round(paymentBreakdown.cartao_debito * 100) / 100;
     paymentBreakdown.cartao_credito = Math.round(paymentBreakdown.cartao_credito * 100) / 100;
     serviceFeeTotal = Math.round(serviceFeeTotal * 100) / 100;
-    discountTotal = Math.round(discountTotal * 100) / 100;
 
     const expectedCash = Math.round((openingCash + paymentBreakdown.dinheiro) * 100) / 100;
     const cashDifference =
@@ -7489,7 +7774,11 @@ export function createApp(): express.Express {
     return {
       ordersCount,
       totalRevenue,
+      productsRevenue,
+      totalCost,
       netProfit,
+      profitMarginPercent,
+      missingCostItemsCount,
       avgTicket,
       onlineCount,
       onlineRevenue,
@@ -7517,6 +7806,13 @@ export function createApp(): express.Express {
     if (typeof rawSummary.totalRevenue !== 'number' && typeof rawSummary.ordersCount !== 'number') {
       return null;
     }
+    // Require new fields so older closed sessions without productsRevenue/missingCostItemsCount are recomputed cleanly from orders
+    if (
+      typeof rawSummary.productsRevenue !== 'number' ||
+      typeof rawSummary.missingCostItemsCount !== 'number'
+    ) {
+      return null;
+    }
     const openingCash = Math.max(0, Math.round((Number(openingCashRaw ?? rawSummary.openingCash) || 0) * 100) / 100);
     const countedCash =
       countedCashRaw !== null && countedCashRaw !== undefined && !Number.isNaN(Number(countedCashRaw))
@@ -7534,11 +7830,25 @@ export function createApp(): express.Express {
       countedCash !== null ? Math.round((countedCash - expectedCash) * 100) / 100 : null;
     const ordersCount = Math.max(0, Math.floor(Number(rawSummary.ordersCount) || 0));
     const totalRevenue = Math.max(0, Math.round((Number(rawSummary.totalRevenue) || 0) * 100) / 100);
+    const productsRevenue = Math.max(0, Math.round((Number(rawSummary.productsRevenue) || 0) * 100) / 100);
+    const totalCost = Math.max(0, Math.round((Number(rawSummary.totalCost) || 0) * 100) / 100);
+    const netProfit = Math.round((Number(rawSummary.netProfit) || 0) * 100) / 100;
+    const profitMarginPercent =
+      typeof rawSummary.profitMarginPercent === 'number'
+        ? Math.round(rawSummary.profitMarginPercent * 10) / 10
+        : productsRevenue > 0
+        ? Math.round((netProfit / productsRevenue) * 1000) / 10
+        : 0;
+    const missingCostItemsCount = Math.max(0, Math.floor(Number(rawSummary.missingCostItemsCount) || 0));
 
     return {
       ordersCount,
       totalRevenue,
-      netProfit: Math.max(0, Math.round((Number(rawSummary.netProfit ?? totalRevenue * 0.35) || 0) * 100) / 100),
+      productsRevenue,
+      totalCost,
+      netProfit,
+      profitMarginPercent,
+      missingCostItemsCount,
       avgTicket:
         ordersCount > 0
           ? Math.round((Number(rawSummary.avgTicket ?? totalRevenue / ordersCount) || 0) * 100) / 100
@@ -7587,7 +7897,7 @@ export function createApp(): express.Express {
     const endIso = sessionRow.closed_at ? String(sessionRow.closed_at) : new Date().toISOString();
     const { data: orderRows, error: ordErr } = await supabase
       .from('orders')
-      .select('id, status, source, total, discount, payment_method, notes, items, created_at')
+      .select('id, status, source, subtotal, delivery_fee, total, discount, payment_method, notes, items, created_at')
       .gte('created_at', openedAt)
       .lte('created_at', endIso);
 
@@ -7643,6 +7953,7 @@ export function createApp(): express.Express {
       return { error: upsertErr.message };
     }
 
+    invalidatePublicCache();
     return { settings: nextSettings };
   };
 
@@ -7876,7 +8187,7 @@ export function createApp(): express.Express {
     const closedAtIso = new Date().toISOString();
     const { data: orderRows, error: ordErr } = await supabase
       .from('orders')
-      .select('id, status, source, total, discount, payment_method, notes, items, created_at')
+      .select('id, status, source, subtotal, delivery_fee, total, discount, payment_method, notes, items, created_at')
       .gte('created_at', String(sessionRow.opened_at))
       .lte('created_at', closedAtIso);
 
@@ -8000,7 +8311,7 @@ export function createApp(): express.Express {
 
     const { data: orderRows, error: ordErr } = await supabase
       .from('orders')
-      .select('id, status, source, total, discount, payment_method, notes, items, created_at')
+      .select('id, status, source, subtotal, delivery_fee, total, discount, payment_method, notes, items, created_at')
       .gte('created_at', fromIso)
       .lte('created_at', toIsoVal);
 

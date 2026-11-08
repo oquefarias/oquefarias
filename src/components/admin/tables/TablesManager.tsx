@@ -99,19 +99,18 @@ export const TablesManager: React.FC<TablesManagerProps> = ({
       }
     };
 
-    // Auto-refresh every 15 seconds ONLY while tab is visible
-    const interval = setInterval(() => {
-      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+    const unsubscribeChanges = api.subscribeAdminChanges((changes) => {
+      if (changes.tabsChanged) {
         loadTables();
       }
-    }, 15000);
+    });
 
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleVisibilityChange);
     }
 
     return () => {
-      clearInterval(interval);
+      unsubscribeChanges();
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', handleVisibilityChange);
       }
@@ -407,7 +406,7 @@ export const TablesManager: React.FC<TablesManagerProps> = ({
                       <div className="flex items-center gap-3 text-[11px] text-neutral-500">
                         <span>👥 {tab.peopleCount} {tab.peopleCount === 1 ? 'pessoa' : 'pessoas'}</span>
                         <span>•</span>
-                        <span>📦 {tab.itemsCount} un</span>
+                        <span>📦 {tab.itemsSummary || `${tab.itemsCount} un`}</span>
                       </div>
                     </div>
                   </div>

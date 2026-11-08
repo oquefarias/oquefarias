@@ -35,6 +35,7 @@ export interface AdminChangesResponse {
   ordersChanged: boolean;
   productsChanged: boolean;
   tabsChanged: boolean;
+  cashSessionChanged?: boolean;
   serverTime: string;
 }
 
@@ -347,6 +348,7 @@ export interface LinkedTable {
 export interface TableWithTab extends DiningTable {
   currentTab?: (TableTab & {
     itemsCount: number;
+    itemsSummary?: string;
     subtotal: number;
   }) | null;
   linkedTables?: LinkedTable[];
@@ -1064,7 +1066,11 @@ export interface ProductImportResult {
 export interface CashSessionSummary {
   ordersCount: number;
   totalRevenue: number;
+  productsRevenue?: number;
+  totalCost?: number;
   netProfit: number;
+  profitMarginPercent?: number;
+  missingCostItemsCount?: number;
   avgTicket: number;
   onlineCount: number;
   onlineRevenue: number;
@@ -1201,4 +1207,97 @@ export function formatDeliveryAreaOptionLabel(area: DeliveryArea): string {
   const timeText = (area.estimatedTime || '30 a 45 min').trim();
   return `${area.name} — taxa R$ ${feeFormatted} — ${timeText}`;
 }
+
+/**
+ * Formats separated unit and case counts for a product or cart:
+ * e.g. "3 un + 1 cx (12 un)", "3 un", "1 cx (12 un)".
+ */
+export function formatUnitAndCaseCount(
+  unitQty: number,
+  caseQty: number,
+  caseSize?: number | null
+): string {
+  const u = Math.max(0, Math.round(Number(unitQty) || 0));
+  const c = Math.max(0, Math.round(Number(caseQty) || 0));
+  const cs = Number(caseSize) > 1 ? Math.round(Number(caseSize)) : 0;
+  const caseUnitsTotal = cs > 0 ? c * cs : 0;
+
+  if (u > 0 && c > 0) {
+    return caseUnitsTotal > 0
+      ? `${u} un + ${c} cx (${caseUnitsTotal} un)`
+      : `${u} un + ${c} cx`;
+  }
+  if (c > 0) {
+    return caseUnitsTotal > 0 ? `${c} cx (${caseUnitsTotal} un)` : `${c} cx`;
+  }
+  return `${u} un`;
+}
+
+/**
+ * Formats an array of cart/tab/order items separating loose units ("un") and cases ("cx (N un)").
+ */
+export function formatCartItemsUnitAndCaseSummary(
+  items: Array<{
+    quantity: number;
+    saleUnit?: SaleUnit | null;
+    unitsPerSale?: number | null;
+    caseSize?: number | null;
+    product?: { caseSize?: number | null } | null;
+  }>
+): string {
+  let unitQty = 0;
+  let caseQty = 0;
+  let caseUnitsTotal = 0;
+
+  for (const item of items) {
+    const qty = Math.max(0, Math.round(Number(item?.quantity) || 0));
+    if (qty <= 0) continue;
+    if (item?.saleUnit === 'case') {
+      caseQty += qty;
+      const perCase =
+        Number(item?.unitsPerSale) > 1
+          ? Math.round(Number(item.unitsPerSale))
+          : Number(item?.caseSize) > 1
+          ? Math.round(Number(item.caseSize))
+          : Number(item?.product?.caseSize) > 1
+          ? Math.round(Number(item?.product?.caseSize))
+          : 0;
+      if (perCase > 0) {
+        caseUnitsTotal += qty * perCase;
+      }
+    } else {
+      unitQty += qty;
+    }
+  }
+
+  if (unitQty > 0 && caseQty > 0) {
+    return caseUnitsTotal > 0
+      ? `${unitQty} un + ${caseQty} cx (${caseUnitsTotal} un)`
+      : `${unitQty} un + ${caseQty} cx`;
+  }
+  if (caseQty > 0) {
+    return caseUnitsTotal > 0 ? `${caseQty} cx (${caseUnitsTotal} un)` : `${caseQty} cx`;
+  }
+  return `${unitQty} un`;
+}
+
+/**
+ * Returns the product's safe image URL (preferring `/api/products/:id/image` via `product.imageUrl`),
+ * strictly rejecting any base64 (`data:`) strings so lists and grids remain lightweight.
+ */
+export function getSafeProductImageUrl(
+  product?: { imageUrl?: string | null; image?: string | null } | null
+): string {
+  if (!product) return '';
+  const url = typeof product.imageUrl === 'string' ? product.imageUrl.trim() : '';
+  if (url && !url.toLowerCase().startsWith('data:')) {
+    return url;
+  }
+  const fallback = typeof product.image === 'string' ? product.image.trim() : '';
+  if (fallback && !fallback.toLowerCase().startsWith('data:')) {
+    return fallback;
+  }
+  return '';
+}
+
 

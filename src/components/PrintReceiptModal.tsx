@@ -226,11 +226,12 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
                     <div key={item.key} className="flex justify-between items-start text-xs">
                       <div className="pr-2">
                         <span className="font-bold text-neutral-900">
-                          {isCase ? `${item.quantity} cx ` : `${item.quantity}x `}
+                          {isCase
+                            ? `${item.quantity} cx (${item.quantity * (item.unitsPerSale || 1)} un) `
+                            : `${item.quantity} un `}
                         </span>
                         <span className="font-semibold">
                           {item.name}
-                          {isCase ? ` (c/${item.unitsPerSale})` : ''}
                         </span>
                         <span className="block text-[11px] text-neutral-500">
                           {item.volume} {item.isCold ? '• Gelada ❄️' : ''} ({formatCurrency(item.price)} {isCase ? 'cx' : 'un'})
