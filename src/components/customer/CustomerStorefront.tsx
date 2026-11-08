@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import confetti from 'canvas-confetti';
 import {
   CustomerProfile,
@@ -68,6 +68,8 @@ import {
   Eye,
   EyeOff,
   Home,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 import { fetchAddressByCep } from '../../utils/geo';
 
@@ -513,41 +515,67 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return onlyCold ? storeVisibleProducts.filter((p) => p.isCold) : storeVisibleProducts;
   }, [storeVisibleProducts, onlyCold]);
 
-  // Active promotional products for the "🔥 Promoções" section
+  // Active promotional products
   const promoProducts = useMemo(() => {
     const activePromos = storeVisibleProducts.filter((p) => isProductPromoActive(p));
     return sortProductsForStore(activePromos, settings, storeVisibleProducts);
   }, [storeVisibleProducts, settings]);
 
-  // Filter products and place preferred products (settings.featuredProductIds) first, followed by store sort mode/order
-  const filteredProducts = useMemo(() => {
-    const matching = baseVisibleProducts.filter((p) => {
-      if (selectedCategory !== 'todas') {
-        if (selectedCategory === 'outros') {
-          if (p.category && knownCategoryIds.has(p.category)) return false;
-        } else if (p.category !== selectedCategory) {
-          return false;
-        }
+  // Combined carousel items: preferred products (featuredProductIds visible in store) + promoProducts without duplicates
+  const featuredAndPromoCarouselProducts = useMemo(() => {
+    const visibleById = new Map<string, Product>(storeVisibleProducts.map((p) => [p.id, p]));
+    const seen = new Set<string>();
+    const combined: Product[] = [];
+
+    const featuredIds = Array.isArray(settings.featuredProductIds) ? settings.featuredProductIds : [];
+    for (const id of featuredIds) {
+      const prod = visibleById.get(id);
+      if (prod && !seen.has(prod.id)) {
+        seen.add(prod.id);
+        combined.push(prod);
       }
-      if (searchQuery.trim()) {
-        const query = searchQuery.toLowerCase();
-        return (
-          p.name.toLowerCase().includes(query) ||
-          p.volume.toLowerCase().includes(query) ||
-          p.description.toLowerCase().includes(query)
-        );
+    }
+
+    for (const prod of promoProducts) {
+      if (!seen.has(prod.id)) {
+        seen.add(prod.id);
+        combined.push(prod);
       }
-      return true;
+    }
+
+    return combined;
+  }, [storeVisibleProducts, settings.featuredProductIds, promoProducts]);
+
+  // Products filtered by search query and cold filter across the entire catalog
+  const searchFilteredProducts = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return baseVisibleProducts;
+    return baseVisibleProducts.filter((p) => {
+      if (
+        p.name.toLowerCase().includes(query) ||
+        p.volume.toLowerCase().includes(query) ||
+        p.description.toLowerCase().includes(query)
+      ) {
+        return true;
+      }
+      if (isComboProduct(p.id, settings)) {
+        const metrics = calculateComboMetrics(p, settings, products);
+        if (metrics?.itemsSummaryText.toLowerCase().includes(query)) return true;
+      }
+      return false;
     });
+  }, [baseVisibleProducts, searchQuery, settings, products]);
 
-    return sortProductsForStore(matching, settings, storeVisibleProducts);
-  }, [baseVisibleProducts, selectedCategory, searchQuery, settings, storeVisibleProducts, knownCategoryIds]);
+  // Keep filteredProducts for empty-state checks
+  const filteredProducts = useMemo(() => {
+    return sortProductsForStore(searchFilteredProducts, settings, storeVisibleProducts);
+  }, [searchFilteredProducts, settings, storeVisibleProducts]);
 
+  // Continuous page grouped by category (always groups searchFilteredProducts across all categories with items)
   const groupedCategorySections = useMemo(() => {
-    if (selectedCategory !== 'todas' || searchQuery.trim() !== '') return [];
     const sections: { id: string; name: string; items: Product[] }[] = [];
     for (const cat of storeCategories) {
-      const catProducts = baseVisibleProducts.filter((p) => p.category === cat.id);
+      const catProducts = searchFilteredProducts.filter((p) => p.category === cat.id);
       if (catProducts.length > 0) {
         sections.push({
           id: cat.id,
@@ -556,7 +584,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         });
       }
     }
-    const otherProducts = baseVisibleProducts.filter(
+    const otherProducts = searchFilteredProducts.filter(
       (p) => !p.category || !knownCategoryIds.has(p.category)
     );
     if (otherProducts.length > 0) {
@@ -567,7 +595,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       });
     }
     return sections;
-  }, [selectedCategory, searchQuery, storeCategories, baseVisibleProducts, knownCategoryIds, settings, storeVisibleProducts]);
+  }, [storeCategories, searchFilteredProducts, knownCategoryIds, settings, storeVisibleProducts]);
 
   const getSelectedUnit = (product: Product): SaleUnit => {
     if (!canSellProductCase(product, settings, 'store')) return 'unit';
@@ -1159,29 +1187,19 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     };
 
     const list: { id: string; label: string; icon: any }[] = [
-      { id: 'todas', label: 'Todas as Bebidas', icon: Sparkles },
+      { id: 'todas', label: 'Início', icon: Sparkles },
     ];
 
-    for (const cat of storeCategories) {
-      if (baseVisibleProducts.some((p) => p.category === cat.id)) {
-        list.push({
-          id: cat.id,
-          label: cat.name,
-          icon: getCategoryIcon(cat.id),
-        });
-      }
-    }
-
-    if (baseVisibleProducts.some((p) => !p.category || !knownCategoryIds.has(p.category))) {
+    for (const sec of groupedCategorySections) {
       list.push({
-        id: 'outros',
-        label: 'Outros',
-        icon: Package,
+        id: sec.id,
+        label: sec.name,
+        icon: getCategoryIcon(sec.id),
       });
     }
 
     return list;
-  }, [storeCategories, baseVisibleProducts, knownCategoryIds]);
+  }, [groupedCategorySections]);
 
   // If the currently selected category becomes empty, switch back to 'todas'
   useEffect(() => {
@@ -1189,6 +1207,176 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setSelectedCategory('todas');
     }
   }, [categories, selectedCategory]);
+
+  // Refs & IntersectionObserver for continuous category scroll navigation (MUST be before `if (placedOrder)`)
+  const catalogTopRef = useRef<HTMLDivElement | null>(null);
+  const categoryNavScrollRef = useRef<HTMLDivElement | null>(null);
+  const featuredCarouselScrollRef = useRef<HTMLDivElement | null>(null);
+  const isManualScrollingRef = useRef<boolean>(false);
+  const manualScrollTimeoutRef = useRef<number | null>(null);
+
+  // Mouse drag-to-scroll state for desktop / preview horizontal lists
+  const dragStateRef = useRef<{
+    activeKey: string | null;
+    startX: number;
+    scrollLeft: number;
+    hasMoved: boolean;
+  }>({
+    activeKey: null,
+    startX: 0,
+    scrollLeft: 0,
+    hasMoved: false,
+  });
+
+  const scrollHorizontalContainer = (
+    ref: React.RefObject<HTMLDivElement | null>,
+    delta: number
+  ) => {
+    if (!ref.current) return;
+    ref.current.scrollBy({ left: delta, behavior: 'smooth' });
+  };
+
+  const getHorizontalDragProps = (
+    ref: React.RefObject<HTMLDivElement | null>,
+    key: string
+  ) => ({
+    onMouseDown: (e: React.MouseEvent<HTMLDivElement>) => {
+      if (e.button !== 0 || !ref.current) return;
+      dragStateRef.current = {
+        activeKey: key,
+        startX: e.pageX - ref.current.offsetLeft,
+        scrollLeft: ref.current.scrollLeft,
+        hasMoved: false,
+      };
+    },
+    onMouseMove: (e: React.MouseEvent<HTMLDivElement>) => {
+      const st = dragStateRef.current;
+      if (st.activeKey !== key || !ref.current) return;
+      const x = e.pageX - ref.current.offsetLeft;
+      const walk = x - st.startX;
+      if (Math.abs(walk) > 5) {
+        st.hasMoved = true;
+        e.preventDefault();
+        ref.current.scrollLeft = st.scrollLeft - walk * 1.25;
+      }
+    },
+    onMouseUp: () => {
+      if (dragStateRef.current.activeKey === key) {
+        dragStateRef.current.activeKey = null;
+      }
+    },
+    onMouseLeave: () => {
+      if (dragStateRef.current.activeKey === key) {
+        dragStateRef.current.activeKey = null;
+      }
+    },
+    onClickCapture: (e: React.MouseEvent<HTMLDivElement>) => {
+      if (dragStateRef.current.hasMoved) {
+        e.preventDefault();
+        e.stopPropagation();
+        dragStateRef.current.hasMoved = false;
+      }
+    },
+  });
+
+  const handleSelectCategoryPill = (catId: ProductCategory | 'todas') => {
+    setSelectedCategory(catId);
+    isManualScrollingRef.current = true;
+    if (manualScrollTimeoutRef.current !== null) {
+      window.clearTimeout(manualScrollTimeoutRef.current);
+    }
+    manualScrollTimeoutRef.current = window.setTimeout(() => {
+      isManualScrollingRef.current = false;
+      manualScrollTimeoutRef.current = null;
+    }, 750);
+
+    if (typeof window === 'undefined') return;
+    if (catId === 'todas') {
+      if (catalogTopRef.current) {
+        catalogTopRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } else {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+      return;
+    }
+
+    const sectionEl = document.getElementById(`cat-section-${catId}`);
+    if (sectionEl) {
+      sectionEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (manualScrollTimeoutRef.current !== null) {
+        window.clearTimeout(manualScrollTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  // Keep active category pill centered/visible inside horizontal category bar
+  useEffect(() => {
+    const navEl = categoryNavScrollRef.current;
+    if (!navEl) return;
+    const pillEl = navEl.querySelector<HTMLElement>(`[data-cat-pill="${selectedCategory}"]`);
+    if (!pillEl) return;
+    const navRect = navEl.getBoundingClientRect();
+    const pillRect = pillEl.getBoundingClientRect();
+    const offset = pillRect.left - navRect.left - navRect.width / 2 + pillRect.width / 2;
+    navEl.scrollBy({ left: offset, behavior: 'smooth' });
+  }, [selectedCategory]);
+
+  // Observe `#cat-section-${section.id}` during page scroll to highlight the active category pill
+  useEffect(() => {
+    if (placedOrder || typeof window === 'undefined' || !('IntersectionObserver' in window)) {
+      return;
+    }
+    if (groupedCategorySections.length === 0) return;
+
+    const visibleRatios = new Map<string, number>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const catId = entry.target.getAttribute('data-cat-section-id');
+          if (!catId) continue;
+          if (entry.isIntersecting) {
+            visibleRatios.set(catId, entry.intersectionRatio);
+          } else {
+            visibleRatios.delete(catId);
+          }
+        }
+
+        if (isManualScrollingRef.current) return;
+
+        if (window.scrollY < 160) {
+          setSelectedCategory('todas');
+          return;
+        }
+
+        // Pick the first category in catalog order that is currently intersecting in the upper viewport zone
+        for (const sec of groupedCategorySections) {
+          if (visibleRatios.has(sec.id)) {
+            setSelectedCategory(sec.id as ProductCategory);
+            break;
+          }
+        }
+      },
+      {
+        root: null,
+        rootMargin: '-125px 0px -58% 0px',
+        threshold: [0, 0.1, 0.25, 0.5],
+      }
+    );
+
+    for (const sec of groupedCategorySections) {
+      const el = document.getElementById(`cat-section-${sec.id}`);
+      if (el) observer.observe(el);
+    }
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [placedOrder, groupedCategorySections]);
 
   const getStatusBadgeInfo = (status: OrderStatus, delivType: 'delivery' | 'retirada' | 'local') => {
     switch (status) {
@@ -1739,31 +1927,31 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   }
 
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 pb-24">
+    <div ref={catalogTopRef} className="max-w-5xl mx-auto px-3 sm:px-6 pt-3 sm:pt-5 pb-36 md:pb-28">
       {/* Store Closed Warning Banner if offline */}
       {!settings.isOpen && (
-        <div className="mb-6 p-4 bg-red-600 text-white rounded-3xl shadow-lg border border-red-700 flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-2xl bg-white/20 flex items-center justify-center font-black text-lg shrink-0">
+        <div className="mb-3 p-3.5 bg-red-600 text-white rounded-2xl shadow-md border border-red-700 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-xl bg-white/20 flex items-center justify-center font-black text-sm shrink-0">
               🔴
             </div>
             <div>
-              <h4 className="font-black text-sm uppercase tracking-wide">
+              <h4 className="font-black text-xs sm:text-sm uppercase tracking-wide">
                 Depósito Fechado no Momento
               </h4>
-              <p className="text-xs text-red-100 mt-0.5">
+              <p className="text-[11px] sm:text-xs text-red-100 mt-0.5">
                 {settings.closedMessage || 'No momento não estamos aceitando novos pedidos de entrega.'}
               </p>
             </div>
           </div>
-          <div className="text-right text-xs text-red-100 font-medium shrink-0">
-            Horário de expediente: <strong className="text-white">{settings.openingHours}</strong>
+          <div className="text-xs text-red-100 font-medium shrink-0">
+            Horário: <strong className="text-white">{settings.openingHours}</strong>
           </div>
         </div>
       )}
 
       {guestTrackingError && (
-        <div className="mb-6 p-4 bg-red-50 border border-red-200 text-red-800 rounded-2xl flex items-center justify-between gap-3 text-xs font-bold">
+        <div className="mb-3 p-3.5 bg-red-50 border border-red-200 text-red-800 rounded-2xl flex items-center justify-between gap-3 text-xs font-bold">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
             <span>{guestTrackingError}</span>
@@ -1785,124 +1973,149 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         </div>
       )}
 
-      {/* Customer Account Recognition Bar */}
-      <div className="mb-6 bg-white p-3.5 rounded-2xl border border-neutral-200 flex flex-wrap items-center justify-between gap-3 shadow-xs">
-        <div className="flex items-center gap-2.5">
-          <div className="w-9 h-9 rounded-xl bg-amber-100 text-amber-800 flex items-center justify-center font-bold">
-            <User className="w-4 h-4" />
-          </div>
-          <div>
-            {currentCustomer ? (
-              <div>
-                <p className="text-xs font-bold text-neutral-900">
-                  Olá, <span className="text-amber-600">{currentCustomer.name}</span>! 👋
-                </p>
-                <p className="text-[11px] text-neutral-500">
-                  {currentCustomer.address
-                    ? `Entregando em: ${currentCustomer.address}, ${currentCustomer.number} (${currentCustomer.neighborhood})`
-                    : 'Conta ativa para pedidos rápidos'}
-                </p>
-              </div>
+      {/* Compact Delivery App Store Header (Yooga / iFood reference) */}
+      <header className="bg-white rounded-2xl border border-neutral-200 shadow-xs p-3.5 sm:p-4 mb-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            {settings.logoUrl ? (
+              <img
+                src={settings.logoUrl}
+                alt={settings.storeName}
+                width={56}
+                height={56}
+                loading="lazy"
+                className="w-12 h-12 sm:w-14 sm:h-14 rounded-2xl object-cover border border-neutral-200 shrink-0 bg-neutral-100"
+              />
             ) : (
-              <div>
-                <p className="text-xs font-bold text-neutral-900">Já tem cadastro?</p>
-                <p className="text-[11px] text-neutral-500">Acesse sua conta ou faça pedido rápido sem cadastro no carrinho.</p>
+              <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-2xl bg-amber-500 text-neutral-950 flex items-center justify-center shrink-0 shadow-xs">
+                <Beer className="w-6 h-6 sm:w-7 sm:h-7" />
               </div>
+            )}
+
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h1 className="text-base sm:text-xl font-black text-neutral-900 truncate">
+                  {settings.storeName}
+                </h1>
+                <span
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wide ${
+                    settings.isOpen
+                      ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                      : 'bg-red-100 text-red-800 border border-red-200'
+                  }`}
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      settings.isOpen ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'
+                    }`}
+                  />
+                  {settings.isOpen ? 'Aberto' : 'Fechado'}
+                </span>
+              </div>
+
+              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] sm:text-xs text-neutral-600 font-medium">
+                <span className="inline-flex items-center gap-1">
+                  <Clock className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                  <span>{settings.estimatedDeliveryTime || '30-45 min'}</span>
+                </span>
+                <span className="text-neutral-300">•</span>
+                <span>
+                  Mín. <strong className="text-neutral-800">{formatCurrency(settings.minOrderValue || 0)}</strong>
+                </span>
+                <span className="text-neutral-300">•</span>
+                <span className="inline-flex items-center gap-1">
+                  <Truck className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                  <span>{activeAreas.length} bairros atendidos</span>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Desktop Quick Actions */}
+          <div className="hidden md:flex items-center gap-2 shrink-0">
+            {(currentCustomer || savedGuestOrdersCount > 0) && (
+              <button
+                type="button"
+                onClick={handleOpenMyOrders}
+                className="px-3.5 py-2 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 rounded-xl text-xs font-black transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <Package className="w-3.5 h-3.5 text-amber-600" />
+                <span>Meus Pedidos</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setAuthModalInitialTab('login');
+                setIsAuthModalOpen(true);
+              }}
+              className="px-3.5 py-2 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <User className="w-3.5 h-3.5" />
+              <span>{currentCustomer ? currentCustomer.name.split(' ')[0] : 'Entrar / Conta'}</span>
+            </button>
+            {currentCustomer && (
+              <button
+                type="button"
+                onClick={() => {
+                  api.logoutCustomer();
+                  setCurrentCustomer(null);
+                  setCheckoutEntryStep('choice');
+                  setAppliedCoupon(null);
+                  setMyOrders([]);
+                }}
+                className="px-2.5 py-2 bg-neutral-100 hover:bg-red-50 text-neutral-600 hover:text-red-700 rounded-xl text-xs font-bold transition-colors cursor-pointer"
+              >
+                Sair
+              </button>
             )}
           </div>
         </div>
 
-        <div className="flex items-center gap-2 flex-wrap">
-          {(currentCustomer || savedGuestOrdersCount > 0) && (
+        {/* Logged-in Delivery Address Bar */}
+        {currentCustomer && (
+          <div className="mt-3 pt-2.5 border-t border-neutral-100 flex items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-1.5 min-w-0 text-neutral-700">
+              <MapPin className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+              <span className="truncate">
+                {currentCustomer.address ? (
+                  <>
+                    Entregar em:{' '}
+                    <strong className="text-neutral-900">
+                      {currentCustomer.address}, {currentCustomer.number}
+                    </strong>{' '}
+                    <span className="text-neutral-500">({currentCustomer.neighborhood})</span>
+                  </>
+                ) : (
+                  <>
+                    Olá, <strong className="text-neutral-900">{currentCustomer.name}</strong>! Cadastre seu endereço para entrega.
+                  </>
+                )}
+              </span>
+            </div>
             <button
-              onClick={handleOpenMyOrders}
-              className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-600 text-neutral-950 rounded-xl text-xs font-black transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
-            >
-              <Package className="w-3.5 h-3.5" />
-              <span>Meus pedidos</span>
-            </button>
-          )}
-          <button
-            onClick={() => {
-              setAuthModalInitialTab('login');
-              setIsAuthModalOpen(true);
-            }}
-            className="px-3.5 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer"
-          >
-            {currentCustomer ? 'Minha Conta / Endereço' : 'Entrar / Cadastrar'}
-          </button>
-          {currentCustomer && (
-            <button
+              type="button"
               onClick={() => {
-                api.logoutCustomer();
-                setCurrentCustomer(null);
-                setCheckoutEntryStep('choice');
-                setAppliedCoupon(null);
-                setMyOrders([]);
+                setAuthModalInitialTab('login');
+                setIsAuthModalOpen(true);
               }}
-              className="px-3 py-1.5 bg-neutral-100 hover:bg-red-50 text-neutral-600 hover:text-red-700 rounded-xl text-xs font-bold transition-colors cursor-pointer"
+              className="text-[11px] font-black text-amber-700 hover:text-amber-800 shrink-0 cursor-pointer"
             >
-              Sair
+              Alterar
             </button>
-          )}
-        </div>
-      </div>
-
-      {/* Store Hero Banner */}
-      <div className="relative rounded-3xl overflow-hidden bg-gradient-to-r from-neutral-900 via-amber-950 to-neutral-900 text-white p-6 sm:p-10 mb-8 shadow-xl">
-        <div className="relative z-10 flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
-          <div className="max-w-2xl">
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/20 border border-amber-400/30 text-amber-300 text-xs font-semibold mb-3">
-              <span className={`w-2 h-2 rounded-full ${settings.isOpen ? 'bg-emerald-400 animate-ping' : 'bg-red-400'}`}></span>
-              {settings.isOpen ? `Depósito Aberto • Entrega em até ${settings.estimatedDeliveryTime}` : 'Depósito Fechado no Momento'}
-            </div>
-            <h1 className="text-2xl sm:text-4xl font-black tracking-tight leading-tight">
-              {settings.storeName}
-            </h1>
-            <p className="mt-2 text-sm sm:text-base text-neutral-300 leading-relaxed">
-              Cervejas trincando de geladas, destilados, vinhos, gelo, carvão e petiscos entregues direto na sua porta!
-            </p>
-
-            <div className="mt-5 flex flex-wrap items-center gap-4 text-xs sm:text-sm text-neutral-300">
-              <div className="flex items-center gap-1.5">
-                <Clock className="w-4 h-4 text-amber-400" />
-                <span>{settings.openingHours}</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <Truck className="w-4 h-4 text-amber-400" />
-                <span>
-                  {activeAreas.length} bairros atendidos com entrega rápida
-                </span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <MapPin className="w-4 h-4 text-amber-400" />
-                <span>{settings.address}</span>
-              </div>
-            </div>
           </div>
-
-          {/* Store Logo / Profile Photo Display */}
-          {settings.logoUrl && (
-            <div className="shrink-0 hidden md:block">
-              <img
-                src={settings.logoUrl}
-                alt={settings.storeName}
-                className="w-28 h-28 rounded-3xl object-cover border-2 border-amber-400/40 shadow-2xl"
-              />
-            </div>
-          )}
-        </div>
-      </div>
+        )}
+      </header>
 
       {/* Out-of-Stock Cart Removal Notices */}
       {outOfStockNotices.length > 0 && (
-        <div className="mb-6 space-y-2">
+        <div className="mb-3 space-y-2">
           {outOfStockNotices.map((notice) => (
             <div
               key={notice}
-              className="p-3.5 bg-amber-50 border border-amber-300 text-amber-900 rounded-2xl shadow-sm flex items-center justify-between gap-3"
+              className="p-3 bg-amber-50 border border-amber-300 text-amber-900 rounded-2xl shadow-xs flex items-center justify-between gap-3"
             >
-              <div className="flex items-center gap-2.5 text-xs sm:text-sm font-bold">
+              <div className="flex items-center gap-2 text-xs font-bold">
                 <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
                 <span>{notice}</span>
               </div>
@@ -1920,311 +2133,303 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         </div>
       )}
 
-      {/* Featured 🔥 Promoções Horizontal Carousel (right below Hero Banner) */}
-      {promoProducts.length > 0 && (
-        <div className="mb-8 bg-gradient-to-br from-red-600/10 via-amber-500/10 to-white p-5 sm:p-6 rounded-3xl border border-red-200 shadow-sm">
-          <div className="flex items-center justify-between gap-2 mb-4">
-            <div className="flex items-center gap-2">
-              <h2 className="text-lg sm:text-xl font-black text-neutral-900 flex items-center gap-2">
-                <span>🔥 Promoções</span>
-              </h2>
-              <span className="px-2.5 py-0.5 rounded-full bg-red-600 text-white text-[11px] font-black uppercase tracking-wider">
-                Ofertas Ativas
+      {/* Optional Top Featured & Promo Carousel (settings.showFeaturedCarousel !== false) */}
+      {settings.showFeaturedCarousel !== false && featuredAndPromoCarouselProducts.length > 0 && (
+        <section className="mb-4">
+          <div className="flex items-center justify-between mb-2 px-0.5">
+            <h2 className="text-sm sm:text-base font-black text-neutral-900 flex items-center gap-1.5">
+              <span>🔥 Destaques & Promoções</span>
+            </h2>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11px] font-bold text-neutral-400 mr-1 hidden sm:inline">
+                Arraste ou use as setas
               </span>
+              <button
+                type="button"
+                onClick={() => scrollHorizontalContainer(featuredCarouselScrollRef, -280)}
+                className="w-7 h-7 rounded-lg bg-white hover:bg-neutral-50 border border-neutral-200 text-neutral-700 flex items-center justify-center shadow-2xs active:scale-95 cursor-pointer"
+                aria-label="Rolar destaques para a esquerda"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => scrollHorizontalContainer(featuredCarouselScrollRef, 280)}
+                className="w-7 h-7 rounded-lg bg-white hover:bg-neutral-50 border border-neutral-200 text-neutral-700 flex items-center justify-center shadow-2xs active:scale-95 cursor-pointer"
+                aria-label="Rolar destaques para a direita"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
             </div>
-            <span className="text-xs text-neutral-500 font-semibold hidden sm:inline">
-              Aproveite os descontos especiais
-            </span>
           </div>
 
-          <div className="flex gap-4 sm:gap-5 overflow-x-auto pb-2 snap-x snap-mandatory">
-            {promoProducts.map((product) => {
+          <div
+            ref={featuredCarouselScrollRef}
+            {...getHorizontalDragProps(featuredCarouselScrollRef, 'carousel')}
+            className="flex gap-2.5 overflow-x-auto pb-1.5 scrollbar-none cursor-grab active:cursor-grabbing select-none"
+          >
+            {featuredAndPromoCarouselProducts.map((product) => {
               const isCombo = isComboProduct(product.id, settings);
               const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
-              const hasCase = !isCombo && canSellProductCase(product, settings, 'store');
-              const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
               const activeUnit = getSelectedUnit(product);
+              const hasCase = !isCombo && canSellProductCase(product, settings, 'store');
               const isCaseSelected = activeUnit === 'case' && hasCase;
               const unitsPerSale = isCaseSelected ? Number(product.caseSize) : 1;
               const qty = getCartQuantity(product.id, activeUnit);
               const usedUnits = getCartTotalUnitsForProduct(product.id);
               const canAddMore = usedUnits + unitsPerSale <= product.stock;
               const isOutOfStock = product.stock <= 0;
-              const discountPct = getPromoDiscountPercent(product);
-              const unitEffPrice = getEffectiveProductPrice(product);
-              const displayPrice = isCaseSelected ? Number(product.casePrice) : unitEffPrice;
-              const formattedEndDate = product.promoEndsAt
-                ? new Date(product.promoEndsAt).toLocaleString('pt-BR', {
-                    day: '2-digit',
-                    month: '2-digit',
-                    year: 'numeric',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  })
-                : null;
+              const promoActive = isProductPromoActive(product);
+              const discountPct = promoActive ? getPromoDiscountPercent(product) : 0;
+              const effPrice = getEffectiveProductPrice(product);
+              const displayPrice = isCaseSelected ? Number(product.casePrice) : effPrice;
+              const hasComboSavings = Boolean(
+                isCombo && comboMetrics && comboMetrics.separatePrice > effPrice
+              );
 
               return (
                 <div
-                  key={`promo-featured-${product.id}`}
-                  className="min-w-[260px] sm:min-w-[300px] max-w-[300px] snap-start bg-white rounded-3xl border-2 border-red-200 shadow-sm hover:shadow-md transition-all overflow-hidden flex flex-col justify-between shrink-0 group"
+                  key={`carousel-${product.id}`}
+                  className={`min-w-[245px] sm:min-w-[270px] max-w-[275px] bg-white rounded-2xl border p-2.5 shadow-2xs flex items-center gap-2.5 shrink-0 ${
+                    promoActive ? 'border-red-200' : 'border-neutral-200'
+                  }`}
                 >
-                  <div>
-                    <div className="relative h-48 bg-neutral-100 overflow-hidden">
-                      {product.imageUrl || product.image ? (
-                        <img
-                          src={product.imageUrl || product.image}
-                          alt={product.name}
-                          width={300}
-                          height={192}
-                          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                          loading="lazy"
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center text-neutral-300">
-                          <Package className="w-12 h-12" />
-                        </div>
-                      )}
-                      {/* Red Discount Badge */}
-                      <div className="absolute top-3 right-3 bg-red-600 text-white text-xs font-black px-2.5 py-1 rounded-full shadow-md">
-                        -{discountPct}%
-                      </div>
-                      {product.isCold && (
-                        <div className="absolute top-3 left-3 bg-sky-500/95 backdrop-blur-xs text-white text-[10px] font-black px-2.5 py-1 rounded-full shadow-sm flex items-center gap-1">
-                          <span>❄️</span>
-                          <span>GELADA</span>
-                        </div>
-                      )}
-                      {isOutOfStock && (
-                        <div className="absolute inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center">
-                          <span className="bg-red-600 text-white text-xs font-black px-3.5 py-1.5 rounded-full uppercase">
-                            Esgotado
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="p-4 pb-2">
-                      <span className="text-[11px] font-bold text-neutral-400 uppercase tracking-wider">
-                        {isCombo ? 'Combo' : product.volume}
-                      </span>
-                      <h3 className="font-black text-base text-neutral-900 leading-snug line-clamp-2 mt-0.5">
-                        {product.name}
-                      </h3>
-                      {isCombo && comboMetrics?.itemsSummaryText && (
-                        <p className="text-xs text-neutral-600 font-medium mt-1 leading-snug">
-                          {comboMetrics.itemsSummaryText}
-                        </p>
-                      )}
-                      {formattedEndDate && (
-                        <p className="mt-1.5 text-[11px] font-bold text-red-700 bg-red-50 border border-red-200 px-2 py-0.5 rounded-lg inline-block">
-                          Termina em {formattedEndDate}
-                        </p>
-                      )}
-
-                      {hasCase && (
-                        <div className="mt-2.5 space-y-1">
-                          <div className="grid grid-cols-2 gap-1 p-1 bg-neutral-100 rounded-xl border border-neutral-200">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setSelectedUnits((prev) => ({ ...prev, [product.id]: 'unit' }))
-                              }
-                              className={`py-1.5 px-2 rounded-lg text-[10px] font-bold transition-all leading-tight text-center cursor-pointer ${
-                                !isCaseSelected
-                                  ? 'bg-white text-neutral-900 shadow-2xs'
-                                  : 'text-neutral-600 hover:text-neutral-900'
-                              }`}
-                            >
-                              <span className="block">Unidade</span>
-                              <span className="text-[10px] font-black text-red-600">
-                                {formatCurrency(unitEffPrice)}
-                              </span>
-                            </button>
-                            <button
-                              type="button"
-                              disabled={caseUnavailable}
-                              onClick={() =>
-                                setSelectedUnits((prev) => ({ ...prev, [product.id]: 'case' }))
-                              }
-                              className={`py-1.5 px-2 rounded-lg text-[10px] font-bold transition-all leading-tight text-center ${
-                                caseUnavailable
-                                  ? 'opacity-40 cursor-not-allowed text-neutral-400'
-                                  : isCaseSelected
-                                  ? 'bg-amber-500 text-neutral-950 shadow-2xs cursor-pointer'
-                                  : 'text-neutral-600 hover:text-neutral-900 cursor-pointer'
-                              }`}
-                            >
-                              <span className="block">Caixa c/{product.caseSize}</span>
-                              <span className="text-[10px] font-black">
-                                {formatCurrency(Number(product.casePrice))}
-                              </span>
-                            </button>
-                          </div>
-                          {caseUnavailable && !isOutOfStock && (
-                            <p className="text-[10px] text-neutral-400 font-semibold text-center">
-                              sem caixa fechada no estoque
-                            </p>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="p-3 sm:p-4 pt-2.5 border-t border-neutral-100 flex flex-col gap-2.5">
-                    <div>
-                      {!isCaseSelected ? (
-                        <>
-                          <span className="text-xs text-neutral-400 line-through block font-semibold">
-                            De {formatCurrency(product.price)}
-                          </span>
-                          <span className="text-base sm:text-xl font-black text-red-600 block leading-tight">
-                            Por {formatCurrency(displayPrice)}
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          <span className="text-[10px] text-amber-700 font-bold block">
-                            Caixa c/{product.caseSize} un.
-                          </span>
-                          <span className="text-base sm:text-xl font-black text-neutral-900 block leading-tight">
-                            {formatCurrency(displayPrice)}
-                          </span>
-                        </>
-                      )}
-                    </div>
-
-                    {isOutOfStock ? (
-                      <button
-                        type="button"
-                        disabled
-                        className="w-full py-2 px-3 bg-neutral-200 text-neutral-500 text-xs font-bold rounded-xl cursor-not-allowed text-center"
-                      >
-                        Esgotado
-                      </button>
-                    ) : qty === 0 ? (
-                      <button
-                        type="button"
-                        disabled={!canAddMore}
-                        onClick={() => addToCart(product, activeUnit)}
-                        className="w-full flex items-center justify-center gap-1.5 px-3 py-2.5 bg-red-600 hover:bg-red-700 disabled:bg-neutral-300 text-white text-xs font-black rounded-xl transition-all shadow-sm active:scale-95 cursor-pointer"
-                      >
-                        <Plus className="w-4 h-4 shrink-0" />
-                        <span>Adicionar</span>
-                      </button>
+                  <div className="relative w-18 h-18 sm:w-20 sm:h-20 rounded-xl bg-neutral-100 overflow-hidden shrink-0">
+                    {product.imageUrl || product.image ? (
+                      <img
+                        src={product.imageUrl || product.image}
+                        alt={product.name}
+                        width={80}
+                        height={80}
+                        loading="lazy"
+                        draggable={false}
+                        className="w-full h-full object-cover pointer-events-none"
+                      />
                     ) : (
-                      <div className="w-full flex items-center justify-between gap-1.5 bg-neutral-100 p-1 rounded-xl">
-                        <button
-                          type="button"
-                          onClick={() => removeFromCart(product.id, activeUnit)}
-                          className="w-8 h-8 shrink-0 bg-white hover:bg-neutral-200 text-neutral-800 rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
-                        >
-                          <Minus className="w-3.5 h-3.5" />
-                        </button>
-                        <span className="flex-1 text-center font-black text-xs text-neutral-900">{qty}</span>
-                        <button
-                          type="button"
-                          onClick={() => addToCart(product, activeUnit)}
-                          disabled={!canAddMore}
-                          className="w-8 h-8 shrink-0 bg-red-600 hover:bg-red-700 disabled:bg-neutral-300 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
-                        >
-                          <Plus className="w-3.5 h-3.5" />
-                        </button>
+                      <div className="w-full h-full flex items-center justify-center text-neutral-300">
+                        <Package className="w-6 h-6" />
                       </div>
                     )}
+                    {promoActive && (
+                      <span className="absolute top-1 left-1 bg-red-600 text-white text-[9px] font-black px-1.5 py-0.5 rounded-md shadow-xs">
+                        -{discountPct}%
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex-1 min-w-0 flex flex-col justify-between h-full">
+                    <div>
+                      <div className="flex items-center gap-1 flex-wrap">
+                        {isCombo && (
+                          <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 text-[9px] font-black uppercase">
+                            Combo
+                          </span>
+                        )}
+                        {product.isCold && (
+                          <span className="px-1.5 py-0.5 rounded bg-sky-100 text-sky-800 text-[9px] font-black">
+                            ❄️ Gelada
+                          </span>
+                        )}
+                      </div>
+                      <h3 className="font-bold text-xs text-neutral-900 leading-tight line-clamp-2 mt-0.5">
+                        {product.name}
+                      </h3>
+                    </div>
+
+                    <div className="mt-1.5 flex items-end justify-between gap-1.5">
+                      <div className="min-w-0">
+                        {promoActive && !isCaseSelected ? (
+                          <>
+                            <span className="text-[10px] text-neutral-400 line-through block leading-none">
+                              {formatCurrency(product.price)}
+                            </span>
+                            <span className="text-xs sm:text-sm font-black text-red-600 block leading-tight">
+                              {formatCurrency(displayPrice)}
+                            </span>
+                          </>
+                        ) : hasComboSavings && comboMetrics ? (
+                          <>
+                            <span className="text-[10px] text-neutral-400 line-through block leading-none">
+                              {formatCurrency(comboMetrics.separatePrice)}
+                            </span>
+                            <span className="text-xs sm:text-sm font-black text-neutral-900 block leading-tight">
+                              {formatCurrency(displayPrice)}
+                            </span>
+                          </>
+                        ) : (
+                          <span className="text-xs sm:text-sm font-black text-neutral-900 block leading-tight">
+                            {formatCurrency(displayPrice)}
+                          </span>
+                        )}
+                      </div>
+
+                      {isOutOfStock ? (
+                        <span className="text-[10px] font-bold text-neutral-400 bg-neutral-100 px-2 py-1 rounded-lg">
+                          Esgotado
+                        </span>
+                      ) : qty === 0 ? (
+                        <button
+                          type="button"
+                          disabled={!canAddMore}
+                          onClick={() => addToCart(product, activeUnit)}
+                          className="w-8 h-8 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-neutral-950 flex items-center justify-center shadow-sm active:scale-95 cursor-pointer shrink-0"
+                          aria-label={`Adicionar ${product.name}`}
+                        >
+                          <Plus className="w-4 h-4 stroke-[2.5]" />
+                        </button>
+                      ) : (
+                        <div className="flex items-center gap-1 bg-neutral-900 text-white rounded-full px-1.5 py-0.5 shadow-sm">
+                          <button
+                            type="button"
+                            onClick={() => removeFromCart(product.id, activeUnit)}
+                            className="w-6 h-6 rounded-full hover:bg-neutral-700 flex items-center justify-center cursor-pointer"
+                          >
+                            <Minus className="w-3 h-3" />
+                          </button>
+                          <span className="text-[11px] font-black min-w-[14px] text-center">{qty}</span>
+                          <button
+                            type="button"
+                            disabled={!canAddMore}
+                            onClick={() => addToCart(product, activeUnit)}
+                            className="w-6 h-6 rounded-full bg-amber-500 text-neutral-950 disabled:opacity-40 flex items-center justify-center cursor-pointer"
+                          >
+                            <Plus className="w-3 h-3 stroke-[2.5]" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               );
             })}
           </div>
-        </div>
+        </section>
       )}
 
-      {/* Search & Cold Filter Bar */}
-      <div className="flex flex-col sm:flex-row gap-3 items-center justify-between mb-6">
-        <div className="relative w-full sm:max-w-md">
-          <Search className="w-5 h-5 absolute left-3.5 top-1/2 -translate-y-1/2 text-neutral-400" />
-          <input
-            type="text"
-            placeholder="Buscar cerveja, whisky, refri, gelo..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-3 bg-white border border-neutral-200 rounded-2xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 shadow-xs"
-          />
-          {searchQuery && (
-            <button
-              onClick={() => setSearchQuery('')}
-              className="absolute right-3.5 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-600 text-xs font-bold"
-            >
-              Limpar
-            </button>
-          )}
+      {/* Sticky Top Search + Super Geladas Filter + Horizontal Category Bar */}
+      <div className="sticky top-0 z-30 bg-neutral-100/95 backdrop-blur-md pt-2 pb-2.5 -mx-3 px-3 sm:-mx-6 sm:px-6 border-b border-neutral-200/80 shadow-xs mb-4 space-y-2">
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
+            <input
+              type="text"
+              placeholder="Buscar bebida, combo, gelo, carvão..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-9 pr-14 py-2 bg-white border border-neutral-200 rounded-xl text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 shadow-2xs"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-700 text-[11px] font-bold cursor-pointer"
+              >
+                Limpar
+              </button>
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setOnlyCold(!onlyCold)}
+            className={`flex items-center gap-1.5 px-3 py-2 rounded-xl font-bold text-xs transition-all border shrink-0 cursor-pointer ${
+              onlyCold
+                ? 'bg-sky-500 text-white border-sky-600 shadow-xs'
+                : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-50'
+            }`}
+          >
+            <span>❄️</span>
+            <span className="hidden xs:inline sm:inline">Super Geladas</span>
+            <span className="inline xs:hidden sm:hidden">Geladas</span>
+          </button>
         </div>
 
-        <button
-          onClick={() => setOnlyCold(!onlyCold)}
-          className={`flex items-center gap-2 px-4 py-2.5 rounded-2xl font-bold text-xs sm:text-sm transition-all border ${
-            onlyCold
-              ? 'bg-sky-500 text-white border-sky-600 shadow-md shadow-sky-500/20'
-              : 'bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-50'
-          }`}
-        >
-          <span>❄️</span>
-          <span>Apenas Super Geladas</span>
-        </button>
-      </div>
+        {/* Category Pills Navigation with Side Arrows + Mouse Drag */}
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => scrollHorizontalContainer(categoryNavScrollRef, -220)}
+            className="w-7 h-7 rounded-xl bg-white hover:bg-neutral-50 border border-neutral-200 text-neutral-700 flex items-center justify-center shrink-0 shadow-2xs active:scale-95 cursor-pointer"
+            aria-label="Rolar categorias para a esquerda"
+          >
+            <ChevronLeft className="w-4 h-4" />
+          </button>
 
-      {/* Category Pills */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-4 mb-6 scrollbar-none">
-        {categories.map((cat) => {
-          const Icon = cat.icon;
-          const isActive = selectedCategory === cat.id;
-          return (
-            <button
-              key={cat.id}
-              onClick={() => setSelectedCategory(cat.id as ProductCategory | 'todas')}
-              className={`flex items-center gap-2 px-4 py-2.5 rounded-2xl text-xs sm:text-sm font-bold whitespace-nowrap transition-all ${
-                isActive
-                  ? 'bg-amber-500 text-white shadow-md shadow-amber-500/25 scale-[1.02]'
-                  : 'bg-white text-neutral-700 hover:bg-amber-50 border border-neutral-200'
-              }`}
-            >
-              <Icon className="w-4 h-4" />
-              <span>{cat.label}</span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Products Grid */}
-      {products.length === 0 ? (
-        <div className="text-center py-20 px-4 bg-white rounded-3xl border border-dashed border-neutral-300">
-          <div className="w-16 h-16 bg-amber-100 text-amber-600 rounded-2xl flex items-center justify-center mx-auto mb-3">
-            <Beer className="w-8 h-8" />
+          <div
+            ref={categoryNavScrollRef}
+            {...getHorizontalDragProps(categoryNavScrollRef, 'categories')}
+            className="flex-1 flex items-center gap-1.5 overflow-x-auto scrollbar-none pb-0.5 cursor-grab active:cursor-grabbing select-none"
+          >
+            {categories.map((cat) => {
+              const Icon = cat.icon;
+              const isActive = selectedCategory === cat.id;
+              return (
+                <button
+                  key={cat.id}
+                  type="button"
+                  draggable={false}
+                  data-cat-pill={cat.id}
+                  onClick={() => handleSelectCategoryPill(cat.id as ProductCategory | 'todas')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap transition-all shrink-0 cursor-pointer ${
+                    isActive
+                      ? 'bg-neutral-900 text-amber-400 shadow-xs'
+                      : 'bg-white text-neutral-600 hover:bg-neutral-50 border border-neutral-200'
+                  }`}
+                >
+                  <Icon className="w-3.5 h-3.5 shrink-0 pointer-events-none" />
+                  <span className="pointer-events-none">{cat.label}</span>
+                </button>
+              );
+            })}
           </div>
-          <h3 className="text-lg font-black text-neutral-900">Catálogo em Atualização</h3>
+
+          <button
+            type="button"
+            onClick={() => scrollHorizontalContainer(categoryNavScrollRef, 220)}
+            className="w-7 h-7 rounded-xl bg-white hover:bg-neutral-50 border border-neutral-200 text-neutral-700 flex items-center justify-center shrink-0 shadow-2xs active:scale-95 cursor-pointer"
+            aria-label="Rolar categorias para a direita"
+          >
+            <ChevronRight className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* Continuous Category-Grouped Product List (Yooga / iFood Horizontal Cards) */}
+      {products.length === 0 ? (
+        <div className="text-center py-16 px-4 bg-white rounded-2xl border border-dashed border-neutral-300">
+          <div className="w-14 h-14 bg-amber-100 text-amber-600 rounded-2xl flex items-center justify-center mx-auto mb-3">
+            <Beer className="w-7 h-7" />
+          </div>
+          <h3 className="text-base font-black text-neutral-900">Catálogo em Atualização</h3>
           <p className="text-xs text-neutral-500 mt-1 max-w-sm mx-auto">
-            O depósito está atualizando o estoque e os produtos disponíveis. Em breve novas bebidas geladas estarão cadastradas para entrega!
+            O depósito está atualizando o estoque e os produtos disponíveis. Em breve novas bebidas geladas estarão cadastradas!
           </p>
         </div>
-      ) : filteredProducts.length === 0 ? (
-        <div className="text-center py-16 bg-white rounded-3xl border border-dashed border-neutral-300">
-          <Beer className="w-12 h-12 text-neutral-300 mx-auto mb-3" />
-          <h3 className="text-base font-bold text-neutral-800">Nenhum produto encontrado</h3>
+      ) : groupedCategorySections.length === 0 ? (
+        <div className="text-center py-14 bg-white rounded-2xl border border-dashed border-neutral-300">
+          <Beer className="w-10 h-10 text-neutral-300 mx-auto mb-2" />
+          <h3 className="text-sm font-bold text-neutral-800">Nenhum produto encontrado</h3>
           <p className="text-xs text-neutral-500 mt-1">Tente buscar por outro termo ou limpar os filtros.</p>
         </div>
-      ) : selectedCategory === 'todas' && searchQuery.trim() === '' ? (
-        <div className="space-y-8">
+      ) : (
+        <div className="space-y-6">
           {groupedCategorySections.map((section) => (
-            <section key={section.id} className="space-y-3.5">
-              <div className="flex items-center justify-between border-b border-neutral-200 pb-2">
+            <section
+              key={section.id}
+              id={`cat-section-${section.id}`}
+              data-cat-section-id={section.id}
+              className="scroll-mt-32 space-y-2.5"
+            >
+              <div className="flex items-center justify-between border-b border-neutral-200 pb-1.5">
                 <h2 className="text-base sm:text-lg font-black text-neutral-900 tracking-tight">
                   {section.name}
                 </h2>
-                <span className="text-xs font-bold text-neutral-400">
+                <span className="text-[11px] font-bold text-neutral-400">
                   {section.items.length} {section.items.length === 1 ? 'item' : 'itens'}
                 </span>
               </div>
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-6">
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {section.items.map((product) => {
                   const isCombo = isComboProduct(product.id, settings);
                   const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
@@ -2241,87 +2446,73 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   const discountPct = promoActive ? getPromoDiscountPercent(product) : 0;
                   const effPrice = getEffectiveProductPrice(product);
                   const displayPrice = isCaseSelected ? Number(product.casePrice) : effPrice;
-                  const hasComboSavings =
-                    Boolean(isCombo && comboMetrics && comboMetrics.separatePrice > effPrice);
+                  const hasComboSavings = Boolean(
+                    isCombo && comboMetrics && comboMetrics.separatePrice > effPrice
+                  );
 
                   return (
                     <div
                       key={product.id}
-                      className={`bg-white rounded-3xl border shadow-xs hover:shadow-md transition-all overflow-hidden flex flex-col group ${
+                      className={`bg-white rounded-2xl border p-3 sm:p-3.5 shadow-2xs hover:shadow-md transition-all flex items-stretch justify-between gap-3 ${
                         promoActive ? 'border-red-200' : 'border-neutral-200'
                       }`}
                     >
-                      <div className="relative aspect-square bg-neutral-100 overflow-hidden">
-                        {product.imageUrl || product.image ? (
-                          <img
-                            src={product.imageUrl || product.image}
-                            alt={product.name}
-                            width={300}
-                            height={300}
-                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                            loading="lazy"
-                          />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center text-neutral-300">
-                            <Package className="w-12 h-12" />
-                          </div>
-                        )}
-                        {product.isCold && (
-                          <div className="absolute top-2 left-2 bg-sky-500/95 backdrop-blur-xs text-white text-[10px] font-black px-2 py-0.5 rounded-full shadow-sm flex items-center gap-1">
-                            <span>❄️</span>
-                            <span>GELADA</span>
-                          </div>
-                        )}
-                        {promoActive && (
-                          <div className="absolute top-2 right-2 bg-red-600 text-white text-[11px] font-black px-2 py-0.5 rounded-full shadow-md">
-                            -{discountPct}%
-                          </div>
-                        )}
-                        {isOutOfStock && (
-                          <div className="absolute inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center">
-                            <span className="bg-red-500 text-white text-xs font-black px-3 py-1 rounded-full uppercase">
-                              Esgotado
-                            </span>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="p-3 sm:p-4 flex-1 flex flex-col justify-between">
+                      {/* Left Column: Badges, Title, Combo/Description, Unit vs Case, Price */}
+                      <div className="flex-1 min-w-0 flex flex-col justify-between">
                         <div>
-                          <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
-                            {isCombo ? 'Combo' : product.volume}
-                          </span>
-                          <h3 className="font-bold text-sm text-neutral-900 leading-snug line-clamp-2 mt-0.5">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            {isCombo ? (
+                              <span className="px-1.5 py-0.5 rounded-md bg-amber-100 border border-amber-300 text-amber-900 text-[10px] font-black uppercase tracking-wider">
+                                Combo
+                              </span>
+                            ) : (
+                              product.volume && (
+                                <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider">
+                                  {product.volume}
+                                </span>
+                              )
+                            )}
+                            {product.isCold && (
+                              <span className="px-1.5 py-0.5 rounded-md bg-sky-100 text-sky-800 text-[10px] font-black">
+                                ❄️ Gelada
+                              </span>
+                            )}
+                            {promoActive && (
+                              <span className="px-1.5 py-0.5 rounded-md bg-red-600 text-white text-[10px] font-black">
+                                -{discountPct}% OFF
+                              </span>
+                            )}
+                          </div>
+
+                          <h3 className="font-bold text-sm sm:text-base text-neutral-900 leading-snug line-clamp-2 mt-1">
                             {product.name}
                           </h3>
+
                           {isCombo && comboMetrics?.itemsSummaryText ? (
-                            <p className="text-xs text-neutral-600 font-medium mt-1 leading-snug">
-                              {comboMetrics.itemsSummaryText}
+                            <p className="mt-1 text-[11px] sm:text-xs font-bold text-amber-950 bg-amber-50 border border-amber-200/80 rounded-lg px-2 py-1 leading-snug">
+                              Itens do combo: {comboMetrics.itemsSummaryText}
                             </p>
-                          ) : (
-                            <p className="text-xs text-neutral-500 line-clamp-1 mt-1">
+                          ) : product.description ? (
+                            <p className="text-xs text-neutral-500 line-clamp-2 mt-1 leading-relaxed">
                               {product.description}
                             </p>
-                          )}
+                          ) : null}
 
                           {hasCase && (
-                            <div className="mt-2.5 space-y-1">
-                              <div className="grid grid-cols-2 gap-1 p-1 bg-neutral-100 rounded-xl border border-neutral-200">
+                            <div className="mt-2 max-w-[230px]">
+                              <div className="grid grid-cols-2 gap-1 p-0.5 bg-neutral-100 rounded-lg border border-neutral-200">
                                 <button
                                   type="button"
                                   onClick={() =>
                                     setSelectedUnits((prev) => ({ ...prev, [product.id]: 'unit' }))
                                   }
-                                  className={`py-1.5 px-1 rounded-lg text-[10px] font-bold transition-all leading-tight text-center cursor-pointer ${
+                                  className={`py-1 px-1.5 rounded-md text-[10px] font-bold transition-all leading-tight text-center cursor-pointer ${
                                     !isCaseSelected
                                       ? 'bg-white text-neutral-900 shadow-2xs'
                                       : 'text-neutral-600 hover:text-neutral-900'
                                   }`}
                                 >
-                                  <span className="block">Unidade</span>
-                                  <span className={`text-[10px] font-black ${promoActive ? 'text-red-600' : 'text-neutral-900'}`}>
-                                    {formatCurrency(effPrice)}
-                                  </span>
+                                  <span>Unidade</span>
                                 </button>
                                 <button
                                   type="button"
@@ -2329,7 +2520,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                                   onClick={() =>
                                     setSelectedUnits((prev) => ({ ...prev, [product.id]: 'case' }))
                                   }
-                                  className={`py-1.5 px-1 rounded-lg text-[10px] font-bold transition-all leading-tight text-center ${
+                                  className={`py-1 px-1.5 rounded-md text-[10px] font-bold transition-all leading-tight text-center ${
                                     caseUnavailable
                                       ? 'opacity-40 cursor-not-allowed text-neutral-400'
                                       : isCaseSelected
@@ -2337,99 +2528,112 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                                       : 'text-neutral-600 hover:text-neutral-900 cursor-pointer'
                                   }`}
                                 >
-                                  <span className="block">Caixa c/{product.caseSize}</span>
-                                  <span className="text-[10px] font-black">
-                                    {formatCurrency(Number(product.casePrice))}
-                                  </span>
+                                  <span>Caixa c/{product.caseSize}</span>
                                 </button>
                               </div>
                               {caseUnavailable && !isOutOfStock && (
-                                <p className="text-[10px] text-neutral-400 font-semibold text-center">
-                                  sem caixa fechada no estoque
+                                <p className="text-[10px] text-neutral-400 font-semibold mt-0.5">
+                                  Sem caixa fechada no estoque
                                 </p>
                               )}
                             </div>
                           )}
                         </div>
 
-                        <div className="mt-3 pt-2.5 border-t border-neutral-100 flex flex-col gap-2">
-                          <div>
-                            {isCaseSelected ? (
-                              <>
-                                <span className="text-[10px] text-amber-700 block font-bold">
-                                  Caixa c/{product.caseSize} un.
-                                </span>
-                                <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
-                                  {formatCurrency(displayPrice)}
-                                </span>
-                              </>
-                            ) : promoActive ? (
-                              <>
-                                <span className="text-[11px] text-neutral-400 line-through block font-medium">
-                                  De {formatCurrency(product.price)}
-                                </span>
-                                <span className="text-base sm:text-lg font-black text-red-600 block leading-tight">
-                                  Por {formatCurrency(effPrice)}
-                                </span>
-                              </>
-                            ) : hasComboSavings && comboMetrics ? (
-                              <>
-                                <span className="text-[11px] text-neutral-400 line-through block font-medium">
-                                  De {formatCurrency(comboMetrics.separatePrice)}
-                                </span>
-                                <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
-                                  por {formatCurrency(effPrice)}
-                                </span>
-                              </>
-                            ) : (
-                              <>
-                                <span className="text-[10px] text-neutral-400 block font-medium">Preço</span>
-                                <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
-                                  {formatCurrency(product.price)}
-                                </span>
-                              </>
-                            )}
-                          </div>
+                        {/* Price at base of left column */}
+                        <div className="mt-2.5 pt-1 flex items-baseline gap-2 flex-wrap">
+                          {isCaseSelected ? (
+                            <>
+                              <span className="text-sm sm:text-base font-black text-neutral-900">
+                                {formatCurrency(displayPrice)}
+                              </span>
+                              <span className="text-[10px] font-bold text-amber-700">
+                                Caixa c/{product.caseSize} un.
+                              </span>
+                            </>
+                          ) : promoActive ? (
+                            <>
+                              <span className="text-sm sm:text-base font-black text-red-600">
+                                {formatCurrency(effPrice)}
+                              </span>
+                              <span className="text-xs text-neutral-400 line-through font-medium">
+                                {formatCurrency(product.price)}
+                              </span>
+                            </>
+                          ) : hasComboSavings && comboMetrics ? (
+                            <>
+                              <span className="text-sm sm:text-base font-black text-neutral-900">
+                                {formatCurrency(effPrice)}
+                              </span>
+                              <span className="text-xs text-neutral-400 line-through font-medium">
+                                {formatCurrency(comboMetrics.separatePrice)}
+                              </span>
+                            </>
+                          ) : (
+                            <span className="text-sm sm:text-base font-black text-neutral-900">
+                              {formatCurrency(product.price)}
+                            </span>
+                          )}
+                        </div>
+                      </div>
 
-                          {isOutOfStock ? (
+                      {/* Right Column: Square Photo + Floating + / - qty + Control */}
+                      <div className="relative shrink-0 w-24 h-24 sm:w-28 sm:h-28 self-center">
+                        <div className="w-full h-full rounded-2xl bg-neutral-100 border border-neutral-100 overflow-hidden">
+                          {product.imageUrl || product.image ? (
+                            <img
+                              src={product.imageUrl || product.image}
+                              alt={product.name}
+                              width={112}
+                              height={112}
+                              loading="lazy"
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center text-neutral-300">
+                              <Package className="w-8 h-8" />
+                            </div>
+                          )}
+                        </div>
+
+                        {isOutOfStock ? (
+                          <div className="absolute inset-0 rounded-2xl bg-black/60 backdrop-blur-[1px] flex items-center justify-center">
+                            <span className="bg-red-600 text-white text-[10px] font-black px-2 py-0.5 rounded-full uppercase">
+                              Esgotado
+                            </span>
+                          </div>
+                        ) : qty === 0 ? (
+                          <button
+                            type="button"
+                            disabled={!canAddMore}
+                            onClick={() => addToCart(product, activeUnit)}
+                            className="absolute -bottom-1.5 -right-1.5 w-9 h-9 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-neutral-950 flex items-center justify-center shadow-md border-2 border-white active:scale-95 transition-transform cursor-pointer"
+                            aria-label={`Adicionar ${product.name}`}
+                          >
+                            <Plus className="w-4 h-4 stroke-[2.75]" />
+                          </button>
+                        ) : (
+                          <div className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 flex items-center justify-between gap-1 bg-neutral-950 text-white rounded-full p-1 shadow-md border border-neutral-700 min-w-[92px]">
                             <button
                               type="button"
-                              disabled
-                              className="w-full py-2 px-3 bg-neutral-200 text-neutral-500 text-xs font-bold rounded-xl cursor-not-allowed text-center"
+                              onClick={() => removeFromCart(product.id, activeUnit)}
+                              className="w-6 h-6 rounded-full bg-neutral-800 hover:bg-neutral-700 text-white flex items-center justify-center cursor-pointer"
+                              aria-label="Diminuir quantidade"
                             >
-                              Esgotado
+                              <Minus className="w-3 h-3" />
                             </button>
-                          ) : qty === 0 ? (
+                            <span className="text-xs font-black px-1 text-center">{qty}</span>
                             <button
                               type="button"
                               disabled={!canAddMore}
                               onClick={() => addToCart(product, activeUnit)}
-                              className="w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-white text-xs font-bold rounded-xl transition-all shadow-sm shadow-amber-500/20 active:scale-95 cursor-pointer"
+                              className="w-6 h-6 rounded-full bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-neutral-950 flex items-center justify-center cursor-pointer"
+                              aria-label="Aumentar quantidade"
                             >
-                              <Plus className="w-3.5 h-3.5 shrink-0" />
-                              <span>Adicionar</span>
+                              <Plus className="w-3 h-3 stroke-[2.75]" />
                             </button>
-                          ) : (
-                            <div className="w-full flex items-center justify-between gap-1.5 bg-neutral-100 p-1 rounded-xl">
-                              <button
-                                type="button"
-                                onClick={() => removeFromCart(product.id, activeUnit)}
-                                className="w-8 h-8 shrink-0 bg-white hover:bg-neutral-200 text-neutral-800 rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
-                              >
-                                <Minus className="w-3.5 h-3.5" />
-                              </button>
-                              <span className="flex-1 text-center font-black text-xs text-neutral-900">{qty}</span>
-                              <button
-                                type="button"
-                                onClick={() => addToCart(product, activeUnit)}
-                                disabled={!canAddMore}
-                                className="w-8 h-8 shrink-0 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
-                              >
-                                <Plus className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          )}
-                        </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -2438,258 +2642,88 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             </section>
           ))}
         </div>
-      ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 sm:gap-6">
-          {filteredProducts.map((product) => {
-            const isCombo = isComboProduct(product.id, settings);
-            const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
-            const hasCase = !isCombo && canSellProductCase(product, settings, 'store');
-            const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
-            const activeUnit = getSelectedUnit(product);
-            const isCaseSelected = activeUnit === 'case' && hasCase;
-            const unitsPerSale = isCaseSelected ? Number(product.caseSize) : 1;
-            const qty = getCartQuantity(product.id, activeUnit);
-            const usedUnits = getCartTotalUnitsForProduct(product.id);
-            const canAddMore = usedUnits + unitsPerSale <= product.stock;
-            const isOutOfStock = product.stock <= 0;
-            const promoActive = isProductPromoActive(product);
-            const discountPct = promoActive ? getPromoDiscountPercent(product) : 0;
-            const effPrice = getEffectiveProductPrice(product);
-            const displayPrice = isCaseSelected ? Number(product.casePrice) : effPrice;
-            const hasComboSavings =
-              Boolean(isCombo && comboMetrics && comboMetrics.separatePrice > effPrice);
-
-            return (
-              <div
-                key={product.id}
-                className={`bg-white rounded-3xl border shadow-xs hover:shadow-md transition-all overflow-hidden flex flex-col group ${
-                  promoActive ? 'border-red-200' : 'border-neutral-200'
-                }`}
-              >
-                <div className="relative aspect-square bg-neutral-100 overflow-hidden">
-                  {product.imageUrl || product.image ? (
-                    <img
-                      src={product.imageUrl || product.image}
-                      alt={product.name}
-                      width={300}
-                      height={300}
-                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                      loading="lazy"
-                    />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-neutral-300">
-                      <Package className="w-12 h-12" />
-                    </div>
-                  )}
-                  {product.isCold && (
-                    <div className="absolute top-2 left-2 bg-sky-500/95 backdrop-blur-xs text-white text-[10px] font-black px-2 py-0.5 rounded-full shadow-sm flex items-center gap-1">
-                      <span>❄️</span>
-                      <span>GELADA</span>
-                    </div>
-                  )}
-                  {promoActive && (
-                    <div className="absolute top-2 right-2 bg-red-600 text-white text-[11px] font-black px-2 py-0.5 rounded-full shadow-md">
-                      -{discountPct}%
-                    </div>
-                  )}
-                  {isOutOfStock && (
-                    <div className="absolute inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center">
-                      <span className="bg-red-500 text-white text-xs font-black px-3 py-1 rounded-full uppercase">
-                        Esgotado
-                      </span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="p-3 sm:p-4 flex-1 flex flex-col justify-between">
-                  <div>
-                    <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
-                      {isCombo ? 'Combo' : product.volume}
-                    </span>
-                    <h3 className="font-bold text-sm text-neutral-900 leading-snug line-clamp-2 mt-0.5">
-                      {product.name}
-                    </h3>
-                    {isCombo && comboMetrics?.itemsSummaryText ? (
-                      <p className="text-xs text-neutral-600 font-medium mt-1 leading-snug">
-                        {comboMetrics.itemsSummaryText}
-                      </p>
-                    ) : (
-                      <p className="text-xs text-neutral-500 line-clamp-1 mt-1">
-                        {product.description}
-                      </p>
-                    )}
-
-                    {hasCase && (
-                      <div className="mt-2.5 space-y-1">
-                        <div className="grid grid-cols-2 gap-1 p-1 bg-neutral-100 rounded-xl border border-neutral-200">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setSelectedUnits((prev) => ({ ...prev, [product.id]: 'unit' }))
-                            }
-                            className={`py-1.5 px-1 rounded-lg text-[10px] font-bold transition-all leading-tight text-center cursor-pointer ${
-                              !isCaseSelected
-                                ? 'bg-white text-neutral-900 shadow-2xs'
-                                : 'text-neutral-600 hover:text-neutral-900'
-                            }`}
-                          >
-                            <span className="block">Unidade</span>
-                            <span className={`text-[10px] font-black ${promoActive ? 'text-red-600' : 'text-neutral-900'}`}>
-                              {formatCurrency(effPrice)}
-                            </span>
-                          </button>
-                          <button
-                            type="button"
-                            disabled={caseUnavailable}
-                            onClick={() =>
-                              setSelectedUnits((prev) => ({ ...prev, [product.id]: 'case' }))
-                            }
-                            className={`py-1.5 px-1 rounded-lg text-[10px] font-bold transition-all leading-tight text-center ${
-                              caseUnavailable
-                                ? 'opacity-40 cursor-not-allowed text-neutral-400'
-                                : isCaseSelected
-                                ? 'bg-amber-500 text-neutral-950 shadow-2xs cursor-pointer'
-                                : 'text-neutral-600 hover:text-neutral-900 cursor-pointer'
-                            }`}
-                          >
-                            <span className="block">Caixa c/{product.caseSize}</span>
-                            <span className="text-[10px] font-black">
-                              {formatCurrency(Number(product.casePrice))}
-                            </span>
-                          </button>
-                        </div>
-                        {caseUnavailable && !isOutOfStock && (
-                          <p className="text-[10px] text-neutral-400 font-semibold text-center">
-                            sem caixa fechada no estoque
-                          </p>
-                        )}
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="mt-3 pt-2.5 border-t border-neutral-100 flex flex-col gap-2">
-                    <div>
-                      {isCaseSelected ? (
-                        <>
-                          <span className="text-[10px] text-amber-700 block font-bold">
-                            Caixa c/{product.caseSize} un.
-                          </span>
-                          <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
-                            {formatCurrency(displayPrice)}
-                          </span>
-                        </>
-                      ) : promoActive ? (
-                        <>
-                          <span className="text-[11px] text-neutral-400 line-through block font-medium">
-                            De {formatCurrency(product.price)}
-                          </span>
-                          <span className="text-base sm:text-lg font-black text-red-600 block leading-tight">
-                            Por {formatCurrency(effPrice)}
-                          </span>
-                        </>
-                      ) : hasComboSavings && comboMetrics ? (
-                        <>
-                          <span className="text-[11px] text-neutral-400 line-through block font-medium">
-                            De {formatCurrency(comboMetrics.separatePrice)}
-                          </span>
-                          <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
-                            por {formatCurrency(effPrice)}
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          <span className="text-[10px] text-neutral-400 block font-medium">Preço</span>
-                          <span className="text-base sm:text-lg font-black text-neutral-900 block leading-tight">
-                            {formatCurrency(product.price)}
-                          </span>
-                        </>
-                      )}
-                    </div>
-
-                    {isOutOfStock ? (
-                      <button
-                        type="button"
-                        disabled
-                        className="w-full py-2 px-3 bg-neutral-200 text-neutral-500 text-xs font-bold rounded-xl cursor-not-allowed text-center"
-                      >
-                        Esgotado
-                      </button>
-                    ) : qty === 0 ? (
-                      <button
-                        type="button"
-                        disabled={!canAddMore}
-                        onClick={() => addToCart(product, activeUnit)}
-                        className="w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-white text-xs font-bold rounded-xl transition-all shadow-sm shadow-amber-500/20 active:scale-95 cursor-pointer"
-                      >
-                        <Plus className="w-3.5 h-3.5 shrink-0" />
-                        <span>Adicionar</span>
-                      </button>
-                    ) : (
-                      <div className="w-full flex items-center justify-between gap-1.5 bg-neutral-100 p-1 rounded-xl">
-                        <button
-                          type="button"
-                          onClick={() => removeFromCart(product.id, activeUnit)}
-                          className="w-8 h-8 shrink-0 bg-white hover:bg-neutral-200 text-neutral-800 rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
-                        >
-                          <Minus className="w-3.5 h-3.5" />
-                        </button>
-                        <span className="flex-1 text-center font-black text-xs text-neutral-900">{qty}</span>
-                        <button
-                          type="button"
-                          onClick={() => addToCart(product, activeUnit)}
-                          disabled={!canAddMore}
-                          className="w-8 h-8 shrink-0 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-xs cursor-pointer"
-                        >
-                          <Plus className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
       )}
 
-      {/* Floating Cart Button */}
+      {/* Floating Bag Bar ("Ver Sacola") positioned above mobile bottom navigation */}
       {totalCartCount > 0 && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 w-full max-w-md px-4">
+        <div className="fixed bottom-[68px] md:bottom-6 left-1/2 -translate-x-1/2 z-40 w-full max-w-md px-4">
           <button
+            type="button"
             onClick={() => {
               if (!currentCustomer) {
                 setCheckoutEntryStep('choice');
               }
               setIsCartOpen(true);
             }}
-            className="w-full flex items-center justify-between bg-neutral-950 text-white p-4 rounded-2xl shadow-2xl hover:bg-neutral-900 transition-all border border-neutral-700 active:scale-98"
+            className="w-full flex items-center justify-between bg-neutral-950 text-white p-3.5 sm:p-4 rounded-2xl shadow-2xl hover:bg-neutral-900 transition-all border border-neutral-800 active:scale-98 cursor-pointer"
           >
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center font-black">
+              <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-amber-500 text-neutral-950 flex items-center justify-center font-black text-sm">
                 {totalCartCount}
               </div>
               <div className="text-left">
-                <span className="text-xs text-neutral-400 block font-medium">Ver Sacola</span>
-                <span className="font-bold text-sm text-neutral-100">
-                  {cart.length} {cart.length === 1 ? 'item' : 'itens'} adicionados
+                <span className="text-xs text-neutral-300 block font-bold">Ver Sacola</span>
+                <span className="font-bold text-xs sm:text-sm text-white">
+                  {cart.length} {cart.length === 1 ? 'item' : 'itens'}
                 </span>
                 {totalSavings > 0 && (
-                  <span className="text-[11px] font-bold text-emerald-400 block">
-                    Você economizou {formatCurrency(totalSavings)}
+                  <span className="text-[10px] font-bold text-emerald-400 block">
+                    Economia de {formatCurrency(totalSavings)}
                   </span>
                 )}
               </div>
             </div>
 
             <div className="flex items-center gap-2">
-              <span className="text-base font-black text-amber-400">
+              <span className="text-sm sm:text-base font-black text-amber-400">
                 {formatCurrency(cartTotal)}
               </span>
-              <ArrowRight className="w-5 h-5 text-neutral-300" />
+              <ArrowRight className="w-4 h-4 sm:w-5 sm:h-5 text-neutral-300" />
             </div>
           </button>
         </div>
       )}
+
+      {/* Mobile Fixed Bottom Navigation Bar (Início, Pedidos, Perfil) */}
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-neutral-200 px-4 py-1.5 flex items-center justify-around shadow-lg">
+        <button
+          type="button"
+          onClick={() => {
+            setSelectedCategory('todas');
+            if (typeof window !== 'undefined') {
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+          }}
+          className="flex flex-col items-center justify-center gap-0.5 py-1 px-4 text-neutral-800 hover:text-amber-600 cursor-pointer"
+        >
+          <Home className="w-5 h-5 text-amber-600" />
+          <span className="text-[10px] font-black">Início</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={handleOpenMyOrders}
+          className="flex flex-col items-center justify-center gap-0.5 py-1 px-4 text-neutral-600 hover:text-amber-600 cursor-pointer"
+        >
+          <Package className="w-5 h-5" />
+          <span className="text-[10px] font-bold">Pedidos</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setAuthModalInitialTab('login');
+            setIsAuthModalOpen(true);
+          }}
+          className="flex flex-col items-center justify-center gap-0.5 py-1 px-4 text-neutral-600 hover:text-amber-600 cursor-pointer"
+        >
+          <User className="w-5 h-5" />
+          <span className="text-[10px] font-bold">
+            {currentCustomer ? currentCustomer.name.split(' ')[0] : 'Perfil'}
+          </span>
+        </button>
+      </nav>
+
 
       {/* Cart & Checkout Drawer */}
       {isCartOpen && (

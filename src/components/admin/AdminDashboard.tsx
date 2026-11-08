@@ -73,6 +73,7 @@ import {
   formatCashDifferenceLabel,
 } from './CashSessionModals';
 import { PaymentsHistorySection } from './PaymentsHistorySection';
+import { AdminAssistantSection } from './AdminAssistantSection';
 import {
   buildSingleDeliveryRouteUrl,
   buildMultiStopDeliveryRoute,
@@ -123,6 +124,7 @@ import {
   Keyboard,
   Navigation,
   History,
+  Sparkles,
 } from 'lucide-react';
 
 const SHORTCUT_ACTION_ITEMS: Array<{
@@ -284,7 +286,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onLockDashboard,
   onPreviewCustomerView,
 }) => {
-  const [activeTab, setActiveTab] = useState<'pedidos' | 'estoque' | 'promocoes' | 'mesas' | 'pdv' | 'areas' | 'clientes' | 'cupons' | 'financeiro' | 'configuracoes'>('pedidos');
+  const [activeTab, setActiveTab] = useState<'pedidos' | 'estoque' | 'promocoes' | 'mesas' | 'pdv' | 'areas' | 'clientes' | 'cupons' | 'financeiro' | 'assistente' | 'configuracoes'>('pedidos');
   
   // Promotions state
   const [isPromoModalOpen, setIsPromoModalOpen] = useState<boolean>(false);
@@ -3110,6 +3112,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <BarChart3 className="w-4 h-4" />
             <span>Caixa & Relatórios</span>
           </button>
+
+          {settings.assistantEnabled !== false && (
+            <button
+              onClick={() => setActiveTab('assistente')}
+              className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs sm:text-sm font-bold transition-all ${
+                activeTab === 'assistente' ? 'bg-amber-500 text-white shadow-sm' : 'text-neutral-700 hover:bg-neutral-100'
+              }`}
+            >
+              <Sparkles className="w-4 h-4" />
+              <span>Assistente IA</span>
+            </button>
+          )}
 
           <button
             onClick={() => setActiveTab('configuracoes')}
@@ -7055,6 +7069,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           </form>
         </div>
+      )}
+
+      {activeTab === 'assistente' && (
+        <AdminAssistantSection
+          products={products}
+          settings={settings}
+        />
       )}
 
       {/* ========================================================= */}

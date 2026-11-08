@@ -453,6 +453,21 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
     persistFeaturedIds(next, prev);
   };
 
+  const isFeaturedCarouselEnabled = settings.showFeaturedCarousel !== false;
+
+  const handleToggleFeaturedCarousel = async (next: boolean) => {
+    const prev = settings.showFeaturedCarousel !== false;
+    setErrorNotice('');
+    onSettingsUpdated?.({ showFeaturedCarousel: next });
+    try {
+      await api.updateSettings({ showFeaturedCarousel: next });
+      showSavedFeedback(next ? 'Carrossel ativado' : 'Carrossel ocultado');
+    } catch (err: any) {
+      onSettingsUpdated?.({ showFeaturedCarousel: prev });
+      setErrorNotice(err?.message || 'Não foi possível atualizar o carrossel de destaques.');
+    }
+  };
+
   // ---------------------------------------------------------------------------
   // 3. STORE PRODUCT ORDER ("Organizar loja")
   // ---------------------------------------------------------------------------
@@ -616,6 +631,17 @@ export const StoreOrganizationSection: React.FC<StoreOrganizationSectionProps> =
         collapsed={Boolean(collapsedSections['estoque_preferencia'])}
         onToggle={handleToggleSection}
         variant="amber"
+        rightContent={
+          <label className="inline-flex items-center gap-2 cursor-pointer select-none px-2.5 py-1.5 rounded-xl bg-white/80 hover:bg-white border border-amber-200 text-xs font-bold text-neutral-800 shadow-2xs">
+            <input
+              type="checkbox"
+              checked={isFeaturedCarouselEnabled}
+              onChange={(e) => handleToggleFeaturedCarousel(e.target.checked)}
+              className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
+            />
+            <span>Carrossel de destaques no topo</span>
+          </label>
+        }
       >
         {featuredProductsList.length === 0 ? (
           <div className="p-4 rounded-2xl bg-amber-50/50 border border-dashed border-amber-200 text-xs text-neutral-500 text-center">

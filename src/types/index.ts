@@ -430,6 +430,8 @@ export interface StoreSettings {
   combos?: Record<string, ComboComponentItem[]>; // Composição dos combos: { idDoProdutoCombo: [{ productId, quantity }] } (máx 100)
   hiddenFromStoreIds?: string[]; // Produtos ocultos apenas da loja online / delivery (máx 2000)
   caseSaleChannels?: Record<string, { store: boolean; local: boolean }>; // Canais onde a caixa fechada está liberada por produto
+  assistantEnabled?: boolean; // Habilitar assistente com IA no painel do dono
+  showFeaturedCarousel?: boolean; // Exibir carrossel de destaques na loja
 }
 
 export type StockAdjustMode = 'delta' | 'set';
@@ -1298,6 +1300,60 @@ export function getSafeProductImageUrl(
     return fallback;
   }
   return '';
+}
+
+export type AdminAssistantProposalType =
+  | 'price'
+  | 'promo'
+  | 'description'
+  | 'stock_adjust'
+  | 'combo';
+
+export interface AdminAssistantProposal {
+  id: string;
+  type: AdminAssistantProposalType;
+  title: string;
+  summary: string;
+  productId?: string;
+  productName?: string;
+  currentPrice?: number;
+  newPrice?: number;
+  currentCostPrice?: number;
+  newCostPrice?: number;
+  promoPrice?: number | null;
+  promoEndsAt?: string | null;
+  currentDescription?: string;
+  newDescription?: string;
+  stockMode?: StockAdjustMode;
+  stockQuantity?: number;
+  stockReason?: StockAdjustReason;
+  stockNote?: string;
+  currentStock?: number;
+  comboId?: string;
+  comboName?: string;
+  comboPrice?: number;
+  comboCategory?: string;
+  comboVolume?: string;
+  comboItems?: Array<{
+    productId: string;
+    productName?: string;
+    quantity: number;
+  }>;
+  status?: 'pending' | 'confirmed' | 'ignored';
+}
+
+export interface AdminAssistantMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  createdAt: string;
+  proposals?: AdminAssistantProposal[];
+}
+
+export interface AdminAssistantResponse {
+  reply: string;
+  proposals: AdminAssistantProposal[];
+  remainingToday: number;
 }
 
 

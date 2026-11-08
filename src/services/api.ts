@@ -23,6 +23,8 @@ import {
   CashSession,
   CashSessionSummary,
   PaymentsHistoryResponse,
+  AdminAssistantMessage,
+  AdminAssistantResponse,
   isComboProduct,
   calculateComboMetrics,
 } from '../types';
@@ -2554,6 +2556,38 @@ class ApiService {
         if (json?.error) message = json.error;
       } catch {}
       throw new Error(message);
+    }
+    return await res.json();
+  }
+
+  async askAdminAssistant(
+    message: string,
+    history: AdminAssistantMessage[] = []
+  ): Promise<AdminAssistantResponse> {
+    const res = await fetch('/api/admin/assistant', {
+      method: 'POST',
+      headers: this.getAdminHeaders(),
+      body: JSON.stringify({
+        message,
+        history: history.slice(-10).map((m) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          createdAt: m.createdAt,
+        })),
+      }),
+    });
+    if (res.status === 401) {
+      this.handleAdminSessionExpired();
+      throw new Error('Sua sessão expirou. Digite o PIN novamente.');
+    }
+    if (!res.ok) {
+      let errMsg = 'Não foi possível consultar o Assistente IA agora.';
+      try {
+        const json = await res.json();
+        if (json?.error) errMsg = json.error;
+      } catch {}
+      throw new Error(errMsg);
     }
     return await res.json();
   }

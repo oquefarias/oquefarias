@@ -266,16 +266,7 @@ export default function App() {
   // ZERO botões de admin, ZERO senhas, ZERO risco de clientes acessarem!
   // =====================================================================
   return (
-    <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col font-sans antialiased selection:bg-amber-500 selection:text-white overflow-x-hidden">
-      {/* Customer Header - Clean e-commerce */}
-      <Navbar
-        isAdmin={false}
-        settings={settings}
-        pendingOrdersCount={0}
-        onToggleStoreOpen={() => {}}
-        onLockAdmin={() => {}}
-      />
-
+    <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col font-sans antialiased selection:bg-amber-500 selection:text-white overflow-x-clip">
       {/* Customer Storefront */}
       <main className="flex-1 min-w-0">
         <ErrorBoundary key="customer-store-boundary">

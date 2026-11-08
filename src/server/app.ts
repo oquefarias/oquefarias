@@ -51,7 +51,13 @@ import {
   sortDeliveryAreasAlphabetically,
   findMatchingActiveDeliveryArea,
   formatCartItemsUnitAndCaseSummary,
+  AdminAssistantProposal,
+  AdminAssistantMessage,
+  AdminAssistantResponse,
+  StockAdjustMode,
+  StockAdjustReason,
 } from '../types/index.js';
+import { GoogleGenAI, Type, FunctionDeclaration } from '@google/genai';
 
 dotenv.config();
 
@@ -106,342 +112,6 @@ export function getEffectivePrice(product: any): number {
   const normalPrice = Number(product.price) || 0;
   const rawPromo = product.promoPrice !== undefined ? product.promoPrice : product.promo_price;
   return isPromoActive(product) ? Number(rawPromo) : normalPrice;
-}
-
-export function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const toRad = (deg: number) => (deg * Math.PI) / 180;
-  const R = 6371; // Raio da Terra em km
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return Math.round(R * c * 100) / 100;
-}
-
-export function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const toRad = (deg: number) => (deg * Math.PI) / 180;
-  const R = 6371000; // Raio da Terra em metros
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return Math.round(R * c);
-}
-
-async function fetchNominatimStructured(
-  params: Record<string, string>,
-  userAgent: string
-): Promise<{ lat: number; lon: number; displayName: string } | null> {
-  try {
-    const searchParams = new URLSearchParams({
-      format: 'json',
-      countrycodes: 'br',
-      limit: '1',
-      ...params,
-    });
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 6500);
-    const res = await fetch(`https://nominatim.openstreetmap.org/search?${searchParams.toString()}`, {
-      headers: {
-        'User-Agent': userAgent,
-        'Accept-Language': 'pt-BR,pt;q=0.9',
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (Array.isArray(data) && data.length > 0 && data[0].lat && data[0].lon) {
-      const lat = parseFloat(data[0].lat);
-      const lon = parseFloat(data[0].lon);
-      if (!Number.isNaN(lat) && !Number.isNaN(lon)) {
-        return {
-          lat,
-          lon,
-          displayName: String(data[0].display_name || ''),
-        };
-      }
-    }
-    return null;
-  } catch (err) {
-    console.warn('[Geo Warning] Nominatim request failed:', err);
-    return null;
-  }
-}
-
-async function fetchBrasilApiCepServer(cleanCep: string): Promise<{
-  lat?: number;
-  lng?: number;
-  street: string;
-  neighborhood: string;
-  city: string;
-  state: string;
-} | null> {
-  if (cleanCep.length !== 8) return null;
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 6000);
-    const res = await fetch(`https://brasilapi.com.br/api/cep/v2/${cleanCep}`, {
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const rawLat = data?.location?.coordinates?.latitude;
-    const rawLng = data?.location?.coordinates?.longitude;
-    const lat = rawLat !== undefined && rawLat !== null ? parseFloat(String(rawLat)) : undefined;
-    const lng = rawLng !== undefined && rawLng !== null ? parseFloat(String(rawLng)) : undefined;
-    return {
-      lat: lat !== undefined && !Number.isNaN(lat) ? lat : undefined,
-      lng: lng !== undefined && !Number.isNaN(lng) ? lng : undefined,
-      street: String(data?.street || ''),
-      neighborhood: String(data?.neighborhood || ''),
-      city: String(data?.city || ''),
-      state: String(data?.state || ''),
-    };
-  } catch (err) {
-    console.warn('[Geo Warning] BrasilAPI lookup failed:', err);
-    return null;
-  }
-}
-
-async function computeCustomerServerMetrics(
-  supabase: SupabaseClient,
-  latitude: number | undefined | null,
-  longitude: number | undefined | null
-): Promise<{ distanceKm?: number; isWithinDeliveryRadius?: boolean }> {
-  if (
-    latitude === undefined ||
-    latitude === null ||
-    Number.isNaN(Number(latitude)) ||
-    longitude === undefined ||
-    longitude === null ||
-    Number.isNaN(Number(longitude))
-  ) {
-    return { distanceKm: undefined, isWithinDeliveryRadius: undefined };
-  }
-
-  const { data: settingsRow } = await supabase
-    .from('store_settings')
-    .select('data')
-    .eq('id', 'default')
-    .maybeSingle();
-  const dbSettings: StoreSettings = settingsRow?.data
-    ? sanitizePublicSettings(settingsRow.data)
-    : initialSettings;
-
-  if (
-    dbSettings.storeLatitude === undefined ||
-    dbSettings.storeLatitude === null ||
-    dbSettings.storeLongitude === undefined ||
-    dbSettings.storeLongitude === null
-  ) {
-    return { distanceKm: undefined, isWithinDeliveryRadius: undefined };
-  }
-
-  const distanceKm = haversineKm(
-    Number(dbSettings.storeLatitude),
-    Number(dbSettings.storeLongitude),
-    Number(latitude),
-    Number(longitude)
-  );
-  const maxRadius = Number(dbSettings.deliveryRadiusKm) || 5;
-  return {
-    distanceKm,
-    isWithinDeliveryRadius: distanceKm <= maxRadius,
-  };
-}
-
-export interface ServerGeoResolveResult {
-  latitude: number;
-  longitude: number;
-  precisao: GeoPrecision;
-  displayName: string;
-}
-
-async function resolveAddressGeocodeServer(
-  supabase: SupabaseClient | null,
-  params: {
-    rua?: string;
-    numero?: string;
-    bairro?: string;
-    cidade?: string;
-    uf?: string;
-    cep?: string;
-    query?: string;
-    contactEmail?: string;
-  }
-): Promise<ServerGeoResolveResult | null> {
-  let contactEmail = params.contactEmail || process.env.CONTACT_EMAIL || 'contato@depositoexpress.com.br';
-  if (!params.contactEmail && supabase) {
-    try {
-      const { data: settingsRow, error: sErr } = await supabase
-        .from('store_settings')
-        .select('data')
-        .eq('id', 'default')
-        .maybeSingle();
-      if (!sErr && settingsRow?.data) {
-        const sData = settingsRow.data;
-        if (sData.email && typeof sData.email === 'string' && sData.email.includes('@')) {
-          contactEmail = sData.email.trim();
-        } else if (sData.pixKey && typeof sData.pixKey === 'string' && sData.pixKey.includes('@')) {
-          contactEmail = sData.pixKey.trim();
-        }
-      }
-    } catch {
-      // ignore fallback email lookup errors
-    }
-  }
-
-  const userAgent = `DepositoExpress/1.0 (${contactEmail})`;
-
-  let rua = String(params.rua || '').trim();
-  const numero = String(params.numero || '').trim();
-  let bairro = String(params.bairro || '').trim();
-  let cidade = String(params.cidade || '').trim();
-  let uf = String(params.uf || '').trim();
-  const rawCep = String(params.cep || '').replace(/\D/g, '');
-  const freeQuery = String(params.query || '').trim();
-
-  let brasilApiData: Awaited<ReturnType<typeof fetchBrasilApiCepServer>> = null;
-  if (rawCep.length === 8 && (!rua || !cidade)) {
-    brasilApiData = await fetchBrasilApiCepServer(rawCep);
-    if (brasilApiData) {
-      if (!rua && brasilApiData.street) rua = brasilApiData.street;
-      if (!bairro && brasilApiData.neighborhood) bairro = brasilApiData.neighborhood;
-      if (!cidade && brasilApiData.city) cidade = brasilApiData.city;
-      if (!uf && brasilApiData.state) uf = brasilApiData.state;
-    }
-  }
-
-  const formattedPostal =
-    rawCep.length === 8 ? `${rawCep.slice(0, 5)}-${rawCep.slice(5)}` : rawCep;
-
-  // (a) 1. Structured search with street=[número rua], city, state, postalcode
-  if (rua && numero) {
-    const params1: Record<string, string> = {
-      street: `${numero} ${rua}`,
-    };
-    if (cidade) params1.city = cidade;
-    if (uf) params1.state = uf;
-    if (formattedPostal) params1.postalcode = formattedPostal;
-
-    const hit1 = await fetchNominatimStructured(params1, userAgent);
-    if (hit1) {
-      return {
-        latitude: hit1.lat,
-        longitude: hit1.lon,
-        precisao: 'exata',
-        displayName: hit1.displayName,
-      };
-    }
-  }
-
-  // (a) 2. Retry without number: street=[rua], city, state, postalcode
-  if (rua) {
-    const params2: Record<string, string> = {
-      street: rua,
-    };
-    if (cidade) params2.city = cidade;
-    if (uf) params2.state = uf;
-    if (formattedPostal) params2.postalcode = formattedPostal;
-
-    const hit2 = await fetchNominatimStructured(params2, userAgent);
-    if (hit2) {
-      return {
-        latitude: hit2.lat,
-        longitude: hit2.lon,
-        precisao: 'rua',
-        displayName: hit2.displayName,
-      };
-    }
-  }
-
-  // (a) 3. Retry with only street + city (first with number if available, then street only)
-  if (rua && cidade) {
-    if (numero) {
-      const hit3WithNum = await fetchNominatimStructured(
-        { street: `${numero} ${rua}`, city: cidade },
-        userAgent
-      );
-      if (hit3WithNum) {
-        return {
-          latitude: hit3WithNum.lat,
-          longitude: hit3WithNum.lon,
-          precisao: 'exata',
-          displayName: hit3WithNum.displayName,
-        };
-      }
-    }
-
-    const hit3 = await fetchNominatimStructured(
-      { street: rua, city: cidade },
-      userAgent
-    );
-    if (hit3) {
-      return {
-        latitude: hit3.lat,
-        longitude: hit3.lon,
-        precisao: 'rua',
-        displayName: hit3.displayName,
-      };
-    }
-  }
-
-  // Additional structured fallback when city was not typed: try street + neighborhood or street free-form
-  if (rua && !cidade) {
-    const queryParts = [numero ? `${rua}, ${numero}` : rua, bairro, uf, 'Brasil'].filter(Boolean).join(', ');
-    const hitStreet = await fetchNominatimStructured({ q: queryParts }, userAgent);
-    if (hitStreet) {
-      return {
-        latitude: hitStreet.lat,
-        longitude: hitStreet.lon,
-        precisao: numero ? 'exata' : 'rua',
-        displayName: hitStreet.displayName,
-      };
-    }
-  }
-
-  // Free-form query fallback if caller passed a raw query (e.g. store settings search)
-  if (freeQuery && !rua && !rawCep) {
-    const hitFree = await fetchNominatimStructured({ q: freeQuery }, userAgent);
-    if (hitFree) {
-      return {
-        latitude: hitFree.lat,
-        longitude: hitFree.lon,
-        precisao: 'rua',
-        displayName: hitFree.displayName,
-      };
-    }
-  }
-
-  // (b) Fallback: BrasilAPI coordinates and mark precisao as 'aproximada'
-  if (rawCep.length === 8) {
-    if (!brasilApiData) {
-      brasilApiData = await fetchBrasilApiCepServer(rawCep);
-    }
-    if (brasilApiData && brasilApiData.lat !== undefined && brasilApiData.lng !== undefined) {
-      return {
-        latitude: brasilApiData.lat,
-        longitude: brasilApiData.lng,
-        precisao: 'aproximada',
-        displayName: [
-          brasilApiData.street || rua,
-          brasilApiData.neighborhood || bairro,
-          brasilApiData.city || cidade,
-          brasilApiData.state || uf,
-        ]
-          .filter(Boolean)
-          .join(', '),
-      };
-    }
-  }
-
-  return null;
 }
 
 interface ValidatedCustomerGeoFields {
@@ -1124,13 +794,6 @@ function customerFromDB(row: any): CustomerProfile {
   };
 }
 
-async function ensureLegacyCustomerGeocoded(
-  _supabase: SupabaseClient,
-  custRow: any
-): Promise<{ customer: CustomerProfile; pinRejectedError?: string }> {
-  return { customer: customerFromDB(custRow) };
-}
-
 function normalizeCouponExpiresAt(raw: unknown): string | null {
   if (!raw || typeof raw !== 'string') return null;
   const trimmed = raw.trim();
@@ -1724,6 +1387,16 @@ function sanitizePublicSettings(settings: StoreSettings): StoreSettings {
     }
   }
   clean.caseSaleChannels = sanitizedCaseChannels;
+
+  if (typeof (settings as any)?.assistantEnabled === 'boolean') {
+    clean.assistantEnabled = (settings as any).assistantEnabled;
+  } else {
+    clean.assistantEnabled = true;
+  }
+
+  if (typeof (settings as any)?.showFeaturedCarousel === 'boolean') {
+    clean.showFeaturedCarousel = (settings as any).showFeaturedCarousel;
+  }
 
   return clean;
 }
@@ -2471,78 +2144,6 @@ export function createApp(): express.Express {
   });
 
   // ---------------------------------------------------------------------------
-  // GEOCODING RESOLVE ON SERVER: POST /geo/resolve
-  // Rate-limited to 20 calls/min per IP using admin_login_attempts with 'geo:' prefix
-  // ---------------------------------------------------------------------------
-  router.post('/geo/resolve', async (req, res) => {
-    const supabase = getSupabase();
-    const clientIp = getClientIp(req);
-    const geoIpKey = `geo:${clientIp}`;
-    const oneMinuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
-
-    let contactEmail = process.env.CONTACT_EMAIL || 'contato@depositoexpress.com.br';
-
-    if (supabase) {
-      try {
-        const { count, error: countErr } = await supabase
-          .from('admin_login_attempts')
-          .select('*', { count: 'exact', head: true })
-          .eq('ip', geoIpKey)
-          .gte('created_at', oneMinuteAgo);
-
-        if (!countErr && (count ?? 0) >= 20) {
-          return res.status(429).json({
-            error: 'Limite de consultas de localização atingido (20 por minuto). Aguarde um instante.',
-          });
-        }
-
-        await supabase.from('admin_login_attempts').insert({
-          ip: geoIpKey,
-          success: true,
-          created_at: new Date().toISOString(),
-        });
-
-        const { data: settingsRow } = await supabase
-          .from('store_settings')
-          .select('data')
-          .eq('id', 'default')
-          .maybeSingle();
-        const sData = settingsRow?.data;
-        if (sData) {
-          if (sData.email && typeof sData.email === 'string' && sData.email.includes('@')) {
-            contactEmail = sData.email.trim();
-          } else if (sData.pixKey && typeof sData.pixKey === 'string' && sData.pixKey.includes('@')) {
-            contactEmail = sData.pixKey.trim();
-          }
-        }
-      } catch (err) {
-        console.warn('[Geo Warning] Rate limit check warning:', err);
-      }
-    }
-
-    const body = req.body || {};
-
-    const resolved = await resolveAddressGeocodeServer(supabase, {
-      rua: String(body.rua || body.street || body.address || body.logradouro || '').trim(),
-      numero: String(body.numero || body.number || '').trim(),
-      bairro: String(body.bairro || body.neighborhood || '').trim(),
-      cidade: String(body.cidade || body.city || body.localidade || '').trim(),
-      uf: String(body.uf || body.state || '').trim(),
-      cep: String(body.cep || body.postalcode || '').replace(/\D/g, ''),
-      query: String(body.query || '').trim(),
-      contactEmail,
-    });
-
-    if (resolved) {
-      return res.json(resolved);
-    }
-
-    return res.status(404).json({
-      error: 'Não foi possível localizar as coordenadas deste endereço.',
-    });
-  });
-
-  // ---------------------------------------------------------------------------
   // CUSTOMER AUTH: REGISTER, LOGIN, ME
   // ---------------------------------------------------------------------------
   router.post('/customer/register', async (req, res) => {
@@ -2858,7 +2459,7 @@ export function createApp(): express.Express {
     }
 
     const { token, expiresAt } = createCustomerSignedToken(customerRow.id);
-    const { customer } = await ensureLegacyCustomerGeocoded(supabase, customerRow);
+    const customer = customerFromDB(customerRow);
 
     return res.json({
       success: true,
@@ -2883,7 +2484,7 @@ export function createApp(): express.Express {
       return res.status(404).json({ error: 'Cadastro do cliente não encontrado.' });
     }
 
-    const { customer } = await ensureLegacyCustomerGeocoded(supabase, data);
+    const customer = customerFromDB(data);
     res.json(sanitizePublicCustomer(customer));
   });
 
@@ -8583,6 +8184,1329 @@ export function createApp(): express.Express {
     };
 
     return res.json(responsePayload);
+  });
+
+  // ---------------------------------------------------------------------------
+  // ADMIN AI ASSISTANT: POST /admin/assistant (requireAdmin, 100 msgs/day limit)
+  // ---------------------------------------------------------------------------
+  router.post('/admin/assistant', requireAdmin, async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase não configurado no servidor.' });
+    }
+
+    const geminiApiKey = (process.env.GEMINI_API_KEY || '').trim();
+    if (!geminiApiKey) {
+      return res.status(500).json({
+        error: 'Chave GEMINI_API_KEY não configurada nas variáveis de ambiente do servidor.',
+      });
+    }
+
+    const rawMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    if (!rawMessage) {
+      return res.status(400).json({ error: 'Digite uma pergunta ou comando para o assistente.' });
+    }
+    if (rawMessage.length > 2000) {
+      return res.status(400).json({ error: 'A mensagem deve ter no máximo 2000 caracteres.' });
+    }
+
+    const rawHistory: AdminAssistantMessage[] = Array.isArray(req.body?.history)
+      ? req.body.history.slice(-10)
+      : [];
+
+    // Daily rate limit: 100 messages/day using admin_login_attempts with prefix ai_admin:YYYY-MM-DD
+    const nowBr = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const yyyyMmDd = nowBr.toISOString().slice(0, 10);
+    const aiDailyKey = `ai_admin:${yyyyMmDd}`;
+
+    const { count: usedCount, error: countErr } = await supabase
+      .from('admin_login_attempts')
+      .select('*', { count: 'exact', head: true })
+      .eq('ip', aiDailyKey);
+
+    if (countErr) {
+      console.error('[Supabase Error] assistant rate limit count:', countErr.message);
+      return res.status(500).json({ error: countErr.message });
+    }
+
+    const currentUsed = usedCount ?? 0;
+    if (currentUsed >= 100) {
+      return res.status(429).json({
+        error: 'Limite diário de 100 mensagens do Assistente IA atingido. Tente novamente amanhã.',
+        remainingToday: 0,
+      });
+    }
+
+    const { error: insertAttemptErr } = await supabase.from('admin_login_attempts').insert({
+      ip: aiDailyKey,
+      success: true,
+      created_at: new Date().toISOString(),
+    });
+
+    if (insertAttemptErr) {
+      console.error('[Supabase Error] assistant rate limit insert:', insertAttemptErr.message);
+      return res.status(500).json({ error: insertAttemptErr.message });
+    }
+
+    const remainingToday = Math.max(0, 100 - (currentUsed + 1));
+    const proposals: AdminAssistantProposal[] = [];
+
+    const toBrIsoBound = (rawDate: string | undefined, isEnd: boolean): string | null => {
+      if (!rawDate) return null;
+      const trimmed = String(rawDate).trim();
+      if (!trimmed) return null;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+        return isEnd ? `${trimmed}T23:59:59.999-03:00` : `${trimmed}T00:00:00.000-03:00`;
+      }
+      const d = new Date(trimmed);
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    };
+
+    const loadAllProductsNoImage = async (): Promise<{ products: Product[]; settings: StoreSettings; error?: string }> => {
+      const [prodRes, settingsRes] = await Promise.all([
+        supabase.from('products').select(PRODUCT_COLUMNS_NO_IMAGE).order('name', { ascending: true }),
+        supabase.from('store_settings').select('data').eq('id', 'default').maybeSingle(),
+      ]);
+
+      if (prodRes.error) {
+        return { products: [], settings: initialSettings, error: prodRes.error.message };
+      }
+      if (settingsRes.error) {
+        return { products: [], settings: initialSettings, error: settingsRes.error.message };
+      }
+
+      const dbSettings = settingsRes.data?.data
+        ? sanitizePublicSettings(settingsRes.data.data)
+        : initialSettings;
+      const mapped = applyCombosStockAndCost(mapProductsFromDB(prodRes.data), dbSettings);
+      return { products: mapped, settings: dbSettings };
+    };
+
+    const findBestProductMatch = (products: Product[], idOrTerm: string): Product | undefined => {
+      const needle = String(idOrTerm || '').trim();
+      if (!needle) return undefined;
+      const exactId = products.find((p) => p.id === needle);
+      if (exactId) return exactId;
+      const lower = needle.toLowerCase();
+      const exactSku = products.find((p) => (p.sku || '').toLowerCase() === lower);
+      if (exactSku) return exactSku;
+      const exactName = products.find((p) => p.name.toLowerCase() === lower);
+      if (exactName) return exactName;
+      return products.find(
+        (p) =>
+          p.name.toLowerCase().includes(lower) ||
+          `${p.name} ${p.volume || ''}`.toLowerCase().includes(lower)
+      );
+    };
+
+    const assistantDeclarations: FunctionDeclaration[] = [
+      {
+        name: 'resumo_vendas',
+        description:
+          'Retorna faturamento, custo dos itens vendidos, lucro líquido ou prejuízo (permitindo negativo), margem %, ticket médio, vendas por canal (online/balcão/mesa), por forma de pagamento e itens sem custo cadastrado no período ou expediente atual.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            periodo: {
+              type: Type.STRING,
+              description: "Período desejado: 'expediente', 'hoje', '7d', '30d' ou 'custom'. Padrão: 'expediente'.",
+            },
+            dataInicio: {
+              type: Type.STRING,
+              description: 'Data inicial YYYY-MM-DD quando periodo for custom.',
+            },
+            dataFim: {
+              type: Type.STRING,
+              description: 'Data final YYYY-MM-DD quando periodo for custom.',
+            },
+          },
+        },
+      },
+      {
+        name: 'mais_vendidos',
+        description:
+          'Retorna o ranking dos produtos mais vendidos no período por quantidade vendida, faturamento e lucro estimado.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            dias: {
+              type: Type.NUMBER,
+              description: 'Quantidade de dias para trás (ex: 7, 15, 30). Padrão: 7.',
+            },
+            limite: {
+              type: Type.NUMBER,
+              description: 'Quantidade máxima de produtos no ranking (padrão 10, máx 25).',
+            },
+            ordenarPor: {
+              type: Type.STRING,
+              description: "Critério de ordenação: 'quantidade', 'lucro' ou 'faturamento'. Padrão: 'quantidade'.",
+            },
+          },
+        },
+      },
+      {
+        name: 'produtos_parados',
+        description:
+          'Lista produtos ativos que têm estoque disponível (> 0), mas não tiveram nenhuma venda nos últimos N dias.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            dias: {
+              type: Type.NUMBER,
+              description: 'Dias sem vendas (padrão 15).',
+            },
+            limite: {
+              type: Type.NUMBER,
+              description: 'Quantidade máxima de produtos retornados (padrão 20).',
+            },
+          },
+        },
+      },
+      {
+        name: 'estoque_baixo',
+        description:
+          'Lista produtos ativos cujo estoque atual está menor ou igual ao estoque mínimo (ignorando combos).',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            apenasZerados: {
+              type: Type.BOOLEAN,
+              description: 'Se verdadeiro, retorna apenas produtos com estoque igual a 0.',
+            },
+            limite: {
+              type: Type.NUMBER,
+              description: 'Quantidade máxima de itens (padrão 30).',
+            },
+          },
+        },
+      },
+      {
+        name: 'sugestao_compra',
+        description:
+          'Sugere quantidade de reposição e calcula o custo estimado de compra com base no giro de vendas dos últimos dias e no estoque mínimo.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            diasBase: {
+              type: Type.NUMBER,
+              description: 'Dias de histórico para calcular o giro diário (padrão 14).',
+            },
+            diasCobertura: {
+              type: Type.NUMBER,
+              description: 'Dias de estoque desejados para cobertura (padrão 7).',
+            },
+          },
+        },
+      },
+      {
+        name: 'historico_estoque',
+        description: 'Consulta os últimos registros de movimentação de estoque (entradas, vendas, perdas, ajustes).',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            termoProduto: {
+              type: Type.STRING,
+              description: 'Nome ou ID do produto para filtrar (opcional).',
+            },
+            motivo: {
+              type: Type.STRING,
+              description: "Motivo opcional: 'venda', 'mesa', 'entrada', 'perda', 'ajuste', 'contagem', 'cancelamento'.",
+            },
+            limite: {
+              type: Type.NUMBER,
+              description: 'Quantidade máxima de registros (padrão 20, máx 50).',
+            },
+          },
+        },
+      },
+      {
+        name: 'comparar_periodos',
+        description:
+          'Compara faturamento, número de pedidos, ticket médio e lucro líquido entre dois intervalos de datas.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            periodo1Inicio: {
+              type: Type.STRING,
+              description: 'Data inicial do período 1 (YYYY-MM-DD).',
+            },
+            periodo1Fim: {
+              type: Type.STRING,
+              description: 'Data final do período 1 (YYYY-MM-DD).',
+            },
+            periodo2Inicio: {
+              type: Type.STRING,
+              description: 'Data inicial do período 2 (YYYY-MM-DD).',
+            },
+            periodo2Fim: {
+              type: Type.STRING,
+              description: 'Data final do período 2 (YYYY-MM-DD).',
+            },
+          },
+          required: ['periodo1Inicio', 'periodo1Fim', 'periodo2Inicio', 'periodo2Fim'],
+        },
+      },
+      {
+        name: 'buscar_produto',
+        description: 'Busca produtos no catálogo por nome, categoria ou código SKU (sem imagens base64).',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            termo: {
+              type: Type.STRING,
+              description: 'Termo de busca (nome, categoria ou SKU).',
+            },
+            limite: {
+              type: Type.NUMBER,
+              description: 'Quantidade máxima de produtos (padrão 15).',
+            },
+          },
+          required: ['termo'],
+        },
+      },
+      {
+        name: 'pedidos_agora',
+        description:
+          'Retorna o resumo em tempo real dos pedidos em andamento (pendentes, em separação, em rota) e o total de mesas/comandas abertas agora, sem dados pessoais de clientes.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {},
+        },
+      },
+      {
+        name: 'propor_preco',
+        description:
+          'Cria uma proposta de alteração de preço de venda (e opcionalmente custo) de um produto para o dono confirmar na tela. Não grava direto no banco.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            produtoIdOuNome: {
+              type: Type.STRING,
+              description: 'ID ou nome do produto.',
+            },
+            novoPreco: {
+              type: Type.NUMBER,
+              description: 'Novo preço de venda unitário em R$.',
+            },
+            novoCusto: {
+              type: Type.NUMBER,
+              description: 'Novo preço de custo unitário em R$ (opcional).',
+            },
+          },
+          required: ['produtoIdOuNome', 'novoPreco'],
+        },
+      },
+      {
+        name: 'propor_promocao',
+        description:
+          'Cria uma proposta de promoção (preço promocional ou encerrar promoção passando 0) para o dono confirmar na tela. Não grava direto no banco.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            produtoIdOuNome: {
+              type: Type.STRING,
+              description: 'ID ou nome do produto.',
+            },
+            precoPromocional: {
+              type: Type.NUMBER,
+              description: 'Preço promocional em R$ (menor que o preço normal, ou 0 para encerrar promoção).',
+            },
+            fimPromocao: {
+              type: Type.STRING,
+              description: 'Data/hora limite opcional em formato ISO ou YYYY-MM-DD.',
+            },
+          },
+          required: ['produtoIdOuNome', 'precoPromocional'],
+        },
+      },
+      {
+        name: 'propor_descricao',
+        description:
+          'Cria uma proposta de nova descrição comercial para um produto para o dono confirmar na tela. Não grava direto no banco.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            produtoIdOuNome: {
+              type: Type.STRING,
+              description: 'ID ou nome do produto.',
+            },
+            novaDescricao: {
+              type: Type.STRING,
+              description: 'Texto sugerido para a descrição do produto (máx 400 caracteres).',
+            },
+          },
+          required: ['produtoIdOuNome', 'novaDescricao'],
+        },
+      },
+      {
+        name: 'propor_ajuste_estoque',
+        description:
+          'Cria uma proposta de ajuste de estoque (entrada, perda, contagem ou ajuste) para o dono confirmar na tela. Não grava direto no banco.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            produtoIdOuNome: {
+              type: Type.STRING,
+              description: 'ID ou nome do produto.',
+            },
+            modo: {
+              type: Type.STRING,
+              description: "'delta' para somar/subtrair unidades, ou 'set' para definir o estoque exato.",
+            },
+            quantidade: {
+              type: Type.NUMBER,
+              description: 'Quantidade inteira (positiva ou negativa em delta; >= 0 em set).',
+            },
+            motivo: {
+              type: Type.STRING,
+              description: "Motivo: 'entrada', 'perda', 'contagem' ou 'ajuste'.",
+            },
+            observacao: {
+              type: Type.STRING,
+              description: 'Observação opcional sobre o ajuste.',
+            },
+          },
+          required: ['produtoIdOuNome', 'modo', 'quantidade', 'motivo'],
+        },
+      },
+      {
+        name: 'propor_combo',
+        description:
+          'Cria uma proposta de criação ou atualização de combo de produtos para o dono confirmar na tela. Não grava direto no banco.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            nomeCombo: {
+              type: Type.STRING,
+              description: 'Nome comercial do combo.',
+            },
+            precoCombo: {
+              type: Type.NUMBER,
+              description: 'Preço de venda do combo em R$.',
+            },
+            volume: {
+              type: Type.STRING,
+              description: 'Resumo curto de volume/formato (ex: Kit Festa).',
+            },
+            comboIdExistente: {
+              type: Type.STRING,
+              description: 'ID do produto combo caso já exista no catálogo (opcional).',
+            },
+            itens: {
+              type: Type.ARRAY,
+              description: 'Lista de produtos que compõem o combo e suas quantidades.',
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  produtoIdOuNome: {
+                    type: Type.STRING,
+                    description: 'ID ou nome do produto componente.',
+                  },
+                  quantidade: {
+                    type: Type.NUMBER,
+                    description: 'Quantidade inteira (1 a 99) deste componente no combo.',
+                  },
+                },
+                required: ['produtoIdOuNome', 'quantidade'],
+              },
+            },
+          },
+          required: ['nomeCombo', 'precoCombo', 'itens'],
+        },
+      },
+    ];
+
+    const executeToolCall = async (name: string, args: Record<string, any>): Promise<Record<string, any>> => {
+      try {
+        if (name === 'resumo_vendas') {
+          const periodo = String(args?.periodo || 'expediente').toLowerCase();
+          let fromIso: string | null = null;
+          let toIso: string | null = null;
+          let openingCash = 0;
+          let countedCash: number | null = null;
+          let labelPeriodo = 'Hoje';
+
+          if (periodo === 'expediente') {
+            const { data: openSess, error: openErr } = await supabase
+              .from('cash_sessions')
+              .select('id, opened_at, closed_at, opening_cash, counted_cash')
+              .is('closed_at', null)
+              .order('opened_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+            if (openErr) return { error: openErr.message };
+
+            if (openSess) {
+              fromIso = String(openSess.opened_at);
+              toIso = new Date().toISOString();
+              openingCash = Number(openSess.opening_cash) || 0;
+              labelPeriodo = `Expediente aberto desde ${openSess.opened_at}`;
+            } else {
+              const { data: lastClosed, error: lastErr } = await supabase
+                .from('cash_sessions')
+                .select('id, opened_at, closed_at, opening_cash, counted_cash')
+                .not('closed_at', 'is', null)
+                .order('closed_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+
+              if (lastErr) return { error: lastErr.message };
+
+              if (lastClosed) {
+                fromIso = String(lastClosed.opened_at);
+                toIso = String(lastClosed.closed_at);
+                openingCash = Number(lastClosed.opening_cash) || 0;
+                countedCash =
+                  lastClosed.counted_cash !== null && lastClosed.counted_cash !== undefined
+                    ? Number(lastClosed.counted_cash)
+                    : null;
+                labelPeriodo = `Último expediente fechado (${lastClosed.opened_at} até ${lastClosed.closed_at})`;
+              }
+            }
+          }
+
+          if (!fromIso) {
+            if (periodo === '7d') {
+              fromIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+              toIso = new Date().toISOString();
+              labelPeriodo = 'Últimos 7 dias';
+            } else if (periodo === '30d') {
+              fromIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+              toIso = new Date().toISOString();
+              labelPeriodo = 'Últimos 30 dias';
+            } else if (periodo === 'custom' && args?.dataInicio) {
+              fromIso = toBrIsoBound(String(args.dataInicio), false);
+              toIso = toBrIsoBound(String(args.dataFim || args.dataInicio), true);
+              labelPeriodo = `Período ${args.dataInicio} até ${args.dataFim || args.dataInicio}`;
+            } else {
+              fromIso = `${yyyyMmDd}T00:00:00.000-03:00`;
+              toIso = `${yyyyMmDd}T23:59:59.999-03:00`;
+              labelPeriodo = `Hoje (${yyyyMmDd})`;
+            }
+          }
+
+          // Strict privacy: never select customer column
+          let q = supabase
+            .from('orders')
+            .select(
+              'id, source, status, subtotal, discount, delivery_fee, total, payment_method, notes, items, created_at'
+            );
+          if (fromIso) q = q.gte('created_at', fromIso);
+          if (toIso) q = q.lte('created_at', toIso);
+
+          const { data: orderRows, error: ordersErr } = await q.limit(5000);
+          if (ordersErr) return { error: ordersErr.message };
+
+          const summary = computeCashSessionSummaryFromOrders(orderRows || [], openingCash, countedCash);
+          return {
+            periodo: labelPeriodo,
+            ...summary,
+            situacaoResultado: summary.netProfit >= 0 ? 'lucro' : 'prejuizo',
+          };
+        }
+
+        if (name === 'mais_vendidos') {
+          const dias = Math.max(1, Math.min(90, Math.floor(Number(args?.dias) || 7)));
+          const limite = Math.max(1, Math.min(25, Math.floor(Number(args?.limite) || 10)));
+          const ordenarPor = String(args?.ordenarPor || 'quantidade').toLowerCase();
+          const sinceIso = new Date(Date.now() - dias * 24 * 60 * 60 * 1000).toISOString();
+
+          const [ordersRes, prodInfo] = await Promise.all([
+            supabase
+              .from('orders')
+              .select('status, items, created_at')
+              .neq('status', 'cancelado')
+              .gte('created_at', sinceIso)
+              .limit(5000),
+            loadAllProductsNoImage(),
+          ]);
+
+          if (ordersRes.error) return { error: ordersRes.error.message };
+          if (prodInfo.error) return { error: prodInfo.error };
+
+          const prodById = new Map<string, Product>(prodInfo.products.map((p) => [p.id, p]));
+          const stats = new Map<
+            string,
+            {
+              productId: string;
+              name: string;
+              quantitySold: number;
+              revenue: number;
+              cost: number;
+              profit: number;
+              currentStock: number;
+            }
+          >();
+
+          for (const row of ordersRes.data || []) {
+            const items = Array.isArray(row.items) ? row.items : [];
+            for (const it of items) {
+              const pid = String(it?.productId || '').trim();
+              if (!pid) continue;
+              const qty = Math.max(1, Number(it?.quantity) || 1);
+              const price = Math.max(0, Number(it?.price) || 0);
+              const prod = prodById.get(pid);
+              const unitCost =
+                Number.isFinite(Number(it?.costPrice)) && Number(it?.costPrice) > 0
+                  ? Number(it.costPrice)
+                  : Number(prod?.costPrice) || 0;
+
+              const lineRev = price * qty;
+              const lineCost = unitCost * qty;
+              const existing = stats.get(pid) || {
+                productId: pid,
+                name: String(it?.name || prod?.name || pid),
+                quantitySold: 0,
+                revenue: 0,
+                cost: 0,
+                profit: 0,
+                currentStock: prod ? prod.stock : 0,
+              };
+              existing.quantitySold += qty;
+              existing.revenue = Math.round((existing.revenue + lineRev) * 100) / 100;
+              existing.cost = Math.round((existing.cost + lineCost) * 100) / 100;
+              existing.profit = Math.round((existing.revenue - existing.cost) * 100) / 100;
+              stats.set(pid, existing);
+            }
+          }
+
+          const list = Array.from(stats.values());
+          list.sort((a, b) => {
+            if (ordenarPor === 'lucro') return b.profit - a.profit;
+            if (ordenarPor === 'faturamento') return b.revenue - a.revenue;
+            return b.quantitySold - a.quantitySold;
+          });
+
+          return {
+            diasAnalisados: dias,
+            totalProdutosComVenda: list.length,
+            ranking: list.slice(0, limite),
+          };
+        }
+
+        if (name === 'produtos_parados') {
+          const dias = Math.max(1, Math.min(90, Math.floor(Number(args?.dias) || 15)));
+          const limite = Math.max(1, Math.min(40, Math.floor(Number(args?.limite) || 20)));
+          const sinceIso = new Date(Date.now() - dias * 24 * 60 * 60 * 1000).toISOString();
+
+          const [ordersRes, prodInfo] = await Promise.all([
+            supabase
+              .from('orders')
+              .select('status, items')
+              .neq('status', 'cancelado')
+              .gte('created_at', sinceIso)
+              .limit(5000),
+            loadAllProductsNoImage(),
+          ]);
+
+          if (ordersRes.error) return { error: ordersRes.error.message };
+          if (prodInfo.error) return { error: prodInfo.error };
+
+          const soldIds = new Set<string>();
+          for (const row of ordersRes.data || []) {
+            const items = Array.isArray(row.items) ? row.items : [];
+            for (const it of items) {
+              if (it?.productId) soldIds.add(String(it.productId));
+              if (Array.isArray(it?.comboItems)) {
+                for (const ci of it.comboItems) {
+                  if (ci?.productId) soldIds.add(String(ci.productId));
+                }
+              }
+            }
+          }
+
+          const stagnant = prodInfo.products
+            .filter(
+              (p) =>
+                p.active !== false &&
+                !isComboProduct(p.id, prodInfo.settings) &&
+                p.stock > 0 &&
+                !soldIds.has(p.id)
+            )
+            .map((p) => ({
+              id: p.id,
+              name: p.name,
+              volume: p.volume,
+              category: p.category,
+              stock: p.stock,
+              price: p.price,
+              costPrice: p.costPrice,
+              capitalParado: Math.round(p.stock * (p.costPrice || 0) * 100) / 100,
+            }))
+            .sort((a, b) => b.capitalParado - a.capitalParado || b.stock - a.stock);
+
+          const totalCapitalParado =
+            Math.round(stagnant.reduce((acc, item) => acc + item.capitalParado, 0) * 100) / 100;
+
+          return {
+            diasSemVenda: dias,
+            quantidadeProdutosParados: stagnant.length,
+            totalCapitalParado,
+            produtos: stagnant.slice(0, limite),
+          };
+        }
+
+        if (name === 'estoque_baixo') {
+          const apenasZerados = Boolean(args?.apenasZerados);
+          const limite = Math.max(1, Math.min(50, Math.floor(Number(args?.limite) || 30)));
+          const prodInfo = await loadAllProductsNoImage();
+          if (prodInfo.error) return { error: prodInfo.error };
+
+          const lowStock = prodInfo.products
+            .filter((p) => {
+              if (p.active === false) return false;
+              if (isComboProduct(p.id, prodInfo.settings)) return false;
+              if (apenasZerados) return p.stock <= 0;
+              return p.stock <= p.minStock;
+            })
+            .sort((a, b) => a.stock - b.stock)
+            .slice(0, limite)
+            .map((p) => ({
+              id: p.id,
+              name: p.name,
+              volume: p.volume,
+              category: p.category,
+              stock: p.stock,
+              minStock: p.minStock,
+              costPrice: p.costPrice,
+              price: p.price,
+              caseSize: p.caseSize ?? null,
+            }));
+
+          return {
+            totalItensAlerta: lowStock.length,
+            itens: lowStock,
+          };
+        }
+
+        if (name === 'sugestao_compra') {
+          const diasBase = Math.max(3, Math.min(60, Math.floor(Number(args?.diasBase) || 14)));
+          const diasCobertura = Math.max(2, Math.min(30, Math.floor(Number(args?.diasCobertura) || 7)));
+          const sinceIso = new Date(Date.now() - diasBase * 24 * 60 * 60 * 1000).toISOString();
+
+          const [ordersRes, prodInfo] = await Promise.all([
+            supabase
+              .from('orders')
+              .select('status, items')
+              .neq('status', 'cancelado')
+              .gte('created_at', sinceIso)
+              .limit(5000),
+            loadAllProductsNoImage(),
+          ]);
+
+          if (ordersRes.error) return { error: ordersRes.error.message };
+          if (prodInfo.error) return { error: prodInfo.error };
+
+          const unitsSoldByProduct = new Map<string, number>();
+          for (const row of ordersRes.data || []) {
+            const items = Array.isArray(row.items) ? row.items : [];
+            for (const it of items) {
+              const itemQty = Math.max(1, Number(it?.quantity) || 1);
+              if (Array.isArray(it?.comboItems) && it.comboItems.length > 0) {
+                for (const ci of it.comboItems) {
+                  const cid = String(ci?.productId || '').trim();
+                  const cqty = Math.max(1, Number(ci?.quantity) || 1);
+                  if (cid) {
+                    unitsSoldByProduct.set(cid, (unitsSoldByProduct.get(cid) || 0) + itemQty * cqty);
+                  }
+                }
+              } else if (it?.productId) {
+                const pid = String(it.productId).trim();
+                const mult =
+                  it?.unitsPerSale && Number(it.unitsPerSale) > 1 ? Math.floor(Number(it.unitsPerSale)) : 1;
+                unitsSoldByProduct.set(pid, (unitsSoldByProduct.get(pid) || 0) + itemQty * mult);
+              }
+            }
+          }
+
+          const sugestoes: Array<{
+            id: string;
+            name: string;
+            volume: string;
+            stockAtual: number;
+            minStock: number;
+            vendidosNoPeriodo: number;
+            giroDiario: number;
+            sugestaoComprarUnidades: number;
+            custoUnitario: number;
+            custoEstimadoTotal: number;
+          }> = [];
+
+          for (const p of prodInfo.products) {
+            if (p.active === false || isComboProduct(p.id, prodInfo.settings)) continue;
+            const sold = unitsSoldByProduct.get(p.id) || 0;
+            const dailyRate = sold / diasBase;
+            const neededForCoverage = Math.ceil(dailyRate * diasCobertura);
+            const targetStock = Math.max(p.minStock, neededForCoverage);
+            if (p.stock < targetStock && (p.stock <= p.minStock || sold > 0)) {
+              const buyQty = Math.max(1, targetStock - p.stock);
+              const unitCost = Number(p.costPrice) || 0;
+              sugestoes.push({
+                id: p.id,
+                name: p.name,
+                volume: p.volume,
+                stockAtual: p.stock,
+                minStock: p.minStock,
+                vendidosNoPeriodo: sold,
+                giroDiario: Math.round(dailyRate * 100) / 100,
+                sugestaoComprarUnidades: buyQty,
+                custoUnitario: unitCost,
+                custoEstimadoTotal: Math.round(buyQty * unitCost * 100) / 100,
+              });
+            }
+          }
+
+          sugestoes.sort((a, b) => b.giroDiario - a.giroDiario || a.stockAtual - b.stockAtual);
+          const custoTotalEstimado =
+            Math.round(sugestoes.reduce((acc, s) => acc + s.custoEstimadoTotal, 0) * 100) / 100;
+
+          return {
+            diasBaseGiro: diasBase,
+            diasCobertura,
+            totalItensParaRepor: sugestoes.length,
+            custoTotalEstimado,
+            itens: sugestoes.slice(0, 30),
+          };
+        }
+
+        if (name === 'historico_estoque') {
+          const limite = Math.max(1, Math.min(50, Math.floor(Number(args?.limite) || 20)));
+          const motivo = typeof args?.motivo === 'string' ? args.motivo.trim().toLowerCase() : '';
+          const termo = typeof args?.termoProduto === 'string' ? args.termoProduto.trim().toLowerCase() : '';
+
+          let q = supabase
+            .from('stock_movements')
+            .select('*')
+            .order('created_at', { ascending: false })
+            .limit(150);
+
+          if (motivo) {
+            q = q.eq('reason', motivo);
+          }
+
+          const { data: rows, error: movErr } = await q;
+          if (movErr) return { error: movErr.message };
+
+          const filtered = (rows || [])
+            .filter((r: any) => {
+              if (!termo) return true;
+              const pName = String(r.product_name || '').toLowerCase();
+              const pId = String(r.product_id || '').toLowerCase();
+              return pName.includes(termo) || pId === termo;
+            })
+            .slice(0, limite)
+            .map((r: any) => ({
+              id: String(r.id),
+              createdAt: String(r.created_at),
+              productId: String(r.product_id),
+              productName: String(r.product_name || ''),
+              delta: Number(r.delta) || 0,
+              stockAfter: Number(r.stock_after) || 0,
+              reason: String(r.reason || ''),
+              note: r.note ? String(r.note) : null,
+            }));
+
+          return {
+            totalRetornado: filtered.length,
+            movimentacoes: filtered,
+          };
+        }
+
+        if (name === 'comparar_periodos') {
+          const p1Start = toBrIsoBound(args?.periodo1Inicio, false);
+          const p1End = toBrIsoBound(args?.periodo1Fim, true);
+          const p2Start = toBrIsoBound(args?.periodo2Inicio, false);
+          const p2End = toBrIsoBound(args?.periodo2Fim, true);
+
+          if (!p1Start || !p1End || !p2Start || !p2End) {
+            return { error: 'Datas inválidas para comparação. Use o formato YYYY-MM-DD.' };
+          }
+
+          const [res1, res2] = await Promise.all([
+            supabase
+              .from('orders')
+              .select(
+                'id, source, status, subtotal, discount, delivery_fee, total, payment_method, notes, items, created_at'
+              )
+              .gte('created_at', p1Start)
+              .lte('created_at', p1End)
+              .limit(5000),
+            supabase
+              .from('orders')
+              .select(
+                'id, source, status, subtotal, discount, delivery_fee, total, payment_method, notes, items, created_at'
+              )
+              .gte('created_at', p2Start)
+              .lte('created_at', p2End)
+              .limit(5000),
+          ]);
+
+          if (res1.error) return { error: res1.error.message };
+          if (res2.error) return { error: res2.error.message };
+
+          const s1 = computeCashSessionSummaryFromOrders(res1.data || [], 0, null);
+          const s2 = computeCashSessionSummaryFromOrders(res2.data || [], 0, null);
+
+          const diffRevenue = Math.round((s2.totalRevenue - s1.totalRevenue) * 100) / 100;
+          const diffProfit = Math.round((s2.netProfit - s1.netProfit) * 100) / 100;
+          const pctRevenue =
+            s1.totalRevenue > 0
+              ? Math.round(((s2.totalRevenue - s1.totalRevenue) / s1.totalRevenue) * 1000) / 10
+              : null;
+
+          return {
+            periodo1: {
+              inicio: args.periodo1Inicio,
+              fim: args.periodo1Fim,
+              faturamento: s1.totalRevenue,
+              pedidos: s1.ordersCount,
+              lucroLiquido: s1.netProfit,
+              ticketMedio: s1.avgTicket,
+            },
+            periodo2: {
+              inicio: args.periodo2Inicio,
+              fim: args.periodo2Fim,
+              faturamento: s2.totalRevenue,
+              pedidos: s2.ordersCount,
+              lucroLiquido: s2.netProfit,
+              ticketMedio: s2.avgTicket,
+            },
+            comparativo: {
+              diferencaFaturamento: diffRevenue,
+              variacaoFaturamentoPercent: pctRevenue,
+              diferencaLucro: diffProfit,
+              diferencaPedidos: s2.ordersCount - s1.ordersCount,
+            },
+          };
+        }
+
+        if (name === 'buscar_produto') {
+          const termo = String(args?.termo || '').trim().toLowerCase();
+          const limite = Math.max(1, Math.min(30, Math.floor(Number(args?.limite) || 15)));
+          const prodInfo = await loadAllProductsNoImage();
+          if (prodInfo.error) return { error: prodInfo.error };
+
+          const matches = prodInfo.products
+            .filter((p) => {
+              if (!termo) return true;
+              return (
+                p.name.toLowerCase().includes(termo) ||
+                String(p.category || '').toLowerCase().includes(termo) ||
+                String(p.sku || '').toLowerCase().includes(termo) ||
+                String(p.volume || '').toLowerCase().includes(termo) ||
+                p.id.toLowerCase() === termo
+              );
+            })
+            .slice(0, limite)
+            .map((p) => ({
+              id: p.id,
+              name: p.name,
+              category: p.category,
+              volume: p.volume,
+              price: p.price,
+              promoPrice: p.promoPrice ?? null,
+              promoEndsAt: p.promoEndsAt ?? null,
+              costPrice: p.costPrice,
+              stock: p.stock,
+              minStock: p.minStock,
+              caseSize: p.caseSize ?? null,
+              casePrice: p.casePrice ?? null,
+              sku: p.sku,
+              active: p.active,
+              isCombo: isComboProduct(p.id, prodInfo.settings),
+              description: p.description,
+            }));
+
+          return {
+            encontrados: matches.length,
+            produtos: matches,
+          };
+        }
+
+        if (name === 'pedidos_agora') {
+          // Strict privacy: never select customer column
+          const [ordersRes, tabsRes] = await Promise.all([
+            supabase
+              .from('orders')
+              .select(
+                'id, source, status, delivery_type, subtotal, delivery_fee, discount, total, payment_method, created_at'
+              )
+              .in('status', ['pendente', 'em_separacao', 'em_rota'])
+              .order('created_at', { ascending: true }),
+            supabase
+              .from('table_tabs')
+              .select('id, table_id, status, people_count, opened_at')
+              .in('status', ['open', 'closing']),
+          ]);
+
+          if (ordersRes.error) return { error: ordersRes.error.message };
+          if (tabsRes.error) return { error: tabsRes.error.message };
+
+          const activeOrders = ordersRes.data || [];
+          const pendentes = activeOrders.filter((o: any) => o.status === 'pendente');
+          const emSeparacao = activeOrders.filter((o: any) => o.status === 'em_separacao');
+          const emRota = activeOrders.filter((o: any) => o.status === 'em_rota');
+
+          const activeTabs = tabsRes.data || [];
+          let openTabsSubtotal = 0;
+          if (activeTabs.length > 0) {
+            const tabIds = activeTabs.map((t: any) => String(t.id));
+            const { data: tabItems, error: itemsErr } = await supabase
+              .from('table_tab_items')
+              .select('tab_id, unit_price, quantity, status')
+              .in('tab_id', tabIds)
+              .eq('status', 'active');
+            if (itemsErr) return { error: itemsErr.message };
+            for (const item of tabItems || []) {
+              openTabsSubtotal += (Number(item.unit_price) || 0) * (Number(item.quantity) || 1);
+            }
+          }
+          openTabsSubtotal = Math.round(openTabsSubtotal * 100) / 100;
+
+          return {
+            pedidosPendentes: pendentes.length,
+            pedidosEmSeparacao: emSeparacao.length,
+            pedidosEmRota: emRota.length,
+            valorTotalPedidosEmAndamento:
+              Math.round(activeOrders.reduce((acc: number, o: any) => acc + (Number(o.total) || 0), 0) * 100) /
+              100,
+            mesasAbertasCount: activeTabs.length,
+            mesasAbertasSubtotal: openTabsSubtotal,
+          };
+        }
+
+        // ---------------------------------------------------------------------
+        // PROPOSAL TOOLS (Never write to DB; add to `proposals` for confirmation)
+        // ---------------------------------------------------------------------
+        if (name === 'propor_preco') {
+          const prodInfo = await loadAllProductsNoImage();
+          if (prodInfo.error) return { error: prodInfo.error };
+          const target = findBestProductMatch(prodInfo.products, String(args?.produtoIdOuNome || ''));
+          if (!target) {
+            return { error: `Produto "${args?.produtoIdOuNome || ''}" não encontrado.` };
+          }
+          const newPrice = Math.round((Number(args?.novoPreco) || 0) * 100) / 100;
+          if (newPrice <= 0) {
+            return { error: 'O novo preço deve ser maior que zero.' };
+          }
+          const hasNewCost =
+            args?.novoCusto !== undefined && args?.novoCusto !== null && Number(args.novoCusto) >= 0;
+          const newCost = hasNewCost
+            ? Math.round(Number(args.novoCusto) * 100) / 100
+            : target.costPrice;
+
+          const proposal: AdminAssistantProposal = {
+            id: crypto.randomUUID(),
+            type: 'price',
+            title: `Alterar preço: ${target.name}`,
+            summary: `Preço de R$ ${target.price.toFixed(2).replace('.', ',')} para R$ ${newPrice
+              .toFixed(2)
+              .replace('.', ',')}${
+              hasNewCost && newCost !== target.costPrice
+                ? ` • Custo de R$ ${target.costPrice.toFixed(2).replace('.', ',')} para R$ ${newCost
+                    .toFixed(2)
+                    .replace('.', ',')}`
+                : ''
+            }`,
+            productId: target.id,
+            productName: target.name,
+            currentPrice: target.price,
+            newPrice,
+            currentCostPrice: target.costPrice,
+            newCostPrice: newCost,
+            status: 'pending',
+          };
+          proposals.push(proposal);
+          return {
+            propostaCriada: true,
+            mensagem: 'Proposta de preço adicionada na tela para confirmação do dono.',
+            proposta: proposal,
+          };
+        }
+
+        if (name === 'propor_promocao') {
+          const prodInfo = await loadAllProductsNoImage();
+          if (prodInfo.error) return { error: prodInfo.error };
+          const target = findBestProductMatch(prodInfo.products, String(args?.produtoIdOuNome || ''));
+          if (!target) {
+            return { error: `Produto "${args?.produtoIdOuNome || ''}" não encontrado.` };
+          }
+          const rawPromo = Number(args?.precoPromocional) || 0;
+          const promoPrice = rawPromo > 0 ? Math.round(rawPromo * 100) / 100 : null;
+          if (promoPrice !== null && promoPrice >= target.price) {
+            return {
+              error: `O preço promocional (R$ ${promoPrice.toFixed(2)}) deve ser menor que o preço normal (R$ ${target.price.toFixed(2)}).`,
+            };
+          }
+          const promoEndsAt =
+            promoPrice !== null && args?.fimPromocao ? String(args.fimPromocao).trim() : null;
+
+          const proposal: AdminAssistantProposal = {
+            id: crypto.randomUUID(),
+            type: 'promo',
+            title:
+              promoPrice !== null
+                ? `Ativar promoção: ${target.name}`
+                : `Encerrar promoção: ${target.name}`,
+            summary:
+              promoPrice !== null
+                ? `De R$ ${target.price.toFixed(2).replace('.', ',')} por R$ ${promoPrice
+                    .toFixed(2)
+                    .replace('.', ',')}`
+                : `Voltar ao preço normal de R$ ${target.price.toFixed(2).replace('.', ',')}`,
+            productId: target.id,
+            productName: target.name,
+            currentPrice: target.price,
+            promoPrice,
+            promoEndsAt,
+            status: 'pending',
+          };
+          proposals.push(proposal);
+          return {
+            propostaCriada: true,
+            mensagem: 'Proposta de promoção adicionada na tela para confirmação do dono.',
+            proposta: proposal,
+          };
+        }
+
+        if (name === 'propor_descricao') {
+          const prodInfo = await loadAllProductsNoImage();
+          if (prodInfo.error) return { error: prodInfo.error };
+          const target = findBestProductMatch(prodInfo.products, String(args?.produtoIdOuNome || ''));
+          if (!target) {
+            return { error: `Produto "${args?.produtoIdOuNome || ''}" não encontrado.` };
+          }
+          const newDescription = String(args?.novaDescricao || '').trim().slice(0, 400);
+          if (!newDescription) {
+            return { error: 'A nova descrição não pode ser vazia.' };
+          }
+
+          const proposal: AdminAssistantProposal = {
+            id: crypto.randomUUID(),
+            type: 'description',
+            title: `Atualizar descrição: ${target.name}`,
+            summary: `"${newDescription}"`,
+            productId: target.id,
+            productName: target.name,
+            currentDescription: target.description || '',
+            newDescription,
+            status: 'pending',
+          };
+          proposals.push(proposal);
+          return {
+            propostaCriada: true,
+            mensagem: 'Proposta de descrição adicionada na tela para confirmação do dono.',
+            proposta: proposal,
+          };
+        }
+
+        if (name === 'propor_ajuste_estoque') {
+          const prodInfo = await loadAllProductsNoImage();
+          if (prodInfo.error) return { error: prodInfo.error };
+          const target = findBestProductMatch(prodInfo.products, String(args?.produtoIdOuNome || ''));
+          if (!target) {
+            return { error: `Produto "${args?.produtoIdOuNome || ''}" não encontrado.` };
+          }
+          if (isComboProduct(target.id, prodInfo.settings)) {
+            return { error: 'O estoque de um combo é calculado automaticamente pelos seus itens.' };
+          }
+
+          const mode: StockAdjustMode = String(args?.modo).toLowerCase() === 'set' ? 'set' : 'delta';
+          const quantity = Math.trunc(Number(args?.quantidade) || 0);
+          const rawReason = String(args?.motivo || 'ajuste').toLowerCase();
+          const validReasons: StockAdjustReason[] = ['ajuste', 'entrada', 'perda', 'contagem'];
+          const reason: StockAdjustReason = validReasons.includes(rawReason as StockAdjustReason)
+            ? (rawReason as StockAdjustReason)
+            : 'ajuste';
+          const note = args?.observacao ? String(args.observacao).trim().slice(0, 140) : undefined;
+
+          const resultingStock = mode === 'set' ? Math.max(0, quantity) : Math.max(0, target.stock + quantity);
+
+          const proposal: AdminAssistantProposal = {
+            id: crypto.randomUUID(),
+            type: 'stock_adjust',
+            title: `Ajustar estoque: ${target.name}`,
+            summary:
+              mode === 'set'
+                ? `Definir estoque em ${resultingStock} un (atual: ${target.stock} un) • Motivo: ${reason}`
+                : `${quantity >= 0 ? `+${quantity}` : quantity} un (de ${target.stock} para ${resultingStock} un) • Motivo: ${reason}`,
+            productId: target.id,
+            productName: target.name,
+            currentStock: target.stock,
+            stockMode: mode,
+            stockQuantity: quantity,
+            stockReason: reason,
+            stockNote: note,
+            status: 'pending',
+          };
+          proposals.push(proposal);
+          return {
+            propostaCriada: true,
+            mensagem: 'Proposta de ajuste de estoque adicionada na tela para confirmação do dono.',
+            proposta: proposal,
+          };
+        }
+
+        if (name === 'propor_combo') {
+          const prodInfo = await loadAllProductsNoImage();
+          if (prodInfo.error) return { error: prodInfo.error };
+
+          const comboName = String(args?.nomeCombo || '').trim().slice(0, 80);
+          const comboPrice = Math.round((Number(args?.precoCombo) || 0) * 100) / 100;
+          const rawItems = Array.isArray(args?.itens) ? args.itens : [];
+
+          if (!comboName || comboPrice <= 0 || rawItems.length === 0) {
+            return { error: 'Informe nome, preço válido e pelo menos 1 item para o combo.' };
+          }
+
+          const resolvedItems: Array<{ productId: string; productName: string; quantity: number }> = [];
+          for (const item of rawItems) {
+            const comp = findBestProductMatch(prodInfo.products, String(item?.produtoIdOuNome || ''));
+            if (!comp) {
+              return { error: `Produto componente "${item?.produtoIdOuNome || ''}" não encontrado.` };
+            }
+            if (isComboProduct(comp.id, prodInfo.settings)) {
+              return { error: `O item "${comp.name}" já é um combo e não pode compor outro combo.` };
+            }
+            const qty = Math.max(1, Math.min(99, Math.floor(Number(item?.quantidade) || 1)));
+            resolvedItems.push({
+              productId: comp.id,
+              productName: comp.name,
+              quantity: qty,
+            });
+          }
+
+          const existingCombo = args?.comboIdExistente
+            ? findBestProductMatch(prodInfo.products, String(args.comboIdExistente))
+            : prodInfo.products.find((p) => p.name.toLowerCase() === comboName.toLowerCase());
+
+          const itemsLabel = resolvedItems.map((i) => `${i.quantity}x ${i.productName}`).join(' + ');
+
+          const proposal: AdminAssistantProposal = {
+            id: crypto.randomUUID(),
+            type: 'combo',
+            title: existingCombo ? `Atualizar combo: ${comboName}` : `Criar combo: ${comboName}`,
+            summary: `${itemsLabel} por R$ ${comboPrice.toFixed(2).replace('.', ',')}`,
+            comboId: existingCombo?.id,
+            comboName,
+            comboPrice,
+            comboVolume: args?.volume ? String(args.volume).trim().slice(0, 40) : 'Combo',
+            comboCategory: existingCombo?.category || 'combos',
+            comboItems: resolvedItems,
+            status: 'pending',
+          };
+          proposals.push(proposal);
+          return {
+            propostaCriada: true,
+            mensagem: 'Proposta de combo adicionada na tela para confirmação do dono.',
+            proposta: proposal,
+          };
+        }
+
+        return { error: `Função desconhecida: ${name}` };
+      } catch (err: any) {
+        console.error(`[Assistant Tool Error] ${name}:`, err);
+        return { error: err?.message || 'Erro ao executar ferramenta.' };
+      }
+    };
+
+    try {
+      const ai = new GoogleGenAI({
+        apiKey: geminiApiKey,
+        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+      });
+
+      const contents: any[] = [];
+      for (const h of rawHistory) {
+        if (!h || typeof h.content !== 'string' || !h.content.trim()) continue;
+        contents.push({
+          role: h.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: h.content.trim().slice(0, 2000) }],
+        });
+      }
+      contents.push({
+        role: 'user',
+        parts: [{ text: rawMessage }],
+      });
+
+      const systemInstruction = [
+        'Você é o Assistente de Gestão do dono de um depósito de bebidas e conveniência.',
+        `Data atual no Brasil (America/Sao_Paulo): ${yyyyMmDd}.`,
+        'Responda sempre em português do Brasil, de forma objetiva, prática e amigável, usando valores formatados em R$ X,XX.',
+        'Use as ferramentas disponíveis para consultar dados reais de faturamento, lucro/prejuízo, produtos mais vendidos, estoque baixo, produtos parados, sugestão de compra, histórico de estoque e pedidos/mesas em andamento.',
+        'Quando o dono pedir para alterar preço, criar/encerrar promoção, mudar descrição, ajustar estoque ou montar um combo, use a ferramenta propor_* correspondente e avise que o cartão amarelo de confirmação foi gerado abaixo para ele aprovar com 1 clique.',
+        'Nunca invente números: consulte sempre as funções antes de responder sobre vendas, estoque ou produtos.',
+      ].join(' ');
+
+      let currentResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents,
+        config: {
+          systemInstruction,
+          tools: [{ functionDeclarations: assistantDeclarations }],
+        },
+      });
+
+      let loopCount = 0;
+      while (
+        currentResponse.functionCalls &&
+        currentResponse.functionCalls.length > 0 &&
+        loopCount < 5
+      ) {
+        loopCount++;
+        const modelContent = currentResponse.candidates?.[0]?.content;
+        if (modelContent) {
+          contents.push(modelContent);
+        }
+
+        const responseParts: any[] = [];
+        for (const call of currentResponse.functionCalls) {
+          const fnName = String(call.name || '');
+          const fnArgs = (call.args as Record<string, any>) || {};
+          const toolResult = await executeToolCall(fnName, fnArgs);
+          responseParts.push({
+            functionResponse: {
+              name: fnName,
+              response: { result: toolResult },
+            },
+          });
+        }
+
+        contents.push({
+          role: 'user',
+          parts: responseParts,
+        });
+
+        currentResponse = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents,
+          config: {
+            systemInstruction,
+            tools: [{ functionDeclarations: assistantDeclarations }],
+          },
+        });
+      }
+
+      const replyText =
+        (currentResponse.text || '').trim() ||
+        (proposals.length > 0
+          ? 'Preparei a proposta abaixo. Confira os dados e clique em Confirmar para aplicar.'
+          : 'Consulta concluída.');
+
+      const payload: AdminAssistantResponse = {
+        reply: replyText,
+        proposals,
+        remainingToday,
+      };
+
+      return res.json(payload);
+    } catch (err: any) {
+      console.error('[Assistant Error] Falha ao processar consulta IA:', err);
+      return res.status(500).json({
+        error: err?.message || 'Não foi possível consultar o Assistente IA agora.',
+      });
+    }
   });
 
   // Mount the router under both /api and root (for Vercel path rewrites compatibility)
