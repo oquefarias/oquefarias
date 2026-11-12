@@ -99,7 +99,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [addonModalState, setAddonModalState] = useState<{
     product: Product;
     saleUnit: SaleUnit;
+    initialQuantity?: number;
+    initialAddons?: OrderItemAddon[];
+    replaceLineId?: string;
   } | null>(null);
+  const [dismissedFloatingCaseProductIds, setDismissedFloatingCaseProductIds] = useState<string[]>([]);
+  const [askingCompleteCaseProductId, setAskingCompleteCaseProductId] = useState<string | null>(null);
 
   // Customer Account state
   const [currentCustomer, setCurrentCustomer] = useState<CustomerProfile | null>(() => api.getCurrentCustomer());
@@ -572,8 +577,16 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   }, [searchFilteredProducts, settings, storeVisibleProducts]);
 
   // Continuous page grouped by category (always groups searchFilteredProducts across all categories with items)
+  // Also inserts "📦 Caixas fechadas" showcase right after the first section of the store (Requirement 2d)
   const groupedCategorySections = useMemo(() => {
-    const sections: { id: string; name: string; items: Product[] }[] = [];
+    const sections: {
+      id: string;
+      name: string;
+      pillLabel?: string;
+      isCaseShowcase?: boolean;
+      items: Product[];
+    }[] = [];
+
     for (const cat of storeCategories) {
       const catProducts = searchFilteredProducts.filter((p) => p.category === cat.id);
       if (catProducts.length > 0) {
@@ -594,6 +607,26 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         items: sortProductsForStore(otherProducts, settings, storeVisibleProducts),
       });
     }
+
+    const caseShowcaseProducts = sortProductsForStore(
+      searchFilteredProducts.filter(
+        (p) => !isComboProduct(p.id, settings) && canSellProductCase(p, settings, 'store')
+      ),
+      settings,
+      storeVisibleProducts
+    );
+
+    if (caseShowcaseProducts.length > 0) {
+      const insertIndex = sections.length > 0 ? 1 : 0;
+      sections.splice(insertIndex, 0, {
+        id: 'caixas_fechadas',
+        name: '📦 Caixas fechadas',
+        pillLabel: 'Caixas',
+        isCaseShowcase: true,
+        items: caseShowcaseProducts,
+      });
+    }
+
     return sections;
   }, [storeCategories, searchFilteredProducts, knownCategoryIds, settings, storeVisibleProducts]);
 
@@ -611,14 +644,373 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return Math.round((base + (Number(addonsTotal) || 0)) * 100) / 100;
   };
 
-  const getCartTotalUnitsForProduct = (productId: string, cartList: CartItem[] = cart): number => {
+  const getCartTotalUnitsForProduct = (
+    productId: string,
+    cartList: CartItem[] = cart,
+    excludeLineId?: string
+  ): number => {
     return cartList
-      .filter((i) => i.product.id === productId)
+      .filter((i) => i.product.id === productId && (!excludeLineId || i.lineId !== excludeLineId))
       .reduce((sum, i) => {
         const cp = products.find((p) => p.id === i.product.id) || i.product;
         const mult = i.saleUnit === 'case' && canSellProductCase(cp, settings, 'store') ? Number(cp.caseSize) : 1;
         return sum + i.quantity * mult;
       }, 0);
+  };
+
+  // Reconcile cart items against latest products & settings (silently strips removed/inactive addon groups/options and recalculates totals)
+  const reconcileCartItemsWithStore = (
+    cartList: CartItem[],
+    latestProducts: Product[],
+    latestSettings: StoreSettings
+  ): { nextCart: CartItem[]; changed: boolean } => {
+    if (cartList.length === 0) return { nextCart: cartList, changed: false };
+    const prodMap = new Map<string, Product>(latestProducts.map((p) => [p.id, p]));
+    let changed = false;
+    const mergedByLineId = new Map<string, CartItem>();
+
+    for (const item of cartList) {
+      const currentProd = prodMap.get(item.product.id) || item.product;
+      const activeGroups = getProductAddonGroups(currentProd, latestSettings);
+      const activeGroupMap = new Map(activeGroups.map((g) => [g.id, g]));
+
+      let validAddons: OrderItemAddon[] | undefined = undefined;
+      let validAddonsTotal: number | undefined = undefined;
+
+      if (Array.isArray(item.addons) && item.addons.length > 0) {
+        const cleaned: OrderItemAddon[] = [];
+        for (const addon of item.addons) {
+          const grp = activeGroupMap.get(addon.groupId || '');
+          if (!grp) {
+            changed = true;
+            continue;
+          }
+          const activeOpt = (grp.options || []).find(
+            (o) => o && o.active !== false && o.id === addon.optionId
+          );
+          if (!activeOpt) {
+            changed = true;
+            continue;
+          }
+          const maxGroup = Math.max(Math.max(1, grp.min || 0), grp.max || 1);
+          const clampedQty = Math.max(0, Math.min(maxGroup, Math.floor(Number(addon.quantity) || 0)));
+          if (clampedQty <= 0) {
+            changed = true;
+            continue;
+          }
+          const freshPrice = Math.max(0, Math.round((Number(activeOpt.price) || 0) * 100) / 100);
+          if (
+            clampedQty !== addon.quantity ||
+            freshPrice !== addon.price ||
+            grp.name !== addon.groupName ||
+            activeOpt.name !== addon.optionName
+          ) {
+            changed = true;
+          }
+          cleaned.push({
+            groupId: grp.id,
+            optionId: activeOpt.id,
+            groupName: grp.name,
+            optionName: activeOpt.name,
+            price: freshPrice,
+            quantity: clampedQty,
+          });
+        }
+
+        if (cleaned.length > 0) {
+          validAddons = cleaned;
+          validAddonsTotal =
+            Math.round(cleaned.reduce((sum, a) => sum + a.price * a.quantity, 0) * 100) / 100;
+        } else {
+          changed = true;
+        }
+      }
+
+      const nextSig = buildOrderItemAddonsSignature(validAddons);
+      const nextLineId = `${currentProd.id}::${item.saleUnit}::${nextSig}`;
+      if (nextLineId !== item.lineId || currentProd !== item.product) {
+        changed = true;
+      }
+
+      const isCombo = isComboProduct(currentProd.id, latestSettings);
+      const nextComboItems = isCombo
+        ? calculateComboMetrics(currentProd, latestSettings, latestProducts).orderComboItems
+        : undefined;
+
+      const existing = mergedByLineId.get(nextLineId);
+      if (existing) {
+        changed = true;
+        mergedByLineId.set(nextLineId, {
+          ...existing,
+          quantity: existing.quantity + item.quantity,
+        });
+      } else {
+        mergedByLineId.set(nextLineId, {
+          ...item,
+          lineId: nextLineId,
+          product: currentProd,
+          addons: validAddons,
+          addonsTotal: validAddonsTotal,
+          comboItems: nextComboItems && nextComboItems.length > 0 ? nextComboItems : undefined,
+        });
+      }
+    }
+
+    return {
+      nextCart: Array.from(mergedByLineId.values()),
+      changed,
+    };
+  };
+
+  // Check which required addon groups (min > 0) are missing on a given cart line
+  const getMissingRequiredAddonGroupNames = (
+    item: CartItem,
+    latestProducts: Product[] = products,
+    latestSettings: StoreSettings = settings
+  ): string[] => {
+    const currentProd = latestProducts.find((p) => p.id === item.product.id) || item.product;
+    const activeGroups = getProductAddonGroups(currentProd, latestSettings);
+    if (activeGroups.length === 0) return [];
+
+    const missing: string[] = [];
+    const currentAddons = Array.isArray(item.addons) ? item.addons : [];
+
+    for (const group of activeGroups) {
+      const minRequired = Math.max(0, Math.floor(Number(group.min) || 0));
+      if (minRequired <= 0) continue;
+
+      const activeOptionIds = new Set(
+        (group.options || []).filter((o) => o && o.active !== false).map((o) => o.id)
+      );
+      const selectedCount = currentAddons
+        .filter((a) => a.groupId === group.id && activeOptionIds.has(a.optionId || ''))
+        .reduce((sum, a) => sum + (Math.floor(Number(a.quantity) || 0)), 0);
+
+      if (selectedCount < minRequired) {
+        missing.push(group.name);
+      }
+    }
+
+    return missing;
+  };
+
+  // Silently clean removed/inactive addons whenever products or settings update (Requirement 1c)
+  useEffect(() => {
+    if (cart.length === 0) return;
+    const { nextCart, changed } = reconcileCartItemsWithStore(cart, products, settings);
+    if (changed) {
+      setCart(nextCart);
+    }
+  }, [products, settings]);
+
+  // Reload settings and products when opening the cart and reset submitting state (Requirement 1a)
+  useEffect(() => {
+    if (!isCartOpen) return;
+    setIsSubmitting(false);
+    setSubmittingStatusText('');
+    lastProductsFetchAtRef.current = Date.now();
+    let cancelled = false;
+    api
+      .refreshPublicStoreState()
+      .then((fresh) => {
+        if (cancelled) return;
+        setCart((prev) => {
+          const { nextCart, changed } = reconcileCartItemsWithStore(
+            prev,
+            fresh.products,
+            fresh.settings
+          );
+          return changed ? nextCart : prev;
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isCartOpen]);
+
+  // Map of cart lineId -> missing required addon group names (Requirement 1b)
+  const missingAddonsByLineId = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const item of cart) {
+      const missing = getMissingRequiredAddonGroupNames(item, products, settings);
+      if (missing.length > 0) {
+        map.set(item.lineId, missing);
+      }
+    }
+    return map;
+  }, [cart, products, settings]);
+
+  const hasPendingRequiredAddons = missingAddonsByLineId.size > 0;
+
+  // Automatic suggestion when loose units in cart >= half of a closed case (Requirement 2c)
+  const caseConversionSuggestions = useMemo(() => {
+    const suggestions: {
+      product: Product;
+      looseUnits: number;
+      caseSize: number;
+      casePrice: number;
+      unitEffPrice: number;
+      caseSavings: number;
+      missingUnits: number;
+      extraCostToComplete: number;
+      firstUnitLineId: string;
+    }[] = [];
+
+    const unitLinesByProduct = new Map<string, { qty: number; firstLineId: string }>();
+    for (const item of cart) {
+      if (item.saleUnit !== 'unit') continue;
+      const prev = unitLinesByProduct.get(item.product.id);
+      if (prev) {
+        prev.qty += item.quantity;
+      } else {
+        unitLinesByProduct.set(item.product.id, {
+          qty: item.quantity,
+          firstLineId: item.lineId,
+        });
+      }
+    }
+
+    for (const [productId, info] of unitLinesByProduct.entries()) {
+      const prod = products.find((p) => p.id === productId);
+      if (!prod || isComboProduct(prod.id, settings) || !canSellProductCase(prod, settings, 'store')) {
+        continue;
+      }
+      const caseSize = Number(prod.caseSize) || 0;
+      const casePrice = Number(prod.casePrice) || 0;
+      if (caseSize < 2 || casePrice <= 0) continue;
+
+      const halfCase = Math.ceil(caseSize / 2);
+      if (info.qty < halfCase) continue;
+
+      const totalUsedUnits = getCartTotalUnitsForProduct(prod.id, cart);
+      const missingUnits = info.qty < caseSize ? caseSize - info.qty : 0;
+      // Ensure stock supports converting/completing the case
+      if (prod.stock < caseSize || totalUsedUnits + missingUnits > prod.stock) {
+        continue;
+      }
+
+      const unitEffPrice = getEffectiveProductPrice(prod);
+      const caseSavings = Math.max(
+        0,
+        Math.round((unitEffPrice * caseSize - casePrice) * 100) / 100
+      );
+      const currentLooseCost = Math.round(info.qty * unitEffPrice * 100) / 100;
+      const extraCostToComplete =
+        missingUnits > 0
+          ? Math.max(0, Math.round((casePrice - currentLooseCost) * 100) / 100)
+          : 0;
+
+      suggestions.push({
+        product: prod,
+        looseUnits: info.qty,
+        caseSize,
+        casePrice,
+        unitEffPrice,
+        caseSavings,
+        missingUnits,
+        extraCostToComplete,
+        firstUnitLineId: info.firstLineId,
+      });
+    }
+
+    return suggestions;
+  }, [cart, products, settings]);
+
+  const caseSuggestionByProductId = useMemo(() => {
+    return new Map(caseConversionSuggestions.map((s) => [s.product.id, s]));
+  }, [caseConversionSuggestions]);
+
+  const activeFloatingCaseSuggestion = useMemo(() => {
+    return (
+      caseConversionSuggestions.find(
+        (s) => !dismissedFloatingCaseProductIds.includes(s.product.id)
+      ) || null
+    );
+  }, [caseConversionSuggestions, dismissedFloatingCaseProductIds]);
+
+  const convertLooseUnitsToCase = (productId: string, completePartial: boolean = true) => {
+    const prod = products.find((p) => p.id === productId);
+    if (!prod || !canSellProductCase(prod, settings, 'store')) return;
+    const caseSize = Number(prod.caseSize) || 0;
+    if (caseSize < 2) return;
+
+    setCart((prev) => {
+      const unitLines = prev.filter((i) => i.product.id === productId && i.saleUnit === 'unit');
+      const totalLoose = unitLines.reduce((sum, i) => sum + i.quantity, 0);
+      if (totalLoose <= 0) return prev;
+
+      let casesToAdd = 0;
+      let remainderUnits = 0;
+
+      if (totalLoose >= caseSize) {
+        casesToAdd = Math.floor(totalLoose / caseSize);
+        remainderUnits = totalLoose % caseSize;
+      } else if (completePartial) {
+        const usedUnits = getCartTotalUnitsForProduct(productId, prev);
+        const neededExtra = caseSize - totalLoose;
+        if (usedUnits + neededExtra > prod.stock) return prev;
+        casesToAdd = 1;
+        remainderUnits = 0;
+      } else {
+        return prev;
+      }
+
+      const templateLine = unitLines[0];
+      const preservedAddons = templateLine?.addons;
+      const preservedAddonsTotal = templateLine?.addonsTotal;
+      const addonsSig = buildOrderItemAddonsSignature(preservedAddons);
+      const caseLineId = `${prod.id}::case::${addonsSig}`;
+      const unitLineId = `${prod.id}::unit::${addonsSig}`;
+
+      const next: CartItem[] = [];
+      let caseLineAdded = false;
+
+      for (const item of prev) {
+        if (item.product.id === productId && item.saleUnit === 'unit') {
+          continue;
+        }
+        if (item.lineId === caseLineId) {
+          next.push({
+            ...item,
+            product: prod,
+            quantity: item.quantity + casesToAdd,
+          });
+          caseLineAdded = true;
+        } else {
+          next.push(item);
+        }
+      }
+
+      if (!caseLineAdded && casesToAdd > 0) {
+        next.push({
+          lineId: caseLineId,
+          product: prod,
+          quantity: casesToAdd,
+          saleUnit: 'case',
+          addons: preservedAddons,
+          addonsTotal: preservedAddonsTotal,
+        });
+      }
+
+      if (remainderUnits > 0) {
+        next.push({
+          lineId: unitLineId,
+          product: prod,
+          quantity: remainderUnits,
+          saleUnit: 'unit',
+          addons: preservedAddons,
+          addonsTotal: preservedAddonsTotal,
+        });
+      }
+
+      return next;
+    });
+
+    setAskingCompleteCaseProductId((curr) => (curr === productId ? null : curr));
+    setDismissedFloatingCaseProductIds((prev) =>
+      prev.includes(productId) ? prev : [...prev, productId]
+    );
   };
 
   // Cart math (using casePrice for 'case', effective promotional price for 'unit', plus addonsTotal)
@@ -631,15 +1023,20 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
   const cartPromoSavings = useMemo(() => {
     return cart.reduce((sum, item) => {
-      if (item.saleUnit === 'case') return sum;
       const currentProd = products.find((p) => p.id === item.product.id) || item.product;
+      if (item.saleUnit === 'case' && canSellProductCase(currentProd, settings, 'store')) {
+        const unitEff = getEffectiveProductPrice(currentProd);
+        const caseDiff = unitEff * Number(currentProd.caseSize) - Number(currentProd.casePrice);
+        if (caseDiff > 0) return sum + caseDiff * item.quantity;
+        return sum;
+      }
       if (isProductPromoActive(currentProd)) {
         const diff = currentProd.price - getEffectiveProductPrice(currentProd);
         if (diff > 0) return sum + diff * item.quantity;
       }
       return sum;
     }, 0);
-  }, [cart, products]);
+  }, [cart, products, settings]);
 
   // Fetch delivery quote from server whenever customer is logged in and using saved address
   useEffect(() => {
@@ -768,11 +1165,66 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     });
   };
 
+  // Replace an existing cart line in place when choosing missing required addons (Requirement 1b — never duplicates)
+  const replaceCartLine = (
+    oldLineId: string,
+    product: Product,
+    saleUnit: SaleUnit,
+    newQty: number,
+    addons?: OrderItemAddon[],
+    addonsTotal?: number
+  ) => {
+    const isCase = saleUnit === 'case' && canSellProductCase(product, settings, 'store');
+    const unitsPerSale = isCase ? Number(product.caseSize) : 1;
+    const addonsSig = buildOrderItemAddonsSignature(addons);
+    const nextLineId = `${product.id}::${saleUnit}::${addonsSig}`;
+    const isCombo = isComboProduct(product.id, settings);
+    const comboItems = isCombo
+      ? calculateComboMetrics(product, settings, products).orderComboItems
+      : undefined;
+
+    setCart((prev) => {
+      const otherUsedUnits = getCartTotalUnitsForProduct(product.id, prev, oldLineId);
+      const maxAllowedQty = Math.max(
+        1,
+        Math.floor(Math.max(0, product.stock - otherUsedUnits) / unitsPerSale)
+      );
+      const finalQty = Math.min(Math.max(1, newQty), maxAllowedQty);
+
+      // If another line already has the exact same nextLineId, merge into it and remove oldLineId
+      const existingSameTarget = prev.find(
+        (i) => i.lineId === nextLineId && i.lineId !== oldLineId
+      );
+      if (existingSameTarget) {
+        return prev
+          .filter((i) => i.lineId !== oldLineId)
+          .map((i) =>
+            i.lineId === nextLineId ? { ...i, quantity: i.quantity + finalQty } : i
+          );
+      }
+
+      return prev.map((i) =>
+        i.lineId === oldLineId
+          ? {
+              lineId: nextLineId,
+              product,
+              quantity: finalQty,
+              saleUnit,
+              addons: addons && addons.length > 0 ? addons : undefined,
+              addonsTotal: addons && addons.length > 0 ? addonsTotal : undefined,
+              comboItems: comboItems && comboItems.length > 0 ? comboItems : undefined,
+            }
+          : i
+      );
+    });
+    setCheckoutError('');
+  };
+
   const addToCart = (product: Product, unitOverride?: SaleUnit) => {
     const saleUnit: SaleUnit = unitOverride || getSelectedUnit(product);
     const applicableGroups = getProductAddonGroups(product, settings);
     if (applicableGroups.length > 0) {
-      setAddonModalState({ product, saleUnit });
+      setAddonModalState({ product, saleUnit, initialQuantity: 1 });
       return;
     }
     appendCartLine(product, saleUnit, 1);
@@ -839,6 +1291,16 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     paymentMethod === 'dinheiro' &&
     hasCheckoutCashTyped &&
     (Number.isNaN(checkoutCashNum) || Math.round(checkoutCashNum * 100) < Math.round(cartTotal * 100));
+
+  const scrollToCartLine = (lineId: string) => {
+    if (typeof document === 'undefined') return;
+    window.setTimeout(() => {
+      const el = document.getElementById(`cart-line-${encodeURIComponent(lineId)}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, 80);
+  };
 
   // Submit order to depot (supports logged-in saved address, logged-in custom address, and guest quick checkout)
   const submitCustomerOrder = async () => {
@@ -922,9 +1384,37 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
     setIsSubmitting(true);
     try {
-      // Refresh products right before finalizing the order
+      // Requirement 1a: Reload settings and products right before sending the order and check every cart item's addon groups
       lastProductsFetchAtRef.current = Date.now();
-      await api.reloadProducts().catch(() => {});
+      const freshState = await api.refreshPublicStoreState();
+      const { nextCart: reconciledCart, changed: cartChanged } = reconcileCartItemsWithStore(
+        cart,
+        freshState.products,
+        freshState.settings
+      );
+      if (cartChanged) {
+        setCart(reconciledCart);
+      }
+
+      // Check if any item in reconciledCart is missing a required addon group with fresh settings
+      let firstPendingLineId: string | null = null;
+      for (const item of reconciledCart) {
+        const missing = getMissingRequiredAddonGroupNames(
+          item,
+          freshState.products,
+          freshState.settings
+        );
+        if (missing.length > 0) {
+          firstPendingLineId = item.lineId;
+          break;
+        }
+      }
+
+      if (firstPendingLineId) {
+        setCheckoutError('Falta escolher adicionais obrigatórios em um ou mais itens da sacola.');
+        scrollToCartLine(firstPendingLineId);
+        return;
+      }
 
       // If logged-in customer chose "Outro endereço" (or had no saved address) and checked "Salvar este endereço na minha conta"
       if (
@@ -955,9 +1445,11 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         }
       }
 
-      const orderItemsPayload = cart.map((i) => {
-        const currentProd = products.find((p) => p.id === i.product.id) || i.product;
-        const isCase = i.saleUnit === 'case' && canSellProductCase(currentProd, settings, 'store');
+      const orderItemsPayload = reconciledCart.map((i) => {
+        const currentProd =
+          freshState.products.find((p) => p.id === i.product.id) || i.product;
+        const isCase =
+          i.saleUnit === 'case' && canSellProductCase(currentProd, freshState.settings, 'store');
         const effPrice = getCartItemUnitPrice(currentProd, i.saleUnit, i.addonsTotal);
         const unitsPerSale = isCase ? Number(currentProd.caseSize) : 1;
         return {
@@ -1073,6 +1565,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setCheckoutError('');
       setCanRetryOrderSubmit(false);
       setSubmittingStatusText('');
+      setIsSubmitting(false);
       setIsCartOpen(false);
     } catch (err: any) {
       console.error('Falha ao processar pedido:', err);
@@ -1088,7 +1581,39 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setCanRetryOrderSubmit(false);
       const rawMessage: string = err.message || 'Não foi possível finalizar o pedido. Verifique o estoque dos itens.';
       const lowerMsg = rawMessage.toLowerCase();
+
+      // Requirement 1d: If server rejects due to addons ("adicional" or "é obrigatório"), reload settings, run step (b), and scroll to the item
       if (
+        lowerMsg.includes('adicional') ||
+        lowerMsg.includes('é obrigatório') ||
+        lowerMsg.includes('e obrigatorio') ||
+        lowerMsg.includes('obrigatório')
+      ) {
+        const freshState = await api.refreshPublicStoreState();
+        let targetLineId: string | null = null;
+        setCart((prevCart) => {
+          const { nextCart } = reconcileCartItemsWithStore(
+            prevCart,
+            freshState.products,
+            freshState.settings
+          );
+          for (const item of nextCart) {
+            const missing = getMissingRequiredAddonGroupNames(
+              item,
+              freshState.products,
+              freshState.settings
+            );
+            if (missing.length > 0 && !targetLineId) {
+              targetLineId = item.lineId;
+            }
+          }
+          return nextCart;
+        });
+        setCheckoutError(rawMessage);
+        if (targetLineId) {
+          scrollToCartLine(targetLineId);
+        }
+      } else if (
         lowerMsg.includes('estoque') ||
         lowerMsg.includes('indisponível') ||
         lowerMsg.includes('indisponivel') ||
@@ -1172,6 +1697,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const categories = useMemo(() => {
     const getCategoryIcon = (catId: string) => {
       switch (catId) {
+        case 'caixas_fechadas':
+          return Package;
         case 'cervejas':
           return Beer;
         case 'destilados':
@@ -1193,7 +1720,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     for (const sec of groupedCategorySections) {
       list.push({
         id: sec.id,
-        label: sec.name,
+        label: sec.pillLabel || sec.name,
         icon: getCategoryIcon(sec.id),
       });
     }
@@ -2171,18 +2698,23 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
             {featuredAndPromoCarouselProducts.map((product) => {
               const isCombo = isComboProduct(product.id, settings);
               const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
-              const activeUnit = getSelectedUnit(product);
               const hasCase = !isCombo && canSellProductCase(product, settings, 'store');
-              const isCaseSelected = activeUnit === 'case' && hasCase;
-              const unitsPerSale = isCaseSelected ? Number(product.caseSize) : 1;
-              const qty = getCartQuantity(product.id, activeUnit);
+              const caseSize = hasCase ? Number(product.caseSize) : 1;
+              const casePrice = hasCase ? Number(product.casePrice) : 0;
+              const caseUnavailable = hasCase && product.stock < caseSize;
+              const unitQty = getCartQuantity(product.id, 'unit');
+              const caseQty = hasCase ? getCartQuantity(product.id, 'case') : 0;
               const usedUnits = getCartTotalUnitsForProduct(product.id);
-              const canAddMore = usedUnits + unitsPerSale <= product.stock;
+              const canAddUnit = usedUnits + 1 <= product.stock;
+              const canAddCase = hasCase && usedUnits + caseSize <= product.stock;
               const isOutOfStock = product.stock <= 0;
               const promoActive = isProductPromoActive(product);
               const discountPct = promoActive ? getPromoDiscountPercent(product) : 0;
               const effPrice = getEffectiveProductPrice(product);
-              const displayPrice = isCaseSelected ? Number(product.casePrice) : effPrice;
+              const perUnitInCase = hasCase && caseSize > 0 ? casePrice / caseSize : 0;
+              const caseSavings = hasCase
+                ? Math.round((effPrice * caseSize - casePrice) * 100) / 100
+                : 0;
               const hasComboSavings = Boolean(
                 isCombo && comboMetrics && comboMetrics.separatePrice > effPrice
               );
@@ -2190,35 +2722,40 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
               return (
                 <div
                   key={`carousel-${product.id}`}
-                  className={`min-w-[245px] sm:min-w-[270px] max-w-[275px] bg-white rounded-2xl border p-2.5 shadow-2xs flex items-center gap-2.5 shrink-0 ${
+                  className={`min-w-[265px] sm:min-w-[295px] max-w-[310px] bg-white rounded-2xl border p-2.5 shadow-2xs flex flex-col justify-between gap-2 shrink-0 ${
                     promoActive ? 'border-red-200' : 'border-neutral-200'
                   }`}
                 >
-                  <div className="relative w-18 h-18 sm:w-20 sm:h-20 rounded-xl bg-neutral-100 overflow-hidden shrink-0">
-                    {product.imageUrl || product.image ? (
-                      <img
-                        src={product.imageUrl || product.image}
-                        alt={product.name}
-                        width={80}
-                        height={80}
-                        loading="lazy"
-                        draggable={false}
-                        className="w-full h-full object-cover pointer-events-none"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center text-neutral-300">
-                        <Package className="w-6 h-6" />
-                      </div>
-                    )}
-                    {promoActive && (
-                      <span className="absolute top-1 left-1 bg-red-600 text-white text-[9px] font-black px-1.5 py-0.5 rounded-md shadow-xs">
-                        -{discountPct}%
-                      </span>
-                    )}
-                  </div>
+                  <div className="flex items-start gap-2.5">
+                    <div className="relative w-18 h-18 sm:w-20 sm:h-20 rounded-xl bg-neutral-100 overflow-hidden shrink-0">
+                      {product.imageUrl || product.image ? (
+                        <img
+                          src={product.imageUrl || product.image}
+                          alt={product.name}
+                          width={80}
+                          height={80}
+                          loading="lazy"
+                          draggable={false}
+                          className="w-full h-full object-cover pointer-events-none"
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-neutral-300">
+                          <Package className="w-6 h-6" />
+                        </div>
+                      )}
+                      {promoActive && (
+                        <span className="absolute top-1 left-1 bg-red-600 text-white text-[9px] font-black px-1.5 py-0.5 rounded-md shadow-xs">
+                          -{discountPct}%
+                        </span>
+                      )}
+                      {hasCase && (
+                        <span className="absolute bottom-1 left-1 bg-amber-500 text-neutral-950 text-[8px] font-black px-1.5 py-0.5 rounded shadow-xs uppercase tracking-tight">
+                          TEM CAIXA
+                        </span>
+                      )}
+                    </div>
 
-                  <div className="flex-1 min-w-0 flex flex-col justify-between h-full">
-                    <div>
+                    <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1 flex-wrap">
                         {isCombo && (
                           <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 text-[9px] font-black uppercase">
@@ -2234,71 +2771,177 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       <h3 className="font-bold text-xs text-neutral-900 leading-tight line-clamp-2 mt-0.5">
                         {product.name}
                       </h3>
-                    </div>
 
-                    <div className="mt-1.5 flex items-end justify-between gap-1.5">
-                      <div className="min-w-0">
-                        {promoActive && !isCaseSelected ? (
-                          <>
-                            <span className="text-[10px] text-neutral-400 line-through block leading-none">
-                              {formatCurrency(product.price)}
-                            </span>
-                            <span className="text-xs sm:text-sm font-black text-red-600 block leading-tight">
-                              {formatCurrency(displayPrice)}
-                            </span>
-                          </>
-                        ) : hasComboSavings && comboMetrics ? (
-                          <>
-                            <span className="text-[10px] text-neutral-400 line-through block leading-none">
-                              {formatCurrency(comboMetrics.separatePrice)}
-                            </span>
-                            <span className="text-xs sm:text-sm font-black text-neutral-900 block leading-tight">
-                              {formatCurrency(displayPrice)}
-                            </span>
-                          </>
-                        ) : (
-                          <span className="text-xs sm:text-sm font-black text-neutral-900 block leading-tight">
-                            {formatCurrency(displayPrice)}
-                          </span>
-                        )}
-                      </div>
+                      {!hasCase && (
+                        <div className="mt-2 flex items-end justify-between gap-1.5">
+                          <div className="min-w-0">
+                            {promoActive ? (
+                              <>
+                                <span className="text-[10px] text-neutral-400 line-through block leading-none">
+                                  {formatCurrency(product.price)}
+                                </span>
+                                <span className="text-xs sm:text-sm font-black text-red-600 block leading-tight">
+                                  {formatCurrency(effPrice)}
+                                </span>
+                              </>
+                            ) : hasComboSavings && comboMetrics ? (
+                              <>
+                                <span className="text-[10px] text-neutral-400 line-through block leading-none">
+                                  {formatCurrency(comboMetrics.separatePrice)}
+                                </span>
+                                <span className="text-xs sm:text-sm font-black text-neutral-900 block leading-tight">
+                                  {formatCurrency(effPrice)}
+                                </span>
+                              </>
+                            ) : (
+                              <span className="text-xs sm:text-sm font-black text-neutral-900 block leading-tight">
+                                {formatCurrency(effPrice)}
+                              </span>
+                            )}
+                          </div>
 
-                      {isOutOfStock ? (
-                        <span className="text-[10px] font-bold text-neutral-400 bg-neutral-100 px-2 py-1 rounded-lg">
-                          Esgotado
-                        </span>
-                      ) : qty === 0 ? (
-                        <button
-                          type="button"
-                          disabled={!canAddMore}
-                          onClick={() => addToCart(product, activeUnit)}
-                          className="w-8 h-8 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-neutral-950 flex items-center justify-center shadow-sm active:scale-95 cursor-pointer shrink-0"
-                          aria-label={`Adicionar ${product.name}`}
-                        >
-                          <Plus className="w-4 h-4 stroke-[2.5]" />
-                        </button>
-                      ) : (
-                        <div className="flex items-center gap-1 bg-neutral-900 text-white rounded-full px-1.5 py-0.5 shadow-sm">
-                          <button
-                            type="button"
-                            onClick={() => removeFromCart(product.id, activeUnit)}
-                            className="w-6 h-6 rounded-full hover:bg-neutral-700 flex items-center justify-center cursor-pointer"
-                          >
-                            <Minus className="w-3 h-3" />
-                          </button>
-                          <span className="text-[11px] font-black min-w-[14px] text-center">{qty}</span>
-                          <button
-                            type="button"
-                            disabled={!canAddMore}
-                            onClick={() => addToCart(product, activeUnit)}
-                            className="w-6 h-6 rounded-full bg-amber-500 text-neutral-950 disabled:opacity-40 flex items-center justify-center cursor-pointer"
-                          >
-                            <Plus className="w-3 h-3 stroke-[2.5]" />
-                          </button>
+                          {isOutOfStock ? (
+                            <span className="text-[10px] font-bold text-neutral-400 bg-neutral-100 px-2 py-1 rounded-lg">
+                              Esgotado
+                            </span>
+                          ) : unitQty === 0 ? (
+                            <button
+                              type="button"
+                              disabled={!canAddUnit}
+                              onClick={() => addToCart(product, 'unit')}
+                              className="w-8 h-8 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-neutral-950 flex items-center justify-center shadow-sm active:scale-95 cursor-pointer shrink-0"
+                              aria-label={`Adicionar ${product.name}`}
+                            >
+                              <Plus className="w-4 h-4 stroke-[2.5]" />
+                            </button>
+                          ) : (
+                            <div className="flex items-center gap-1 bg-neutral-900 text-white rounded-full px-1.5 py-0.5 shadow-sm">
+                              <button
+                                type="button"
+                                onClick={() => removeFromCart(product.id, 'unit')}
+                                className="w-6 h-6 rounded-full hover:bg-neutral-700 flex items-center justify-center cursor-pointer"
+                              >
+                                <Minus className="w-3 h-3" />
+                              </button>
+                              <span className="text-[11px] font-black min-w-[14px] text-center">{unitQty}</span>
+                              <button
+                                type="button"
+                                disabled={!canAddUnit}
+                                onClick={() => addToCart(product, 'unit')}
+                                className="w-6 h-6 rounded-full bg-amber-500 text-neutral-950 disabled:opacity-40 flex items-center justify-center cursor-pointer"
+                              >
+                                <Plus className="w-3 h-3 stroke-[2.5]" />
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
                   </div>
+
+                  {hasCase && (
+                    <div className="space-y-1.5 pt-1 border-t border-neutral-100">
+                      {/* Line 1: Unidade */}
+                      <div className="flex items-center justify-between gap-2 px-2 py-1 rounded-xl bg-neutral-50 border border-neutral-200/80">
+                        <div className="min-w-0 text-[11px] font-bold text-neutral-800 truncate">
+                          <span>Unidade — </span>
+                          {promoActive ? (
+                            <>
+                              <span className="text-red-600 font-black">{formatCurrency(effPrice)}</span>
+                              <span className="text-[10px] text-neutral-400 line-through ml-1">
+                                {formatCurrency(product.price)}
+                              </span>
+                            </>
+                          ) : (
+                            <span className="font-black text-neutral-900">{formatCurrency(effPrice)}</span>
+                          )}
+                        </div>
+                        {isOutOfStock ? (
+                          <span className="text-[10px] font-bold text-neutral-400">Esgotado</span>
+                        ) : unitQty === 0 ? (
+                          <button
+                            type="button"
+                            disabled={!canAddUnit}
+                            onClick={() => addToCart(product, 'unit')}
+                            className="w-6 h-6 rounded-full bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 text-white flex items-center justify-center shrink-0 cursor-pointer"
+                            aria-label={`Adicionar unidade de ${product.name}`}
+                          >
+                            <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
+                          </button>
+                        ) : (
+                          <div className="flex items-center gap-1 bg-neutral-900 text-white rounded-full px-1 py-0.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => removeFromCart(product.id, 'unit')}
+                              className="w-5 h-5 rounded-full hover:bg-neutral-700 flex items-center justify-center cursor-pointer"
+                            >
+                              <Minus className="w-2.5 h-2.5" />
+                            </button>
+                            <span className="text-[10px] font-black min-w-[12px] text-center">{unitQty}</span>
+                            <button
+                              type="button"
+                              disabled={!canAddUnit}
+                              onClick={() => addToCart(product, 'unit')}
+                              className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 disabled:opacity-40 flex items-center justify-center cursor-pointer"
+                            >
+                              <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Line 2: Caixa fechada */}
+                      {caseUnavailable ? (
+                        <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-xl bg-neutral-100 border border-neutral-200 opacity-60">
+                          <span className="text-[11px] font-bold text-neutral-500 truncate">
+                            📦 Caixa com {caseSize} — Sem caixa no momento
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-xl bg-amber-50 border border-amber-300">
+                          <div className="min-w-0">
+                            <div className="text-[11px] font-black text-amber-950 leading-tight truncate">
+                              📦 Caixa com {caseSize} — {formatCurrency(casePrice)}
+                            </div>
+                            <div className="text-[10px] font-bold text-amber-800 leading-tight mt-0.5">
+                              sai {formatCurrency(perUnitInCase)} a unidade
+                              {caseSavings > 0 ? ` · economize ${formatCurrency(caseSavings)}` : ''}
+                            </div>
+                          </div>
+                          {caseQty === 0 ? (
+                            <button
+                              type="button"
+                              disabled={!canAddCase}
+                              onClick={() => addToCart(product, 'case')}
+                              className="w-7 h-7 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-neutral-950 flex items-center justify-center shadow-xs shrink-0 cursor-pointer"
+                              aria-label={`Adicionar caixa de ${product.name}`}
+                            >
+                              <Plus className="w-3.5 h-3.5 stroke-[2.75]" />
+                            </button>
+                          ) : (
+                            <div className="flex items-center gap-1 bg-neutral-950 text-white rounded-full px-1 py-0.5 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => removeFromCart(product.id, 'case')}
+                                className="w-5 h-5 rounded-full hover:bg-neutral-700 flex items-center justify-center cursor-pointer"
+                              >
+                                <Minus className="w-2.5 h-2.5" />
+                              </button>
+                              <span className="text-[10px] font-black min-w-[12px] text-center">{caseQty}</span>
+                              <button
+                                type="button"
+                                disabled={!canAddCase}
+                                onClick={() => addToCart(product, 'case')}
+                                className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 disabled:opacity-40 flex items-center justify-center cursor-pointer"
+                              >
+                                <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -2434,30 +3077,34 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   const isCombo = isComboProduct(product.id, settings);
                   const comboMetrics = isCombo ? calculateComboMetrics(product, settings, products) : null;
                   const hasCase = !isCombo && canSellProductCase(product, settings, 'store');
-                  const caseUnavailable = hasCase && product.stock < Number(product.caseSize);
-                  const activeUnit = getSelectedUnit(product);
-                  const isCaseSelected = activeUnit === 'case' && hasCase;
-                  const unitsPerSale = isCaseSelected ? Number(product.caseSize) : 1;
-                  const qty = getCartQuantity(product.id, activeUnit);
+                  const caseSize = hasCase ? Number(product.caseSize) : 1;
+                  const casePrice = hasCase ? Number(product.casePrice) : 0;
+                  const caseUnavailable = hasCase && product.stock < caseSize;
+                  const unitQty = getCartQuantity(product.id, 'unit');
+                  const caseQty = hasCase ? getCartQuantity(product.id, 'case') : 0;
                   const usedUnits = getCartTotalUnitsForProduct(product.id);
-                  const canAddMore = usedUnits + unitsPerSale <= product.stock;
+                  const canAddUnit = usedUnits + 1 <= product.stock;
+                  const canAddCase = hasCase && usedUnits + caseSize <= product.stock;
                   const isOutOfStock = product.stock <= 0;
                   const promoActive = isProductPromoActive(product);
                   const discountPct = promoActive ? getPromoDiscountPercent(product) : 0;
                   const effPrice = getEffectiveProductPrice(product);
-                  const displayPrice = isCaseSelected ? Number(product.casePrice) : effPrice;
+                  const perUnitInCase = hasCase && caseSize > 0 ? casePrice / caseSize : 0;
+                  const caseSavings = hasCase
+                    ? Math.round((effPrice * caseSize - casePrice) * 100) / 100
+                    : 0;
                   const hasComboSavings = Boolean(
                     isCombo && comboMetrics && comboMetrics.separatePrice > effPrice
                   );
 
                   return (
                     <div
-                      key={product.id}
+                      key={section.isCaseShowcase ? `showcase-${product.id}` : product.id}
                       className={`bg-white rounded-2xl border p-3 sm:p-3.5 shadow-2xs hover:shadow-md transition-all flex items-stretch justify-between gap-3 ${
                         promoActive ? 'border-red-200' : 'border-neutral-200'
                       }`}
                     >
-                      {/* Left Column: Badges, Title, Combo/Description, Unit vs Case, Price */}
+                      {/* Left Column: Badges, Title, Combo/Description, Price or Two Purchase Rows */}
                       <div className="flex-1 min-w-0 flex flex-col justify-between">
                         <div>
                           <div className="flex items-center gap-1.5 flex-wrap">
@@ -2497,87 +3144,160 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                               {product.description}
                             </p>
                           ) : null}
+                        </div>
 
-                          {hasCase && (
-                            <div className="mt-2 max-w-[230px]">
-                              <div className="grid grid-cols-2 gap-1 p-0.5 bg-neutral-100 rounded-lg border border-neutral-200">
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setSelectedUnits((prev) => ({ ...prev, [product.id]: 'unit' }))
-                                  }
-                                  className={`py-1 px-1.5 rounded-md text-[10px] font-bold transition-all leading-tight text-center cursor-pointer ${
-                                    !isCaseSelected
-                                      ? 'bg-white text-neutral-900 shadow-2xs'
-                                      : 'text-neutral-600 hover:text-neutral-900'
-                                  }`}
-                                >
-                                  <span>Unidade</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={caseUnavailable}
-                                  onClick={() =>
-                                    setSelectedUnits((prev) => ({ ...prev, [product.id]: 'case' }))
-                                  }
-                                  className={`py-1 px-1.5 rounded-md text-[10px] font-bold transition-all leading-tight text-center ${
-                                    caseUnavailable
-                                      ? 'opacity-40 cursor-not-allowed text-neutral-400'
-                                      : isCaseSelected
-                                      ? 'bg-amber-500 text-neutral-950 shadow-2xs cursor-pointer'
-                                      : 'text-neutral-600 hover:text-neutral-900 cursor-pointer'
-                                  }`}
-                                >
-                                  <span>Caixa c/{product.caseSize}</span>
-                                </button>
+                        {hasCase ? (
+                          /* Two explicit purchase rows for products that sell by case (2a & 2e) */
+                          <div className="mt-2.5 space-y-1.5">
+                            {/* Row 1: Unidade */}
+                            <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-neutral-50 border border-neutral-200">
+                              <div className="min-w-0 text-xs font-bold text-neutral-800 truncate">
+                                <span>Unidade — </span>
+                                {promoActive ? (
+                                  <>
+                                    <span className="font-black text-red-600">
+                                      {formatCurrency(effPrice)}
+                                    </span>
+                                    <span className="text-[11px] text-neutral-400 line-through ml-1 font-medium">
+                                      {formatCurrency(product.price)}
+                                    </span>
+                                  </>
+                                ) : (
+                                  <span className="font-black text-neutral-900">
+                                    {formatCurrency(effPrice)}
+                                  </span>
+                                )}
                               </div>
-                              {caseUnavailable && !isOutOfStock && (
-                                <p className="text-[10px] text-neutral-400 font-semibold mt-0.5">
-                                  Sem caixa fechada no estoque
-                                </p>
+
+                              {isOutOfStock ? (
+                                <span className="text-[10px] font-bold text-neutral-400 shrink-0">
+                                  Esgotado
+                                </span>
+                              ) : unitQty === 0 ? (
+                                <button
+                                  type="button"
+                                  disabled={!canAddUnit}
+                                  onClick={() => addToCart(product, 'unit')}
+                                  className="w-7 h-7 rounded-full bg-neutral-900 hover:bg-neutral-800 disabled:bg-neutral-300 text-white flex items-center justify-center shadow-2xs active:scale-95 transition-transform cursor-pointer shrink-0"
+                                  aria-label={`Adicionar unidade de ${product.name}`}
+                                >
+                                  <Plus className="w-3.5 h-3.5 stroke-[2.75]" />
+                                </button>
+                              ) : (
+                                <div className="flex items-center gap-1 bg-neutral-950 text-white rounded-full px-1.5 py-0.5 shadow-2xs shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => removeFromCart(product.id, 'unit')}
+                                    className="w-5 h-5 rounded-full bg-neutral-800 hover:bg-neutral-700 text-white flex items-center justify-center cursor-pointer"
+                                    aria-label="Diminuir unidade"
+                                  >
+                                    <Minus className="w-3 h-3" />
+                                  </button>
+                                  <span className="text-[11px] font-black px-1 text-center">
+                                    {unitQty}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    disabled={!canAddUnit}
+                                    onClick={() => addToCart(product, 'unit')}
+                                    className="w-5 h-5 rounded-full bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-neutral-950 flex items-center justify-center cursor-pointer"
+                                    aria-label="Aumentar unidade"
+                                  >
+                                    <Plus className="w-3 h-3 stroke-[2.75]" />
+                                  </button>
+                                </div>
                               )}
                             </div>
-                          )}
-                        </div>
 
-                        {/* Price at base of left column */}
-                        <div className="mt-2.5 pt-1 flex items-baseline gap-2 flex-wrap">
-                          {isCaseSelected ? (
-                            <>
+                            {/* Row 2: Caixa fechada */}
+                            {caseUnavailable ? (
+                              <div className="flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl bg-neutral-100 border border-neutral-200 opacity-60">
+                                <span className="text-xs font-bold text-neutral-500">
+                                  📦 Caixa com {caseSize} — Sem caixa no momento
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-amber-50 border border-amber-300 shadow-2xs">
+                                <div className="min-w-0">
+                                  <div className="text-xs font-black text-amber-950 leading-snug">
+                                    📦 Caixa com {caseSize} — {formatCurrency(casePrice)}
+                                  </div>
+                                  <div className="text-[11px] font-bold text-amber-800 leading-tight mt-0.5">
+                                    sai {formatCurrency(perUnitInCase)} a unidade
+                                    {caseSavings > 0
+                                      ? ` · economize ${formatCurrency(caseSavings)}`
+                                      : ''}
+                                  </div>
+                                </div>
+
+                                {caseQty === 0 ? (
+                                  <button
+                                    type="button"
+                                    disabled={!canAddCase}
+                                    onClick={() => addToCart(product, 'case')}
+                                    className="w-8 h-8 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-neutral-950 flex items-center justify-center shadow-xs active:scale-95 transition-transform cursor-pointer shrink-0"
+                                    aria-label={`Adicionar caixa com ${caseSize} de ${product.name}`}
+                                  >
+                                    <Plus className="w-4 h-4 stroke-[2.75]" />
+                                  </button>
+                                ) : (
+                                  <div className="flex items-center gap-1 bg-neutral-950 text-white rounded-full px-1.5 py-0.5 shadow-xs shrink-0">
+                                    <button
+                                      type="button"
+                                      onClick={() => removeFromCart(product.id, 'case')}
+                                      className="w-5 h-5 rounded-full bg-neutral-800 hover:bg-neutral-700 text-white flex items-center justify-center cursor-pointer"
+                                      aria-label="Diminuir caixa"
+                                    >
+                                      <Minus className="w-3 h-3" />
+                                    </button>
+                                    <span className="text-[11px] font-black px-1 text-center">
+                                      {caseQty}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      disabled={!canAddCase}
+                                      onClick={() => addToCart(product, 'case')}
+                                      className="w-5 h-5 rounded-full bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-neutral-950 flex items-center justify-center cursor-pointer"
+                                      aria-label="Aumentar caixa"
+                                    >
+                                      <Plus className="w-3 h-3 stroke-[2.75]" />
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          /* Standard Price at base of left column for single-unit / combo products */
+                          <div className="mt-2.5 pt-1 flex items-baseline gap-2 flex-wrap">
+                            {promoActive ? (
+                              <>
+                                <span className="text-sm sm:text-base font-black text-red-600">
+                                  {formatCurrency(effPrice)}
+                                </span>
+                                <span className="text-xs text-neutral-400 line-through font-medium">
+                                  {formatCurrency(product.price)}
+                                </span>
+                              </>
+                            ) : hasComboSavings && comboMetrics ? (
+                              <>
+                                <span className="text-sm sm:text-base font-black text-neutral-900">
+                                  {formatCurrency(effPrice)}
+                                </span>
+                                <span className="text-xs text-neutral-400 line-through font-medium">
+                                  {formatCurrency(comboMetrics.separatePrice)}
+                                </span>
+                              </>
+                            ) : (
                               <span className="text-sm sm:text-base font-black text-neutral-900">
-                                {formatCurrency(displayPrice)}
-                              </span>
-                              <span className="text-[10px] font-bold text-amber-700">
-                                Caixa c/{product.caseSize} un.
-                              </span>
-                            </>
-                          ) : promoActive ? (
-                            <>
-                              <span className="text-sm sm:text-base font-black text-red-600">
-                                {formatCurrency(effPrice)}
-                              </span>
-                              <span className="text-xs text-neutral-400 line-through font-medium">
                                 {formatCurrency(product.price)}
                               </span>
-                            </>
-                          ) : hasComboSavings && comboMetrics ? (
-                            <>
-                              <span className="text-sm sm:text-base font-black text-neutral-900">
-                                {formatCurrency(effPrice)}
-                              </span>
-                              <span className="text-xs text-neutral-400 line-through font-medium">
-                                {formatCurrency(comboMetrics.separatePrice)}
-                              </span>
-                            </>
-                          ) : (
-                            <span className="text-sm sm:text-base font-black text-neutral-900">
-                              {formatCurrency(product.price)}
-                            </span>
-                          )}
-                        </div>
+                            )}
+                          </div>
+                        )}
                       </div>
 
-                      {/* Right Column: Square Photo + Floating + / - qty + Control */}
+                      {/* Right Column: Square Photo + TEM CAIXA badge + (for non-case products) Floating + / - qty + Control */}
                       <div className="relative shrink-0 w-24 h-24 sm:w-28 sm:h-28 self-center">
                         <div className="w-full h-full rounded-2xl bg-neutral-100 border border-neutral-100 overflow-hidden">
                           {product.imageUrl || product.image ? (
@@ -2596,44 +3316,52 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                           )}
                         </div>
 
+                        {hasCase && (
+                          <span className="absolute top-1.5 left-1.5 bg-amber-500 text-neutral-950 text-[9px] font-black px-1.5 py-0.5 rounded-md shadow-xs uppercase tracking-tight">
+                            TEM CAIXA
+                          </span>
+                        )}
+
                         {isOutOfStock ? (
                           <div className="absolute inset-0 rounded-2xl bg-black/60 backdrop-blur-[1px] flex items-center justify-center">
                             <span className="bg-red-600 text-white text-[10px] font-black px-2 py-0.5 rounded-full uppercase">
                               Esgotado
                             </span>
                           </div>
-                        ) : qty === 0 ? (
-                          <button
-                            type="button"
-                            disabled={!canAddMore}
-                            onClick={() => addToCart(product, activeUnit)}
-                            className="absolute -bottom-1.5 -right-1.5 w-9 h-9 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-neutral-950 flex items-center justify-center shadow-md border-2 border-white active:scale-95 transition-transform cursor-pointer"
-                            aria-label={`Adicionar ${product.name}`}
-                          >
-                            <Plus className="w-4 h-4 stroke-[2.75]" />
-                          </button>
-                        ) : (
-                          <div className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 flex items-center justify-between gap-1 bg-neutral-950 text-white rounded-full p-1 shadow-md border border-neutral-700 min-w-[92px]">
+                        ) : !hasCase ? (
+                          unitQty === 0 ? (
                             <button
                               type="button"
-                              onClick={() => removeFromCart(product.id, activeUnit)}
-                              className="w-6 h-6 rounded-full bg-neutral-800 hover:bg-neutral-700 text-white flex items-center justify-center cursor-pointer"
-                              aria-label="Diminuir quantidade"
+                              disabled={!canAddUnit}
+                              onClick={() => addToCart(product, 'unit')}
+                              className="absolute -bottom-1.5 -right-1.5 w-9 h-9 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 text-neutral-950 flex items-center justify-center shadow-md border-2 border-white active:scale-95 transition-transform cursor-pointer"
+                              aria-label={`Adicionar ${product.name}`}
                             >
-                              <Minus className="w-3 h-3" />
+                              <Plus className="w-4 h-4 stroke-[2.75]" />
                             </button>
-                            <span className="text-xs font-black px-1 text-center">{qty}</span>
-                            <button
-                              type="button"
-                              disabled={!canAddMore}
-                              onClick={() => addToCart(product, activeUnit)}
-                              className="w-6 h-6 rounded-full bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-neutral-950 flex items-center justify-center cursor-pointer"
-                              aria-label="Aumentar quantidade"
-                            >
-                              <Plus className="w-3 h-3 stroke-[2.75]" />
-                            </button>
-                          </div>
-                        )}
+                          ) : (
+                            <div className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 flex items-center justify-between gap-1 bg-neutral-950 text-white rounded-full p-1 shadow-md border border-neutral-700 min-w-[92px]">
+                              <button
+                                type="button"
+                                onClick={() => removeFromCart(product.id, 'unit')}
+                                className="w-6 h-6 rounded-full bg-neutral-800 hover:bg-neutral-700 text-white flex items-center justify-center cursor-pointer"
+                                aria-label="Diminuir quantidade"
+                              >
+                                <Minus className="w-3 h-3" />
+                              </button>
+                              <span className="text-xs font-black px-1 text-center">{unitQty}</span>
+                              <button
+                                type="button"
+                                disabled={!canAddUnit}
+                                onClick={() => addToCart(product, 'unit')}
+                                className="w-6 h-6 rounded-full bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-neutral-950 flex items-center justify-center cursor-pointer"
+                                aria-label="Aumentar quantidade"
+                              >
+                                <Plus className="w-3 h-3 stroke-[2.75]" />
+                              </button>
+                            </div>
+                          )
+                        ) : null}
                       </div>
                     </div>
                   );
@@ -2641,6 +3369,102 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
               </div>
             </section>
           ))}
+        </div>
+      )}
+
+      {/* Floating Case Suggestion Notice (shown once per product when loose units >= half a case) */}
+      {activeFloatingCaseSuggestion && !isCartOpen && (
+        <div className="fixed bottom-[138px] md:bottom-[88px] left-1/2 -translate-x-1/2 z-40 w-full max-w-md px-4">
+          <div className="bg-amber-50 border-2 border-amber-400 text-amber-950 p-3 rounded-2xl shadow-xl space-y-2">
+            <div className="flex items-start justify-between gap-2">
+              <div className="text-xs font-bold leading-snug">
+                <span className="font-black block text-amber-900">
+                  📦 {activeFloatingCaseSuggestion.product.name} ({activeFloatingCaseSuggestion.looseUnits} un na sacola)
+                </span>
+                <span>
+                  Leve a caixa com {activeFloatingCaseSuggestion.caseSize} por{' '}
+                  <strong>{formatCurrency(activeFloatingCaseSuggestion.casePrice)}</strong>
+                  {activeFloatingCaseSuggestion.caseSavings > 0
+                    ? ` e economize ${formatCurrency(activeFloatingCaseSuggestion.caseSavings)}`
+                    : ''}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setDismissedFloatingCaseProductIds((prev) =>
+                    prev.includes(activeFloatingCaseSuggestion.product.id)
+                      ? prev
+                      : [...prev, activeFloatingCaseSuggestion.product.id]
+                  );
+                  if (askingCompleteCaseProductId === activeFloatingCaseSuggestion.product.id) {
+                    setAskingCompleteCaseProductId(null);
+                  }
+                }}
+                className="p-1 rounded-lg hover:bg-amber-200/70 text-amber-800 shrink-0 cursor-pointer"
+                aria-label="Fechar sugestão de caixa"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {askingCompleteCaseProductId === activeFloatingCaseSuggestion.product.id &&
+            activeFloatingCaseSuggestion.looseUnits < activeFloatingCaseSuggestion.caseSize ? (
+              <div className="bg-white/90 border border-amber-300 rounded-xl p-2.5 space-y-2">
+                <p className="text-xs font-black text-amber-950">
+                  Completar para a caixa (+{activeFloatingCaseSuggestion.missingUnits} un por{' '}
+                  {formatCurrency(activeFloatingCaseSuggestion.extraCostToComplete)} a mais)?
+                </p>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      convertLooseUnitsToCase(activeFloatingCaseSuggestion.product.id);
+                      setDismissedFloatingCaseProductIds((prev) =>
+                        prev.includes(activeFloatingCaseSuggestion.product.id)
+                          ? prev
+                          : [...prev, activeFloatingCaseSuggestion.product.id]
+                      );
+                    }}
+                    className="flex-1 py-1.5 px-3 rounded-lg bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black text-xs cursor-pointer"
+                  >
+                    Sim, completar para a caixa
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAskingCompleteCaseProductId(null)}
+                    className="py-1.5 px-2.5 rounded-lg bg-neutral-200 hover:bg-neutral-300 text-neutral-700 font-bold text-xs cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (
+                      activeFloatingCaseSuggestion.looseUnits >=
+                      activeFloatingCaseSuggestion.caseSize
+                    ) {
+                      convertLooseUnitsToCase(activeFloatingCaseSuggestion.product.id);
+                      setDismissedFloatingCaseProductIds((prev) =>
+                        prev.includes(activeFloatingCaseSuggestion.product.id)
+                          ? prev
+                          : [...prev, activeFloatingCaseSuggestion.product.id]
+                      );
+                    } else {
+                      setAskingCompleteCaseProductId(activeFloatingCaseSuggestion.product.id);
+                    }
+                  }}
+                  className="py-1.5 px-3 rounded-xl bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black text-xs shadow-xs cursor-pointer"
+                >
+                  Trocar por caixa
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -2784,108 +3608,206 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   const effPrice = getCartItemUnitPrice(currentProd, item.saleUnit, item.addonsTotal);
                   const usedUnits = getCartTotalUnitsForProduct(currentProd.id);
                   const canAddMore = usedUnits + unitsPerSale <= currentProd.stock;
+                  const missingGroupNames = missingAddonsByLineId.get(item.lineId) || [];
+                  const caseSug =
+                    item.saleUnit === 'unit'
+                      ? caseSuggestionByProductId.get(currentProd.id)
+                      : undefined;
+                  const showCaseSuggestionHere = Boolean(
+                    caseSug && caseSug.firstUnitLineId === item.lineId
+                  );
 
                   return (
                     <div
                       key={item.lineId}
-                      className="flex items-start justify-between gap-2.5 p-3 bg-neutral-50 rounded-2xl border border-neutral-200"
+                      id={`cart-line-${encodeURIComponent(item.lineId)}`}
+                      className={`p-3 bg-neutral-50 rounded-2xl border space-y-2.5 ${
+                        missingGroupNames.length > 0
+                          ? 'border-amber-400 ring-2 ring-amber-200/80'
+                          : 'border-neutral-200'
+                      }`}
                     >
-                      {currentProd.imageUrl || currentProd.image ? (
-                        <img
-                          src={currentProd.imageUrl || currentProd.image}
-                          alt={currentProd.name}
-                          width={44}
-                          height={44}
-                          loading="lazy"
-                          className="w-11 h-11 rounded-xl object-cover shrink-0 mt-0.5"
-                        />
-                      ) : (
-                        <div className="w-11 h-11 rounded-xl bg-neutral-200 flex items-center justify-center text-neutral-400 shrink-0 mt-0.5">
-                          <Package className="w-5 h-5" />
-                        </div>
-                      )}
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-start gap-1.5">
-                          <h5 className="font-bold text-xs text-neutral-900 line-clamp-2 break-words leading-snug">
-                            {isCase
-                              ? `${currentProd.name} — Caixa c/${currentProd.caseSize}`
-                              : currentProd.name}
-                          </h5>
-                          {promoActive && (
-                            <span className="px-1.5 py-0.5 bg-red-600 text-white text-[9px] font-black rounded uppercase shrink-0">
-                              -{getPromoDiscountPercent(currentProd)}%
-                            </span>
-                          )}
-                        </div>
-                        <span className="text-[11px] text-neutral-500 block mt-0.5">
-                          {currentProd.volume} •{' '}
-                          {promoActive ? (
-                            <>
-                              <span className="line-through text-neutral-400 mr-1">
-                                {formatCurrency(currentProd.price + (item.addonsTotal || 0))}
+                      <div className="flex items-start justify-between gap-2.5">
+                        {currentProd.imageUrl || currentProd.image ? (
+                          <img
+                            src={currentProd.imageUrl || currentProd.image}
+                            alt={currentProd.name}
+                            width={44}
+                            height={44}
+                            loading="lazy"
+                            className="w-11 h-11 rounded-xl object-cover shrink-0 mt-0.5"
+                          />
+                        ) : (
+                          <div className="w-11 h-11 rounded-xl bg-neutral-200 flex items-center justify-center text-neutral-400 shrink-0 mt-0.5">
+                            <Package className="w-5 h-5" />
+                          </div>
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-start gap-1.5">
+                            <h5 className="font-bold text-xs text-neutral-900 line-clamp-2 break-words leading-snug">
+                              {isCase
+                                ? `${currentProd.name} — Caixa c/${currentProd.caseSize}`
+                                : currentProd.name}
+                            </h5>
+                            {promoActive && (
+                              <span className="px-1.5 py-0.5 bg-red-600 text-white text-[9px] font-black rounded uppercase shrink-0">
+                                -{getPromoDiscountPercent(currentProd)}%
                               </span>
-                              <strong className="text-red-600">{formatCurrency(effPrice)}</strong>
-                            </>
-                          ) : (
-                            formatCurrency(effPrice)
-                          )}
-                        </span>
-                        {(() => {
-                          const comboLines =
-                            Array.isArray(item.comboItems) && item.comboItems.length > 0
-                              ? item.comboItems
-                              : isComboProduct(currentProd.id, settings)
-                              ? calculateComboMetrics(currentProd, settings, products).orderComboItems
-                              : [];
-                          return comboLines.length > 0 ? (
+                            )}
+                          </div>
+                          <span className="text-[11px] text-neutral-500 block mt-0.5">
+                            {currentProd.volume} •{' '}
+                            {promoActive ? (
+                              <>
+                                <span className="line-through text-neutral-400 mr-1">
+                                  {formatCurrency(currentProd.price + (item.addonsTotal || 0))}
+                                </span>
+                                <strong className="text-red-600">{formatCurrency(effPrice)}</strong>
+                              </>
+                            ) : (
+                              formatCurrency(effPrice)
+                            )}
+                          </span>
+                          {(() => {
+                            const comboLines =
+                              Array.isArray(item.comboItems) && item.comboItems.length > 0
+                                ? item.comboItems
+                                : isComboProduct(currentProd.id, settings)
+                                ? calculateComboMetrics(currentProd, settings, products).orderComboItems
+                                : [];
+                            return comboLines.length > 0 ? (
+                              <div className="mt-1 space-y-0.5 pl-2 border-l-2 border-amber-400">
+                                {comboLines.map((ci, cIdx) => (
+                                  <div
+                                    key={`${ci.productId}-${cIdx}`}
+                                    className="text-[11px] font-semibold text-neutral-600 leading-tight"
+                                  >
+                                    {formatOrderItemComboLine(ci)}
+                                  </div>
+                                ))}
+                              </div>
+                            ) : null;
+                          })()}
+                          {Array.isArray(item.addons) && item.addons.length > 0 && (
                             <div className="mt-1 space-y-0.5 pl-2 border-l-2 border-amber-400">
-                              {comboLines.map((ci, cIdx) => (
+                              {item.addons.map((addon, aIdx) => (
                                 <div
-                                  key={`${ci.productId}-${cIdx}`}
+                                  key={`${addon.groupId || addon.groupName}-${addon.optionId || addon.optionName}-${aIdx}`}
                                   className="text-[11px] font-semibold text-neutral-600 leading-tight"
                                 >
-                                  {formatOrderItemComboLine(ci)}
+                                  {formatOrderItemAddonLine(addon)}
                                 </div>
                               ))}
                             </div>
-                          ) : null;
-                        })()}
-                        {Array.isArray(item.addons) && item.addons.length > 0 && (
-                          <div className="mt-1 space-y-0.5 pl-2 border-l-2 border-amber-400">
-                            {item.addons.map((addon, aIdx) => (
-                              <div
-                                key={`${addon.groupId || addon.groupName}-${addon.optionId || addon.optionName}-${aIdx}`}
-                                className="text-[11px] font-semibold text-neutral-600 leading-tight"
-                              >
-                                {formatOrderItemAddonLine(addon)}
-                              </div>
-                            ))}
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-1 bg-white p-1 rounded-xl border border-neutral-200 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => changeCartLineQuantity(item.lineId, -1)}
+                            className="w-6 h-6 flex items-center justify-center text-neutral-600 hover:bg-neutral-100 rounded-lg"
+                          >
+                            <Minus className="w-3 h-3" />
+                          </button>
+                          <span className="w-5 text-center font-black text-xs text-neutral-900">{item.quantity}</span>
+                          <button
+                            type="button"
+                            onClick={() => changeCartLineQuantity(item.lineId, 1)}
+                            disabled={!canAddMore}
+                            className="w-6 h-6 flex items-center justify-center text-neutral-600 hover:bg-neutral-100 rounded-lg disabled:opacity-30"
+                          >
+                            <Plus className="w-3 h-3" />
+                          </button>
+                        </div>
+
+                        <span className="font-bold text-xs text-neutral-900 shrink-0 text-right min-w-[3.75rem] pt-1">
+                          {formatCurrency(effPrice * item.quantity)}
+                        </span>
+                      </div>
+
+                      {/* 1b: Amber warning when item is missing a required addon group */}
+                      {missingGroupNames.length > 0 && (
+                        <div className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-amber-100/90 border border-amber-300 text-amber-950">
+                          <div className="flex items-center gap-1.5 text-xs font-black min-w-0">
+                            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+                            <span className="truncate">
+                              Falta escolher: {missingGroupNames.join(', ')}
+                            </span>
                           </div>
-                        )}
-                      </div>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setAddonModalState({
+                                product: currentProd,
+                                saleUnit: item.saleUnit,
+                                initialQuantity: item.quantity,
+                                initialAddons: item.addons,
+                                replaceLineId: item.lineId,
+                              })
+                            }
+                            className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black text-xs shrink-0 shadow-2xs cursor-pointer"
+                          >
+                            Escolher
+                          </button>
+                        </div>
+                      )}
 
-                      <div className="flex items-center gap-1 bg-white p-1 rounded-xl border border-neutral-200 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => changeCartLineQuantity(item.lineId, -1)}
-                          className="w-6 h-6 flex items-center justify-center text-neutral-600 hover:bg-neutral-100 rounded-lg"
-                        >
-                          <Minus className="w-3 h-3" />
-                        </button>
-                        <span className="w-5 text-center font-black text-xs text-neutral-900">{item.quantity}</span>
-                        <button
-                          type="button"
-                          onClick={() => changeCartLineQuantity(item.lineId, 1)}
-                          disabled={!canAddMore}
-                          className="w-6 h-6 flex items-center justify-center text-neutral-600 hover:bg-neutral-100 rounded-lg disabled:opacity-30"
-                        >
-                          <Plus className="w-3 h-3" />
-                        </button>
-                      </div>
+                      {/* 2c: Automatic case conversion suggestion inside the cart item */}
+                      {showCaseSuggestionHere && caseSug && (
+                        <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] font-bold leading-snug">
+                              📦 Leve a caixa com {caseSug.caseSize} por{' '}
+                              <strong>{formatCurrency(caseSug.casePrice)}</strong>
+                              {caseSug.caseSavings > 0
+                                ? ` e economize ${formatCurrency(caseSug.caseSavings)}`
+                                : ''}
+                            </span>
+                            {askingCompleteCaseProductId !== currentProd.id && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (caseSug.looseUnits >= caseSug.caseSize) {
+                                    convertLooseUnitsToCase(currentProd.id);
+                                  } else {
+                                    setAskingCompleteCaseProductId(currentProd.id);
+                                  }
+                                }}
+                                className="px-2.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black text-[11px] shrink-0 shadow-2xs cursor-pointer"
+                              >
+                                Trocar por caixa
+                              </button>
+                            )}
+                          </div>
 
-                      <span className="font-bold text-xs text-neutral-900 shrink-0 text-right min-w-[3.75rem] pt-1">
-                        {formatCurrency(effPrice * item.quantity)}
-                      </span>
+                          {askingCompleteCaseProductId === currentProd.id &&
+                            caseSug.looseUnits < caseSug.caseSize && (
+                              <div className="pt-1.5 border-t border-amber-200/80 space-y-2">
+                                <p className="text-[11px] font-black text-amber-950">
+                                  Completar para a caixa (+{caseSug.missingUnits} un por{' '}
+                                  {formatCurrency(caseSug.extraCostToComplete)} a mais)?
+                                </p>
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => convertLooseUnitsToCase(currentProd.id)}
+                                    className="flex-1 py-1.5 px-2.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-neutral-950 font-black text-[11px] cursor-pointer"
+                                  >
+                                    Sim, completar
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setAskingCompleteCaseProductId(null)}
+                                    className="py-1.5 px-2.5 rounded-lg bg-neutral-200 hover:bg-neutral-300 text-neutral-700 font-bold text-[11px] cursor-pointer"
+                                  >
+                                    Cancelar
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -2906,11 +3828,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   <div className="space-y-3">
                     <button
                       type="button"
+                      disabled={hasPendingRequiredAddons}
                       onClick={() => {
                         setAuthModalInitialTab('login');
                         setIsAuthModalOpen(true);
                       }}
-                      className="w-full p-5 rounded-2xl border-2 border-amber-500 bg-amber-50/60 hover:bg-amber-100/70 text-left transition-all flex items-center justify-between gap-4 cursor-pointer shadow-xs group"
+                      className="w-full p-5 rounded-2xl border-2 border-amber-500 bg-amber-50/60 hover:bg-amber-100/70 disabled:opacity-50 disabled:cursor-not-allowed text-left transition-all flex items-center justify-between gap-4 cursor-pointer shadow-xs group"
                     >
                       <div className="flex items-start gap-3.5">
                         <div className="w-11 h-11 rounded-2xl bg-amber-500 text-neutral-950 flex items-center justify-center shrink-0 font-black shadow-xs">
@@ -2930,11 +3853,12 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
 
                     <button
                       type="button"
+                      disabled={hasPendingRequiredAddons}
                       onClick={() => {
                         setCheckoutError('');
                         setCheckoutEntryStep('guest');
                       }}
-                      className="w-full p-5 rounded-2xl border-2 border-neutral-300 hover:border-neutral-900 bg-white hover:bg-neutral-50 text-left transition-all flex items-center justify-between gap-4 cursor-pointer shadow-xs group"
+                      className="w-full p-5 rounded-2xl border-2 border-neutral-300 hover:border-neutral-900 disabled:opacity-50 disabled:cursor-not-allowed bg-white hover:bg-neutral-50 text-left transition-all flex items-center justify-between gap-4 cursor-pointer shadow-xs group"
                     >
                       <div className="flex items-start gap-3.5">
                         <div className="w-11 h-11 rounded-2xl bg-neutral-900 text-white flex items-center justify-center shrink-0 font-black shadow-xs">
@@ -2952,6 +3876,16 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       <ArrowRight className="w-5 h-5 text-neutral-700 shrink-0 group-hover:translate-x-0.5 transition-transform" />
                     </button>
                   </div>
+
+                  {hasPendingRequiredAddons && (
+                    <button
+                      type="button"
+                      disabled
+                      className="w-full py-4 bg-neutral-300 text-white font-black text-base rounded-2xl cursor-not-allowed flex items-center justify-center gap-2"
+                    >
+                      <span>Escolha os adicionais que faltam</span>
+                    </button>
+                  )}
                 </div>
               ) : (
                 <>
@@ -3646,6 +4580,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                     disabled={
                       isSubmitting ||
                       cart.length === 0 ||
+                      hasPendingRequiredAddons ||
                       !isAreaCovered ||
                       !settings.isOpen ||
                       isCheckoutCashInvalid
@@ -3654,6 +4589,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                   >
                     {!settings.isOpen ? (
                       <span>🔴 Depósito Fechado no Momento</span>
+                    ) : hasPendingRequiredAddons ? (
+                      <span>Escolha os adicionais que faltam</span>
                     ) : isSubmitting ? (
                       <>
                         <Loader2 className="w-5 h-5 animate-spin" />
@@ -3775,14 +4712,33 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         <ProductAddonsModal
           product={addonModalState.product}
           initialSaleUnit={addonModalState.saleUnit}
+          initialQuantity={addonModalState.initialQuantity}
+          initialAddons={addonModalState.initialAddons}
+          isReplacingLine={Boolean(addonModalState.replaceLineId)}
           addonGroups={getProductAddonGroups(addonModalState.product, settings)}
           availableStockUnits={Math.max(
             0,
-            addonModalState.product.stock - getCartTotalUnitsForProduct(addonModalState.product.id)
+            addonModalState.product.stock -
+              getCartTotalUnitsForProduct(
+                addonModalState.product.id,
+                cart,
+                addonModalState.replaceLineId
+              )
           )}
           onClose={() => setAddonModalState(null)}
           onConfirm={({ product, saleUnit, quantity, addons, addonsTotal }) => {
-            appendCartLine(product, saleUnit, quantity, addons, addonsTotal);
+            if (addonModalState.replaceLineId) {
+              replaceCartLine(
+                addonModalState.replaceLineId,
+                product,
+                saleUnit,
+                quantity,
+                addons,
+                addonsTotal
+              );
+            } else {
+              appendCartLine(product, saleUnit, quantity, addons, addonsTotal);
+            }
             setAddonModalState(null);
           }}
         />

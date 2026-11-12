@@ -13,6 +13,9 @@ import { X, Plus, Minus, Check, AlertCircle, ShoppingBag, Package } from 'lucide
 interface ProductAddonsModalProps {
   product: Product;
   initialSaleUnit?: SaleUnit;
+  initialQuantity?: number;
+  initialAddons?: OrderItemAddon[];
+  isReplacingLine?: boolean;
   addonGroups: AddonGroup[];
   availableStockUnits: number;
   inCartSummary?: string;
@@ -29,6 +32,9 @@ interface ProductAddonsModalProps {
 export const ProductAddonsModal: React.FC<ProductAddonsModalProps> = ({
   product,
   initialSaleUnit = 'unit',
+  initialQuantity = 1,
+  initialAddons,
+  isReplacingLine = false,
   addonGroups,
   availableStockUnits,
   inCartSummary,
@@ -42,10 +48,24 @@ export const ProductAddonsModal: React.FC<ProductAddonsModalProps> = ({
   const [saleUnit, setSaleUnit] = useState<SaleUnit>(
     initialSaleUnit === 'case' && canAffordCase ? 'case' : 'unit'
   );
-  const [quantity, setQuantity] = useState<number>(1);
+  const [quantity, setQuantity] = useState<number>(() =>
+    Math.max(1, Math.floor(Number(initialQuantity) || 1))
+  );
 
   // Map: groupId -> { [optionId]: quantity }
-  const [selectedByGroup, setSelectedByGroup] = useState<Record<string, Record<string, number>>>({});
+  const [selectedByGroup, setSelectedByGroup] = useState<Record<string, Record<string, number>>>(() => {
+    const initialMap: Record<string, Record<string, number>> = {};
+    if (Array.isArray(initialAddons)) {
+      for (const a of initialAddons) {
+        if (!a || !a.groupId || !a.optionId) continue;
+        const qty = Math.max(0, Math.floor(Number(a.quantity) || 0));
+        if (qty <= 0) continue;
+        if (!initialMap[a.groupId]) initialMap[a.groupId] = {};
+        initialMap[a.groupId][a.optionId] = (initialMap[a.groupId][a.optionId] || 0) + qty;
+      }
+    }
+    return initialMap;
+  });
 
   const unitsPerSale = saleUnit === 'case' && canSellCase ? caseSize : 1;
   const maxItemQty = Math.max(0, Math.floor(availableStockUnits / unitsPerSale));
@@ -488,7 +508,7 @@ export const ProductAddonsModal: React.FC<ProductAddonsModalProps> = ({
                     onClick={handleConfirm}
                     className="flex-1 py-3 px-4 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed text-zinc-950 font-black text-sm transition-all flex items-center justify-between gap-2 shadow-lg shadow-amber-500/10"
                   >
-                    <span>Adicionar ({qtyLabel})</span>
+                    <span>{isReplacingLine ? `Confirmar (${qtyLabel})` : `Adicionar (${qtyLabel})`}</span>
                     <span>R$ {finalLineTotal.toFixed(2).replace('.', ',')}</span>
                   </button>
                 </div>

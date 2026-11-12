@@ -1065,6 +1065,45 @@ class ApiService {
     }
   }
 
+  public async refreshPublicStoreState(): Promise<{
+    products: Product[];
+    settings: StoreSettings;
+    deliveryAreas: DeliveryArea[];
+  }> {
+    try {
+      const res = await fetch('/api/state', {
+        cache: 'no-store',
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const nextProducts = Array.isArray(data.products) ? data.products : this.state.products;
+        const nextSettings = data.settings || this.state.settings;
+        const nextAreas = Array.isArray(data.deliveryAreas)
+          ? data.deliveryAreas
+          : this.state.deliveryAreas;
+        this.state = {
+          ...this.state,
+          products: nextProducts,
+          settings: nextSettings,
+          deliveryAreas: nextAreas,
+        };
+        this.notifyListeners();
+        return {
+          products: nextProducts,
+          settings: nextSettings,
+          deliveryAreas: nextAreas,
+        };
+      }
+    } catch (err) {
+      console.warn('Erro ao atualizar estado público da loja:', err);
+    }
+    return {
+      products: this.state.products,
+      settings: this.state.settings,
+      deliveryAreas: this.state.deliveryAreas,
+    };
+  }
+
   public async importAdminProducts(
     rows: ProductImportItem[],
     duplicateMode: 'skip' | 'update'
