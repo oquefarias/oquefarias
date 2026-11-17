@@ -3105,8 +3105,8 @@ export function createApp(): express.Express {
           .maybeSingle(),
         supabase
           .from('table_tab_items')
-          .select('created_at,cancelled_at')
-          .order('created_at', { ascending: false })
+          .select('added_at,cancelled_at')
+          .order('added_at', { ascending: false })
           .limit(1)
           .maybeSingle(),
         supabase
@@ -3153,7 +3153,7 @@ export function createApp(): express.Express {
       const latestTabMs = Math.max(
         toMs(latestTabRes.data?.opened_at),
         toMs(latestTabRes.data?.closed_at),
-        toMs(latestTabItemRes.data?.created_at),
+        toMs(latestTabItemRes.data?.added_at),
         toMs(latestTabItemRes.data?.cancelled_at)
       );
       const latestCashSessionMs = Math.max(
