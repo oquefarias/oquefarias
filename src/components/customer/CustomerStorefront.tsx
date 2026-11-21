@@ -134,6 +134,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
   const [complement, setComplement] = useState<string>(currentCustomer?.complement || '');
   const [reference, setReference] = useState<string>(currentCustomer?.reference || '');
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('pix');
+  const [cashNeedsChange, setCashNeedsChange] = useState<boolean | null>(null);
   const [cashChangeFor, setCashChangeFor] = useState<string>('');
   const [orderNotes, setOrderNotes] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
@@ -1285,12 +1286,31 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
     return val.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
   };
 
+  const handleSelectPaymentMethod = (method: PaymentMethod) => {
+    setPaymentMethod(method);
+    setCashNeedsChange(null);
+    setCashChangeFor('');
+  };
+
   const hasCheckoutCashTyped = cashChangeFor.trim() !== '';
-  const checkoutCashNum = hasCheckoutCashTyped ? parseFloat(cashChangeFor) : 0;
+  const checkoutCashNum = hasCheckoutCashTyped
+    ? parseFloat(cashChangeFor.replace(',', '.'))
+    : NaN;
+  const isCheckoutCashValueValid =
+    hasCheckoutCashTyped &&
+    !Number.isNaN(checkoutCashNum) &&
+    Math.round(checkoutCashNum * 100) > Math.round(cartTotal * 100);
+  const isCheckoutCashPending =
+    paymentMethod === 'dinheiro' &&
+    (cashNeedsChange === null || (cashNeedsChange === true && !isCheckoutCashValueValid));
   const isCheckoutCashInvalid =
     paymentMethod === 'dinheiro' &&
+    cashNeedsChange === true &&
     hasCheckoutCashTyped &&
-    (Number.isNaN(checkoutCashNum) || Math.round(checkoutCashNum * 100) < Math.round(cartTotal * 100));
+    !isCheckoutCashValueValid;
+  const cashShortcutValues = [20, 50, 100, 200].filter(
+    (v) => Math.round(v * 100) > Math.round(cartTotal * 100)
+  );
 
   const scrollToCartLine = (lineId: string) => {
     if (typeof document === 'undefined') return;
@@ -1312,7 +1332,17 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       setCheckoutError(settings.closedMessage || 'Desculpe, o depósito está fechado no momento para novos pedidos.');
       return;
     }
-    if (cart.length === 0 || isCheckoutCashInvalid) return;
+    if (cart.length === 0) return;
+    if (paymentMethod === 'dinheiro') {
+      if (cashNeedsChange === null) {
+        setCheckoutError('Informe se vai precisar de troco');
+        return;
+      }
+      if (cashNeedsChange === true && !isCheckoutCashValueValid) {
+        setCheckoutError('O valor para troco precisa ser maior que o total do pedido');
+        return;
+      }
+    }
 
     const isLogged = Boolean(api.isCustomerAuthenticated() && currentCustomer);
     if (!isLogged && checkoutEntryStep === 'choice') {
@@ -1501,8 +1531,9 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         deliveryFee,
         total: cartTotal,
         paymentMethod,
+        cashNeedsChange: paymentMethod === 'dinheiro' ? Boolean(cashNeedsChange) : undefined,
         cashChangeFor:
-          paymentMethod === 'dinheiro' && hasCheckoutCashTyped && !Number.isNaN(checkoutCashNum)
+          paymentMethod === 'dinheiro' && cashNeedsChange === true && isCheckoutCashValueValid
             ? Math.round(checkoutCashNum * 100) / 100
             : undefined,
         notes: orderNotes,
@@ -1558,6 +1589,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
         refreshSavedGuestOrdersCount();
       }
       setCart([]);
+      setCashNeedsChange(null);
+      setCashChangeFor('');
       setCheckoutClientRequestId(crypto.randomUUID());
       setAppliedCoupon(null);
       setCouponInput('');
@@ -1991,8 +2024,20 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
       cartao_debito: 'Cartão',
     };
     lines.push(`💳 Pagamento: ${payMap[order.paymentMethod] || 'Pix'}`);
-    if (order.paymentMethod === 'dinheiro' && order.cashChangeFor && Number(order.cashChangeFor) > 0) {
-      lines.push(`💵 Troco para: R$ ${Number(order.cashChangeFor).toFixed(2)}`);
+    if (
+      order.paymentMethod === 'dinheiro' &&
+      order.cashChangeFor !== undefined &&
+      order.cashChangeFor !== null
+    ) {
+      const cashVal = Number(order.cashChangeFor);
+      if (cashVal > 0) {
+        const changeToBring = Math.max(0, cashVal - Number(order.total || 0));
+        lines.push(
+          `💵 Troco para ${formatCurrency(cashVal)} — levar ${formatCurrency(changeToBring)}`
+        );
+      } else if (cashVal === 0) {
+        lines.push('💵 Dinheiro — não precisa de troco');
+      }
     }
 
     const message = lines.join('\n');
@@ -2216,12 +2261,17 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                     {placedOrder.paymentMethod === 'dinheiro' && 'Dinheiro'}
                   </span>
                 </div>
-                {placedOrder.cashChangeFor !== undefined && placedOrder.cashChangeFor !== null && (
-                  <div className="flex justify-between text-amber-800 font-semibold">
-                    <span>Troco:</span>
-                    <span>Troco para {formatCurrency(placedOrder.cashChangeFor)}</span>
-                  </div>
-                )}
+                {placedOrder.paymentMethod === 'dinheiro' &&
+                  placedOrder.cashChangeFor !== undefined &&
+                  placedOrder.cashChangeFor !== null && (
+                    <div className="pt-1 text-amber-800 font-bold text-xs">
+                      {placedOrder.cashChangeFor > 0
+                        ? `💵 Troco para ${formatCurrency(placedOrder.cashChangeFor)} — levar ${formatCurrency(
+                            Math.max(0, placedOrder.cashChangeFor - placedOrder.total)
+                          )}`
+                        : '💵 Dinheiro — não precisa de troco'}
+                    </div>
+                  )}
               </div>
             </div>
 
@@ -4348,8 +4398,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                     <div className="grid grid-cols-2 gap-2">
                       <button
                         type="button"
-                        onClick={() => setPaymentMethod('pix')}
-                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
+                        onClick={() => handleSelectPaymentMethod('pix')}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all cursor-pointer ${
                           paymentMethod === 'pix'
                             ? 'border-amber-500 bg-amber-50 text-amber-900'
                             : 'border-neutral-200 text-neutral-700'
@@ -4359,8 +4409,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       </button>
                       <button
                         type="button"
-                        onClick={() => setPaymentMethod('cartao_credito')}
-                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
+                        onClick={() => handleSelectPaymentMethod('cartao_credito')}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all cursor-pointer ${
                           paymentMethod === 'cartao_credito'
                             ? 'border-amber-500 bg-amber-50 text-amber-900'
                             : 'border-neutral-200 text-neutral-700'
@@ -4372,8 +4422,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       </button>
                       <button
                         type="button"
-                        onClick={() => setPaymentMethod('cartao_debito')}
-                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
+                        onClick={() => handleSelectPaymentMethod('cartao_debito')}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all cursor-pointer ${
                           paymentMethod === 'cartao_debito'
                             ? 'border-amber-500 bg-amber-50 text-amber-900'
                             : 'border-neutral-200 text-neutral-700'
@@ -4385,8 +4435,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       </button>
                       <button
                         type="button"
-                        onClick={() => setPaymentMethod('dinheiro')}
-                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all ${
+                        onClick={() => handleSelectPaymentMethod('dinheiro')}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold transition-all cursor-pointer ${
                           paymentMethod === 'dinheiro'
                             ? 'border-amber-500 bg-amber-50 text-amber-900'
                             : 'border-neutral-200 text-neutral-700'
@@ -4397,25 +4447,107 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                     </div>
 
                     {paymentMethod === 'dinheiro' && (
-                      <div className="mt-2 bg-neutral-50 p-3 rounded-xl border border-neutral-200 space-y-1">
-                        <label className="text-[11px] font-semibold text-neutral-700 block">
-                          Precisa de troco para quanto?
-                        </label>
-                        <input
-                          type="number"
-                          step="0.01"
-                          min="0"
-                          placeholder="Ex: 50 ou 100"
-                          value={cashChangeFor}
-                          onChange={(e) => setCashChangeFor(e.target.value)}
-                          className={`w-full px-3 py-2 bg-white border rounded-lg text-xs ${
-                            isCheckoutCashInvalid ? 'border-red-400' : 'border-neutral-300'
-                          }`}
-                        />
-                        {isCheckoutCashInvalid && (
-                          <p className="text-[11px] font-bold text-red-600">
-                            O valor do troco precisa ser maior que o total do pedido
-                          </p>
+                      <div className="mt-2 bg-amber-50/60 p-3.5 rounded-2xl border border-amber-200 space-y-3">
+                        <div>
+                          <span className="text-xs font-black text-neutral-900 block">
+                            Vai precisar de troco? *
+                          </span>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCashNeedsChange(true);
+                                setCheckoutError('');
+                              }}
+                              className={`p-3 rounded-xl border-2 text-center text-xs font-black transition-all cursor-pointer ${
+                                cashNeedsChange === true
+                                  ? 'border-amber-500 bg-amber-500 text-neutral-950 shadow-xs'
+                                  : 'border-neutral-200 bg-white text-neutral-800 hover:border-amber-300'
+                              }`}
+                            >
+                              Sim, preciso de troco
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCashNeedsChange(false);
+                                setCashChangeFor('');
+                                setCheckoutError('');
+                              }}
+                              className={`p-3 rounded-xl border-2 text-center text-xs font-black transition-all cursor-pointer ${
+                                cashNeedsChange === false
+                                  ? 'border-emerald-600 bg-emerald-600 text-white shadow-xs'
+                                  : 'border-neutral-200 bg-white text-neutral-800 hover:border-emerald-300'
+                              }`}
+                            >
+                              Não, vou pagar o valor exato
+                            </button>
+                          </div>
+                        </div>
+
+                        {cashNeedsChange === true && (
+                          <div className="space-y-2 pt-1 border-t border-amber-200/80">
+                            <label className="text-xs font-bold text-neutral-800 block">
+                              Troco para quanto? *
+                            </label>
+
+                            {cashShortcutValues.length > 0 && (
+                              <div className="flex flex-wrap gap-1.5">
+                                {cashShortcutValues.map((val) => {
+                                  const isSelected =
+                                    hasCheckoutCashTyped &&
+                                    !Number.isNaN(checkoutCashNum) &&
+                                    Math.round(checkoutCashNum * 100) === val * 100;
+                                  return (
+                                    <button
+                                      key={val}
+                                      type="button"
+                                      onClick={() => {
+                                        setCashChangeFor(String(val));
+                                        setCheckoutError('');
+                                      }}
+                                      className={`px-3 py-1.5 rounded-xl border text-xs font-black transition-all cursor-pointer ${
+                                        isSelected
+                                          ? 'border-amber-600 bg-amber-500 text-neutral-950 shadow-2xs'
+                                          : 'border-neutral-300 bg-white text-neutral-800 hover:border-amber-400'
+                                      }`}
+                                    >
+                                      R$ {val}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
+
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              required
+                              placeholder={`Maior que ${formatCurrency(cartTotal)}`}
+                              value={cashChangeFor}
+                              onChange={(e) => {
+                                setCashChangeFor(e.target.value);
+                                setCheckoutError('');
+                              }}
+                              className={`w-full px-3 py-2.5 bg-white border rounded-xl text-sm font-bold ${
+                                isCheckoutCashInvalid ? 'border-red-400 text-red-700' : 'border-neutral-300 text-neutral-900'
+                              }`}
+                            />
+
+                            {isCheckoutCashValueValid && (
+                              <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-black">
+                                Levar de troco:{' '}
+                                {formatCurrency(Math.max(0, checkoutCashNum - cartTotal))}
+                              </div>
+                            )}
+
+                            {isCheckoutCashInvalid && (
+                              <p className="text-[11px] font-bold text-red-600">
+                                O valor para troco precisa ser maior que o total do pedido
+                              </p>
+                            )}
+                          </div>
                         )}
                       </div>
                     )}
@@ -4583,7 +4715,7 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       hasPendingRequiredAddons ||
                       !isAreaCovered ||
                       !settings.isOpen ||
-                      isCheckoutCashInvalid
+                      isCheckoutCashPending
                     }
                     className="w-full py-4 bg-amber-500 hover:bg-amber-600 disabled:bg-neutral-300 disabled:cursor-not-allowed text-white font-black text-base rounded-2xl shadow-xl shadow-amber-500/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
                   >
@@ -4591,6 +4723,8 @@ export const CustomerStorefront: React.FC<CustomerStorefrontProps> = ({ products
                       <span>🔴 Depósito Fechado no Momento</span>
                     ) : hasPendingRequiredAddons ? (
                       <span>Escolha os adicionais que faltam</span>
+                    ) : isCheckoutCashPending ? (
+                      <span>Informe se precisa de troco</span>
                     ) : isSubmitting ? (
                       <>
                         <Loader2 className="w-5 h-5 animate-spin" />

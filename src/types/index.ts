@@ -260,6 +260,7 @@ export interface Order {
   deliveryFee: number;
   total: number;
   paymentMethod: PaymentMethod;
+  cashNeedsChange?: boolean;
   cashChangeFor?: number;
   status: OrderStatus;
   notes?: string;

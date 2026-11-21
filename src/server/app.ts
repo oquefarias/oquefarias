@@ -5358,7 +5358,31 @@ export function createApp(): express.Express {
     const paymentMethod: PaymentMethod = rawOrder.paymentMethod || 'pix';
     let validatedCashChangeFor: number | undefined = undefined;
     if (paymentMethod === 'dinheiro') {
-      if (
+      if (effectiveSource === 'online' || rawOrder.cashNeedsChange !== undefined) {
+        if (typeof rawOrder.cashNeedsChange !== 'boolean') {
+          return res.status(400).json({ error: 'Informe se vai precisar de troco' });
+        }
+        if (rawOrder.cashNeedsChange === true) {
+          const rawCashStr =
+            rawOrder.cashChangeFor !== undefined && rawOrder.cashChangeFor !== null
+              ? String(rawOrder.cashChangeFor).trim()
+              : '';
+          const parsedCash = rawCashStr !== '' ? Number(rawCashStr) : NaN;
+          if (
+            rawCashStr === '' ||
+            Number.isNaN(parsedCash) ||
+            !Number.isFinite(parsedCash) ||
+            Math.round(parsedCash * 100) <= Math.round(calculatedTotal * 100)
+          ) {
+            return res.status(400).json({
+              error: 'O valor para troco precisa ser maior que o total do pedido',
+            });
+          }
+          validatedCashChangeFor = Math.round(parsedCash * 100) / 100;
+        } else {
+          validatedCashChangeFor = 0;
+        }
+      } else if (
         rawOrder.cashChangeFor !== undefined &&
         rawOrder.cashChangeFor !== null &&
         String(rawOrder.cashChangeFor).trim() !== ''
@@ -8110,10 +8134,12 @@ export function createApp(): express.Express {
       const customerName = String(row.customer?.name || 'Cliente').trim();
       const serviceFee = source === 'mesa' ? extractServiceFeeFromNotes(row.notes) : 0;
       const discount = Math.max(0, Math.round((Number(row.discount) || 0) * 100) / 100);
-      const cashReceived =
+      const rawCashChangeFor =
         pm === 'dinheiro' && row.cash_change_for !== null && row.cash_change_for !== undefined
           ? Math.round(Number(row.cash_change_for) * 100) / 100
           : null;
+      const cashReceived =
+        rawCashChangeFor !== null && rawCashChangeFor > 0 ? rawCashChangeFor : null;
       const changeGiven =
         cashReceived !== null && cashReceived >= amount
           ? Math.round((cashReceived - amount) * 100) / 100

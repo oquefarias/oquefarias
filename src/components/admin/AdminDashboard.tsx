@@ -3453,11 +3453,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             {order.paymentMethod === 'cartao_debito' && '💳 Cartão de Débito'}
                             {order.paymentMethod === 'dinheiro' && '💵 Dinheiro'}
                           </span>
-                          {order.cashChangeFor !== undefined && order.cashChangeFor !== null && (
-                            <span className="block text-[11px] font-bold text-amber-800 mt-0.5">
-                              Recebido: {formatCurrency(order.cashChangeFor)} • Troco: {formatCurrency(Math.max(0, order.cashChangeFor - order.total))}
-                            </span>
-                          )}
+                          {order.paymentMethod === 'dinheiro' &&
+                            order.cashChangeFor !== undefined &&
+                            order.cashChangeFor !== null && (
+                              <span className="block text-[11px] font-bold text-amber-800 mt-0.5">
+                                {order.cashChangeFor > 0
+                                  ? `💵 Troco para ${formatCurrency(order.cashChangeFor)} — levar ${formatCurrency(
+                                      Math.max(0, order.cashChangeFor - order.total)
+                                    )}`
+                                  : '💵 Dinheiro — não precisa de troco'}
+                              </span>
+                            )}
                         </div>
                         <div className="text-right">
                           <span className="text-neutral-500 block">Total a Cobrar:</span>
@@ -3479,7 +3485,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         {waPhone && (
                           <a
                             href={`https://wa.me/${waPhone}?text=${encodeURIComponent(
-                              `Olá ${order.customer.name}! Seu pedido #${order.id} está: ${getOrderStatusLabelForWhatsApp(order)}. Total ${formatCurrency(order.total)}`
+                              `Olá ${order.customer.name}! Seu pedido #${order.id} está: ${getOrderStatusLabelForWhatsApp(order)}. Total ${formatCurrency(order.total)}${
+                                order.paymentMethod === 'dinheiro' &&
+                                order.cashChangeFor !== undefined &&
+                                order.cashChangeFor !== null
+                                  ? order.cashChangeFor > 0
+                                    ? `\n💵 Troco para ${formatCurrency(order.cashChangeFor)} — levar ${formatCurrency(
+                                        Math.max(0, order.cashChangeFor - order.total)
+                                      )}`
+                                    : '\n💵 Dinheiro — não precisa de troco'
+                                  : ''
+                              }`
                             )}`}
                             target="_blank"
                             rel="noreferrer"
@@ -8521,8 +8537,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         ord.cashChangeFor !== undefined &&
                         ord.cashChangeFor !== null && (
                           <div className="text-[11px] font-bold text-amber-800">
-                            Troco p/ {formatCurrency(ord.cashChangeFor)} (Levar{' '}
-                            {formatCurrency(Math.max(0, ord.cashChangeFor - ord.total))})
+                            {ord.cashChangeFor > 0
+                              ? `💵 Troco para ${formatCurrency(ord.cashChangeFor)} — levar ${formatCurrency(
+                                  Math.max(0, ord.cashChangeFor - ord.total)
+                                )}`
+                              : '💵 Dinheiro — não precisa de troco'}
                           </div>
                         )}
                     </div>

@@ -199,18 +199,26 @@ export const TableReceiptModal: React.FC<TableReceiptModalProps> = ({
                   {paymentLabels[order.paymentMethod] || order.paymentMethod}
                 </span>
               </div>
-              {order.cashChangeFor !== undefined && order.cashChangeFor !== null && (
-                <>
-                  <div className="flex justify-between">
-                    <span>Recebido:</span>
-                    <span>R$ {order.cashChangeFor.toFixed(2)}</span>
-                  </div>
-                  <div className="flex justify-between font-bold text-amber-800">
-                    <span>Troco:</span>
-                    <span>R$ {Math.max(0, order.cashChangeFor - order.total).toFixed(2)}</span>
-                  </div>
-                </>
-              )}
+              {order.paymentMethod === 'dinheiro' &&
+                order.cashChangeFor !== undefined &&
+                order.cashChangeFor !== null && (
+                  order.cashChangeFor > 0 ? (
+                    <>
+                      <div className="flex justify-between">
+                        <span>Recebido:</span>
+                        <span>R$ {order.cashChangeFor.toFixed(2)}</span>
+                      </div>
+                      <div className="flex justify-between font-bold text-amber-800">
+                        <span>Troco:</span>
+                        <span>R$ {Math.max(0, order.cashChangeFor - order.total).toFixed(2)}</span>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="font-bold text-amber-800">
+                      💵 Dinheiro — não precisa de troco
+                    </div>
+                  )
+                )}
             </div>
           </div>
 

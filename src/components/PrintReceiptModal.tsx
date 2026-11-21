@@ -292,18 +292,17 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ order, set
                 {order.paymentMethod === 'dinheiro' && 'Dinheiro'}
               </span>
             </div>
-            {order.paymentMethod === 'dinheiro' && order.cashChangeFor !== undefined && order.cashChangeFor !== null && (
-              <>
-                <div className="flex justify-between text-neutral-700 font-semibold">
-                  <span>Recebido:</span>
-                  <span>{formatCurrency(order.cashChangeFor)}</span>
+            {order.paymentMethod === 'dinheiro' &&
+              order.cashChangeFor !== undefined &&
+              order.cashChangeFor !== null && (
+                <div className="pt-1 text-amber-800 font-bold">
+                  {order.cashChangeFor > 0
+                    ? `💵 Troco para ${formatCurrency(order.cashChangeFor)} — levar ${formatCurrency(
+                        Math.max(0, order.cashChangeFor - order.total)
+                      )}`
+                    : '💵 Dinheiro — não precisa de troco'}
                 </div>
-                <div className="flex justify-between text-amber-800 font-bold">
-                  <span>Troco:</span>
-                  <span>{formatCurrency(Math.max(0, order.cashChangeFor - order.total))}</span>
-                </div>
-              </>
-            )}
+              )}
             {order.paymentMethod === 'pix' && (
               <p className="text-[11px] text-neutral-600">Chave Pix: {settings.pixKey}</p>
             )}
